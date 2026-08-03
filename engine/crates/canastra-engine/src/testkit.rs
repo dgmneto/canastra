@@ -47,6 +47,7 @@ impl Rig {
                 phase: Phase::AwaitingDraw,
                 turn_context: TurnContext::default(),
                 hand_number: 1,
+                went_out: None,
             },
         }
     }

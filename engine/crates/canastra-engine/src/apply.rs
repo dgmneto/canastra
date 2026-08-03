@@ -235,7 +235,7 @@ fn lay_meld(state: &mut GameState, seat: Seat, cards: &[Card]) -> Result<(), Rul
     take_all_from_hand(state, seat, cards)?;
     record_laid(state, cards);
     state.tables[seat.team().index()].melds.push(meld);
-    Ok(())
+    maybe_go_out(state, seat)
 }
 
 /// §4.2: add cards to one of your own partnership's melds.
@@ -271,6 +271,30 @@ fn add_to_meld(
     take_all_from_hand(state, seat, cards)?;
     record_laid(state, cards);
     state.tables[team].melds[index] = extended;
+    maybe_go_out(state, seat)
+}
+
+/// §11.1: emptying your hand is going out, which needs a clean canastra.
+///
+/// There is no separate "go out" action — running out of cards *is* the act. A
+/// lay that would leave the player with nothing while their partnership has no
+/// clean canastra is refused rather than allowed through into a stuck position.
+///
+/// A player can still lay themselves down to a single card with no clean
+/// canastra and then be unable to discard, since that discard would empty the
+/// hand. That is self-inflicted within the turn — hands only shrink by melding,
+/// and every turn starts with a draw — so the way out is the same as for a
+/// missed opening minimum: abandon the turn and replay it.
+fn maybe_go_out(state: &mut GameState, seat: Seat) -> Result<(), RuleViolation> {
+    if !state.hands[seat.index()].is_empty() {
+        return Ok(());
+    }
+    if !state.has_clean_canastra(seat.team()) {
+        return Err(RuleViolation::NoCleanCanastra);
+    }
+    commit_opening(state, seat)?;
+    state.went_out = Some(seat);
+    state.phase = Phase::HandOver;
     Ok(())
 }
 
@@ -346,8 +370,23 @@ fn discard(state: &mut GameState, seat: Seat, card: Card) -> Result<(), RuleViol
         .position(|held| *held == card)
         .ok_or(RuleViolation::CardNotInHand { card })?;
     commit_opening(state, seat)?;
+
+    // §11.1: throwing away your last card is going out, and is only allowed on
+    // the same terms. Check before committing so an illegal discard leaves the
+    // player with the card still in hand.
+    if state.hands[seat.index()].len() == 1 && !state.has_clean_canastra(seat.team()) {
+        return Err(RuleViolation::NoCleanCanastra);
+    }
+
     state.hands[seat.index()].remove(position);
     state.discard.push(card);
+
+    if state.hands[seat.index()].is_empty() {
+        state.went_out = Some(seat);
+        state.phase = Phase::HandOver;
+        return Ok(());
+    }
+
     end_turn(state);
     Ok(())
 }
@@ -714,7 +753,7 @@ mod tests {
     #[test]
     fn a_single_big_meld_can_open_the_partnership() {
         let state = Rig::new()
-            .hand(1, "JOKER QS KS AS 4D")
+            .hand(1, "JOKER QS KS AS 4D 8C")
             .stock("9C 2C")
             .phase(Phase::Melding)
             .turn(1)
@@ -757,7 +796,7 @@ mod tests {
     #[test]
     fn the_minimum_totals_everything_laid_in_the_turn() {
         let state = Rig::new()
-            .hand(1, "4H 5H 6H 9C TC JC QC KC AC 2S")
+            .hand(1, "4H 5H 6H 9C TC JC QC KC AC 2S 8D")
             .stock("9D 2D")
             .phase(Phase::Melding)
             .turn(1)
@@ -794,7 +833,7 @@ mod tests {
     #[test]
     fn an_open_partnership_may_lay_anything() {
         let state = Rig::new()
-            .hand(1, "4H 5H 6H 2S")
+            .hand(1, "4H 5H 6H 2S 8D")
             .stock("9C 2C")
             .opened(1)
             .phase(Phase::Melding)
@@ -957,14 +996,14 @@ mod tests {
     #[test]
     fn frozen_cards_may_still_be_discarded() {
         let state = Rig::new()
-            .hand(1, "4D 5D")
+            .hand(1, "4D 5D 8C")
             .discard("9H 6D")
             .stock("2C 3S")
             .opened(1)
             .turn(1)
             .build();
         let next = apply(&state, seat(1), &take_pile("4D 5D", MeldTarget::NewMeld)).unwrap();
-        assert_eq!(next.hand(seat(1)), cards("9H"));
+        assert_eq!(next.hand(seat(1)), cards("8C 9H"));
         apply(&next, seat(1), &Action::Discard { card: card("9H") })
             .expect("a frozen card can still be thrown away");
     }
@@ -1102,6 +1141,133 @@ mod tests {
                 phase: Phase::Melding
             })
         );
+    }
+
+    // ---- §11.1, going out ----
+
+    /// A seven-card run with no 2 in it: a clean canastra, worth 500.
+    const CLEAN: &str = "5S 6S 7S 8S 9S TS JS";
+    /// The same length but soured by a 2, so only 200 — and no help for going out.
+    const DIRTY: &str = "5S 6S 7S 8S 9S TS 2S";
+
+    /// §11.1: "Exige pelo menos uma canastra limpa." A dirty one will not do.
+    #[test]
+    fn a_dirty_canastra_does_not_let_you_go_out() {
+        let state = Rig::new()
+            .hand(1, "4H 5H 6H")
+            .meld(1, DIRTY)
+            .phase(Phase::Melding)
+            .turn(1)
+            .build();
+        assert_eq!(
+            apply(&state, seat(1), &lay("4H 5H 6H")),
+            Err(RuleViolation::NoCleanCanastra)
+        );
+    }
+
+    /// §11.1: "Não é obrigatório descartar a última carta — pode-se bater
+    /// baixando tudo."
+    #[test]
+    fn a_clean_canastra_lets_you_go_out_by_laying_everything() {
+        let state = Rig::new()
+            .hand(1, "4H 5H 6H")
+            .meld(1, CLEAN)
+            .phase(Phase::Melding)
+            .turn(1)
+            .build();
+        let next = apply(&state, seat(1), &lay("4H 5H 6H")).unwrap();
+        assert!(next.hand(seat(1)).is_empty());
+        assert_eq!(next.phase, Phase::HandOver);
+        assert_eq!(next.went_out, Some(seat(1)));
+    }
+
+    #[test]
+    fn you_can_also_go_out_on_your_last_discard() {
+        let state = Rig::new()
+            .hand(1, "4D")
+            .meld(1, CLEAN)
+            .stock("2C")
+            .phase(Phase::Melding)
+            .turn(1)
+            .build();
+        let next = apply(&state, seat(1), &Action::Discard { card: card("4D") }).unwrap();
+        assert_eq!(next.discard, cards("4D"));
+        assert_eq!(next.phase, Phase::HandOver);
+        assert_eq!(next.went_out, Some(seat(1)));
+    }
+
+    #[test]
+    fn you_cannot_empty_your_hand_on_a_discard_without_a_clean_canastra() {
+        let state = Rig::new()
+            .hand(1, "4D")
+            .meld(1, DIRTY)
+            .stock("2C")
+            .phase(Phase::Melding)
+            .turn(1)
+            .build();
+        assert_eq!(
+            apply(&state, seat(1), &Action::Discard { card: card("4D") }),
+            Err(RuleViolation::NoCleanCanastra)
+        );
+    }
+
+    /// §10: the clean canastra of aces counts as clean for this purpose too.
+    #[test]
+    fn a_clean_ace_canastra_also_lets_you_go_out() {
+        let state = Rig::new()
+            .hand(1, "4H 5H 6H")
+            .meld(1, "AH AD AS AC AH AD AS")
+            .phase(Phase::Melding)
+            .turn(1)
+            .build();
+        let next = apply(&state, seat(1), &lay("4H 5H 6H")).unwrap();
+        assert_eq!(next.went_out, Some(seat(1)));
+    }
+
+    /// §11.1: the hand stops the instant somebody goes out — the players after
+    /// them do not get a final turn.
+    #[test]
+    fn going_out_stops_everyone_else_immediately() {
+        let state = Rig::new()
+            .hand(1, "4H 5H 6H")
+            .hand(2, "KS QS")
+            .meld(1, CLEAN)
+            .stock("9C 8C 7C")
+            .phase(Phase::Melding)
+            .turn(1)
+            .build();
+        let next = apply(&state, seat(1), &lay("4H 5H 6H")).unwrap();
+        assert_eq!(
+            apply(&next, seat(2), &Action::Draw),
+            Err(RuleViolation::HandIsOver)
+        );
+        assert!(!next.stock.is_empty(), "cards were still left to draw");
+    }
+
+    /// §11.2: when the stock runs out instead, nobody gets the going-out bonus.
+    #[test]
+    fn running_out_of_stock_leaves_nobody_going_out() {
+        let state = Rig::new().hand(1, "KS 4H").stock("9C").turn(1).build();
+        let drawn = apply(&state, seat(1), &Action::Draw).unwrap();
+        let done = apply(&drawn, seat(1), &Action::Discard { card: card("KS") }).unwrap();
+        assert_eq!(done.phase, Phase::HandOver);
+        assert_eq!(done.went_out, None);
+    }
+
+    /// Going out still has to satisfy §6 — you cannot open and go out on a
+    /// total below the minimum.
+    #[test]
+    fn going_out_does_not_excuse_the_opening_minimum() {
+        let state = Rig::new()
+            .hand(1, "4H 5H 6H")
+            .meld(0, CLEAN)
+            .phase(Phase::Melding)
+            .turn(1)
+            .build();
+        assert!(matches!(
+            apply(&state, seat(1), &lay("4H 5H 6H")),
+            Err(RuleViolation::NoCleanCanastra | RuleViolation::OpeningMinimumNotMet { .. })
+        ));
     }
 
     #[test]

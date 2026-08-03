@@ -65,6 +65,7 @@ pub fn deal_hand(
             ..TurnContext::default()
         },
         hand_number,
+        went_out: None,
     };
 
     for seat in Seat::ALL {

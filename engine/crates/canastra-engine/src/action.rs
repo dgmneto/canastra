@@ -88,6 +88,9 @@ pub enum RuleViolation {
     /// §5: a card swept up from the pile cannot be melded until the next turn.
     /// It can still be discarded (CLAUDE.md clarification #5).
     CardFrozen { card: Card },
+    /// §11.1: going out needs a clean canastra on the table. A dirty one does
+    /// not qualify, so this move would have emptied the hand illegally.
+    NoCleanCanastra,
 }
 
 impl fmt::Display for RuleViolation {
@@ -119,6 +122,9 @@ impl fmt::Display for RuleViolation {
             }
             RuleViolation::CardFrozen { card } => {
                 write!(f, "the {card} came out of the pile and is frozen this turn")
+            }
+            RuleViolation::NoCleanCanastra => {
+                f.write_str("going out needs a clean canastra on the table")
             }
         }
     }

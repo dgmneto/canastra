@@ -147,6 +147,9 @@ pub struct GameState {
     pub phase: Phase,
     pub turn_context: TurnContext,
     pub hand_number: u32,
+    /// §11.1: who went out, if anyone. `None` after a hand that ended because
+    /// the stock ran dry (§11.2), where nobody collects the bonus.
+    pub went_out: Option<Seat>,
 }
 
 impl GameState {
@@ -165,6 +168,18 @@ impl GameState {
     /// §6: what this partnership must lay in one turn to open.
     pub fn opening_minimum_for(&self, team: Team) -> u32 {
         opening_minimum(self.score(team))
+    }
+
+    /// §11.1 and §12: whether the partnership holds a clean canastra.
+    ///
+    /// This one predicate gates two separate things — whether the partnership
+    /// may go out at all, and whether their red 3s score +100 or −100 — which is
+    /// why closing a clean canastra is not optional in practice.
+    pub fn has_clean_canastra(&self, team: Team) -> bool {
+        self.table(team)
+            .melds
+            .iter()
+            .any(|meld| meld.canastra().is_clean())
     }
 }
 
