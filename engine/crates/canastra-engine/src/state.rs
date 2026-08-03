@@ -2,6 +2,7 @@
 
 use crate::card::Card;
 use crate::meld::Meld;
+use serde::{Deserialize, Serialize};
 
 /// §2: fifteen cards per player.
 pub const HAND_SIZE: usize = 15;
@@ -37,7 +38,8 @@ pub fn opening_minimum(score: i32) -> u32 {
 }
 
 /// One of the four places at the table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(into = "u8", try_from = "u8")]
 pub struct Seat(u8);
 
 impl Seat {
@@ -63,8 +65,26 @@ impl Seat {
     }
 }
 
+/// Seats cross the wire as plain numbers, but come back through [`Seat::new`],
+/// so a payload naming seat 9 is rejected at the boundary rather than panicking
+/// on an array index later.
+impl From<Seat> for u8 {
+    fn from(seat: Seat) -> u8 {
+        seat.0
+    }
+}
+
+impl TryFrom<u8> for Seat {
+    type Error = &'static str;
+
+    fn try_from(index: u8) -> Result<Seat, Self::Error> {
+        Seat::new(index).ok_or("seat must be 0, 1, 2 or 3")
+    }
+}
+
 /// One of the two partnerships.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(into = "u8", try_from = "u8")]
 pub struct Team(u8);
 
 impl Team {
@@ -83,8 +103,22 @@ impl Team {
     }
 }
 
+impl From<Team> for u8 {
+    fn from(team: Team) -> u8 {
+        team.0
+    }
+}
+
+impl TryFrom<u8> for Team {
+    type Error = &'static str;
+
+    fn try_from(index: u8) -> Result<Team, Self::Error> {
+        Team::new(index).ok_or("team must be 0 or 1")
+    }
+}
+
 /// Everything a partnership has in front of it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TeamTable {
     pub melds: Vec<Meld>,
     /// §12: red 3s sit in their own place, outside every meld. They are not a
@@ -96,7 +130,7 @@ pub struct TeamTable {
 }
 
 /// Where the current turn stands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Phase {
     /// §4.1: draw from the stock, or take the whole discard pile.
     AwaitingDraw,
@@ -109,7 +143,7 @@ pub enum Phase {
 }
 
 /// State that lives for exactly one turn and resets at the next.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnContext {
     /// §6: card value of everything laid this turn. The opening minimum has to
     /// be met inside a single turn, so this never carries across turns.
@@ -134,7 +168,7 @@ pub struct TurnContext {
 /// Mutating them outside [`crate::apply`] is outside the engine's contract —
 /// nothing here re-checks the rules. Clients should be handed a redacted view
 /// rather than this, since it contains every hand and the stock order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GameState {
     pub stock: Vec<Card>,
     pub discard: Vec<Card>,

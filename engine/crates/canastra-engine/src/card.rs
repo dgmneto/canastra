@@ -1,12 +1,13 @@
 //! Cards, the 108-card deck, and the classification predicates the rules lean on.
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::str::FromStr;
 
 /// How a Joker is spelled in the string codec.
 pub const JOKER_CODE: &str = "JOKER";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Suit {
     Clubs,
     Diamonds,
@@ -41,7 +42,7 @@ impl Suit {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Rank {
     Two,
     Three,
@@ -265,6 +266,24 @@ impl FromStr for Card {
             rank: Rank::from_code(rank).ok_or_else(invalid)?,
             suit: Suit::from_code(suit).ok_or_else(invalid)?,
         })
+    }
+}
+
+/// Cards cross language boundaries as their compact string form — `"6D"`,
+/// `"JOKER"` — rather than as a nested object. It is far pleasanter to read and
+/// write from TypeScript, keeps payloads small, and reuses the codec that
+/// already exists for [`fmt::Display`] and [`FromStr`], so the two can never
+/// disagree.
+impl Serialize for Card {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Card {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let encoded = String::deserialize(deserializer)?;
+        encoded.parse().map_err(serde::de::Error::custom)
     }
 }
 

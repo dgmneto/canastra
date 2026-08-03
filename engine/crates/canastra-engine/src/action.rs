@@ -3,6 +3,7 @@
 use crate::card::Card;
 use crate::meld::MeldError;
 use crate::state::{Phase, Seat};
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// A single move.
@@ -21,7 +22,8 @@ use std::fmt;
 /// the one that gives other languages natural objects like
 /// `{ "type": "Discard", "card": "3S" }` — cannot express tuple variants, and
 /// the shape of this enum is a published interface once bindings are generated.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
 pub enum Action {
     /// §4.1: take the top card of the stock.
     Draw,
@@ -44,7 +46,8 @@ pub enum Action {
 }
 
 /// Where the three cards captured from the discard pile are going.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
 pub enum MeldTarget {
     /// Open a new meld with them.
     NewMeld,
@@ -56,7 +59,8 @@ pub enum MeldTarget {
 ///
 /// Rich enough to show a human what went wrong and to let a bot's tests assert
 /// on the specific rule that fired.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "error")]
 pub enum RuleViolation {
     /// Somebody else is to move.
     NotYourTurn { current: Seat },

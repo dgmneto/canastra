@@ -1,6 +1,7 @@
 //! Melds: sequences, ace melds, and the wild-card placement rules of §7–§10.
 
 use crate::card::{Card, Rank, Suit};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -10,7 +11,8 @@ pub const MAX_SEQUENCE_LEN: usize = 11;
 /// Bonus threshold — §10 defines a canastra as a meld of seven cards or more.
 pub const CANASTRA_LEN: usize = 7;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason")]
 pub enum MeldError {
     /// §7: every meld is at least three cards.
     TooFewCards,
@@ -55,7 +57,8 @@ impl std::error::Error for MeldError {}
 
 /// One position in a sequence. Every position is filled, so a sequence is
 /// contiguous by construction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "card")]
 pub enum Slot {
     Natural(Card),
     Wild(Card),
@@ -74,7 +77,7 @@ impl Slot {
 }
 
 /// §10 bonus tiers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CanastraKind {
     /// Fewer than seven cards — scores its cards, but no bonus.
     None,
@@ -107,7 +110,7 @@ impl CanastraKind {
 /// rank `low + i`. That representation is what makes §9's locking rule trivial:
 /// since a sequence has no holes and holds at most one wild, a wild has naturals
 /// on both sides exactly when it sits at an interior index.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sequence {
     suit: Suit,
     low: u8,
@@ -327,7 +330,7 @@ fn assemble(
 }
 
 /// §7.2: a set of aces, any suits. Only eight aces exist across the two decks.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcesMeld {
     aces: Vec<Card>,
     wild: Option<Card>,
@@ -390,7 +393,8 @@ impl AcesMeld {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "meld")]
 pub enum Meld {
     Sequence(Sequence),
     Aces(AcesMeld),

@@ -8,3 +8,10 @@ description = "Rules engine and state machine for Canastra (house rules)"
 [dependencies]
 rand_chacha.workspace = true
 rand_core.workspace = true
+# Not optional: every consumer of this crate crosses a serialization boundary
+# (JSON for the server, JS values for wasm), and gating the derives behind a
+# feature would put a cfg_attr on every public type for no real gain.
+serde.workspace = true
+
+[dev-dependencies]
+serde_json = "1"

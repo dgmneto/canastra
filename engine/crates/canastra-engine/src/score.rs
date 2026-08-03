@@ -3,12 +3,13 @@
 use crate::action::RuleViolation;
 use crate::deal::deal_hand;
 use crate::state::{GOING_OUT_BONUS, GameState, Phase, RED_THREE_VALUE, Seat, TARGET_SCORE, Team};
+use serde::{Deserialize, Serialize};
 
 /// §13: one partnership's score for one hand, itemised.
 ///
 /// Broken out rather than reduced to a single number so a UI can lay out the
 /// arithmetic the way the score sheet in §17 does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HandScore {
     /// §10: 200 per dirty canastra, 500 per clean one, 1000 for clean aces.
     pub canastra_bonus: i32,

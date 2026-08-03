@@ -2,6 +2,7 @@
 
 use crate::card::Card;
 use crate::state::{GameState, Phase, Seat, TeamTable};
+use serde::{Deserialize, Serialize};
 
 /// The game as a single seat sees it.
 ///
@@ -13,7 +14,7 @@ use crate::state::{GameState, Phase, Seat, TeamTable};
 ///
 /// Bots train against this for the same reason: a policy that could see the
 /// stock would learn nothing transferable to a real table.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlayerView {
     /// Whose view this is.
     pub seat: Seat,
