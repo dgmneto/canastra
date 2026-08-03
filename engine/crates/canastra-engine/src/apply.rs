@@ -1,9 +1,9 @@
 //! The state machine: apply an [`Action`] to a [`GameState`].
 
-use crate::action::{Action, RuleViolation};
-use crate::card::Card;
+use crate::action::{Action, MeldTarget, RuleViolation};
+use crate::card::{Card, Rank};
 use crate::deal::resolve_red_threes;
-use crate::meld::Meld;
+use crate::meld::{Meld, MeldError};
 use crate::state::{GameState, Phase, Seat, TurnContext};
 
 /// Check whether a move is legal, without building the state it would produce.
@@ -40,6 +40,9 @@ pub fn apply(state: &GameState, seat: Seat, action: &Action) -> Result<GameState
         Action::Draw => draw(&mut next, seat)?,
         Action::KeepDrawnCard => keep_drawn(&mut next, seat)?,
         Action::RefuseDrawnCard => refuse_drawn(&mut next, seat)?,
+        Action::TakeDiscardPile { core, target } => {
+            take_discard_pile(&mut next, seat, *core, target)?
+        }
         Action::LayMeld { cards } => lay_meld(&mut next, seat, cards)?,
         Action::AddToMeld { meld, cards } => add_to_meld(&mut next, seat, *meld, cards)?,
         Action::Discard { card } => discard(&mut next, seat, *card)?,
@@ -124,6 +127,103 @@ fn take_offered(state: &mut GameState) -> Card {
         .expect("AwaitingRefusalChoice always holds the card on offer")
 }
 
+/// §5: take the entire discard pile instead of drawing.
+///
+/// The bar is deliberately high. The player must hold two natural cards that,
+/// with the top card, make a contiguous three of one suit (or three aces), those
+/// three go down together into a single meld, and everything else in the pile
+/// enters their hand frozen until the next turn.
+fn take_discard_pile(
+    state: &mut GameState,
+    seat: Seat,
+    core: [Card; 2],
+    target: &MeldTarget,
+) -> Result<(), RuleViolation> {
+    require_phase(state, Phase::AwaitingDraw)?;
+
+    let top = *state
+        .discard
+        .last()
+        .ok_or(RuleViolation::DiscardPileEmpty)?;
+    // §5: a black 3 or a wild on top puts the pile out of reach. Since the next
+    // player is always an opponent, throwing a blocker never costs the partner.
+    if top.is_black_three() || top.is_wild() {
+        return Err(RuleViolation::DiscardPileBlocked { card: top });
+    }
+    if core.iter().any(|card| card.is_wild()) {
+        return Err(RuleViolation::WildInDiscardCore);
+    }
+
+    let block = [top, core[0], core[1]];
+    let core_meld = match target {
+        MeldTarget::NewMeld => {
+            Meld::new(&block).map_err(|reason| RuleViolation::InvalidMeld { reason })?
+        }
+        MeldTarget::Existing { meld } => {
+            let existing = state.tables[seat.team().index()]
+                .melds
+                .get(*meld)
+                .cloned()
+                .ok_or(RuleViolation::NoSuchMeld { meld: *meld })?;
+            fold_block_into(existing, &block)?
+        }
+    };
+
+    // Only the two cards from hand actually leave it; the third came off the pile.
+    take_all_from_hand(state, seat, &core)?;
+    // §5: the minimum counts everything that goes down this turn, the captured
+    // top card included.
+    record_laid(state, &block);
+
+    let index = match target {
+        MeldTarget::NewMeld => {
+            state.tables[seat.team().index()].melds.push(core_meld);
+            state.tables[seat.team().index()].melds.len() - 1
+        }
+        MeldTarget::Existing { meld } => {
+            state.tables[seat.team().index()].melds[*meld] = core_meld;
+            *meld
+        }
+    };
+
+    // §5: the remainder joins the hand but is frozen for the rest of the turn.
+    // Pop the captured card rather than filtering the pile by equality — the
+    // deck has two of everything, and a second copy further down is a different
+    // card that must still be swept up.
+    state.discard.pop();
+    let swept: Vec<Card> = state.discard.drain(..).collect();
+    state.hands[seat.index()].extend(swept.iter().copied());
+    state.turn_context.frozen = swept;
+    state.turn_context.took_pile = true;
+    state.turn_context.pile_core_meld = Some(index);
+
+    state.phase = Phase::Melding;
+    Ok(())
+}
+
+/// Fold the captured three into an existing meld as one block.
+///
+/// Order matters for a run: a block that sits below the meld has to be fed in
+/// from its top card down, and one that sits above from the bottom up, or an
+/// intermediate step would leave a gap. Trying both orders covers each case
+/// without the caller having to care.
+fn fold_block_into(meld: Meld, block: &[Card]) -> Result<Meld, RuleViolation> {
+    let mut ascending: Vec<Card> = block.to_vec();
+    ascending.sort_by_key(|card| card.rank().and_then(Rank::sequence_index));
+
+    if let Ok(folded) = feed(meld.clone(), ascending.iter().copied()) {
+        return Ok(folded);
+    }
+    feed(meld, ascending.into_iter().rev()).map_err(|reason| RuleViolation::InvalidMeld { reason })
+}
+
+fn feed(mut meld: Meld, cards: impl Iterator<Item = Card>) -> Result<Meld, MeldError> {
+    for card in cards {
+        meld.add_card(card)?;
+    }
+    Ok(meld)
+}
+
 /// §4.2: put a new meld on the table.
 ///
 /// The meld is validated before any card leaves the hand, so pointing at cards
@@ -147,6 +247,13 @@ fn add_to_meld(
 ) -> Result<(), RuleViolation> {
     require_phase(state, Phase::Melding)?;
     let team = seat.team().index();
+
+    // §5: the meld that captured the pile accepts no wild for the rest of this
+    // turn. Other melds are free, and the restriction lifts next turn — from
+    // then on it is an ordinary meld.
+    if state.turn_context.pile_core_meld == Some(index) && cards.iter().any(|card| card.is_wild()) {
+        return Err(RuleViolation::WildInPileCoreMeld);
+    }
 
     // Build the extended meld off to the side first: a run of lay-offs has to
     // land all together or not at all.
@@ -177,6 +284,25 @@ fn take_all_from_hand(
             .iter()
             .position(|held| *held == card)
             .ok_or(RuleViolation::CardNotInHand { card })?;
+
+        // §5: a card swept out of the pile is unusable until the next turn.
+        // Counting copies rather than tracking identity is what lets a player
+        // meld a card they already held when an identical one came out of the
+        // pile — the two are interchangeable, so only the count matters.
+        let held = state.hands[seat.index()]
+            .iter()
+            .filter(|held| **held == card)
+            .count();
+        let frozen = state
+            .turn_context
+            .frozen
+            .iter()
+            .filter(|held| **held == card)
+            .count();
+        if held <= frozen {
+            return Err(RuleViolation::CardFrozen { card });
+        }
+
         state.hands[seat.index()].remove(position);
     }
     Ok(())
@@ -242,6 +368,7 @@ fn end_turn(state: &mut GameState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::action::MeldTarget;
     use crate::deal::new_game;
     use crate::meld::MeldError;
     use crate::state::{Phase, Seat};
@@ -706,6 +833,275 @@ mod tests {
             apply(&laid, seat(1), &Action::Discard { card: card("2S") }),
             Err(RuleViolation::OpeningMinimumNotMet { .. })
         ));
+    }
+
+    // ---- §5, taking the discard pile ----
+
+    fn take_pile(core: &str, target: MeldTarget) -> Action {
+        let core = cards(core);
+        Action::TakeDiscardPile {
+            core: [core[0], core[1]],
+            target,
+        }
+    }
+
+    /// §5 worked example: with the 6♦ on top, the only hands that serve are
+    /// `4♦ 5♦`, `5♦ 7♦` and `7♦ 8♦` — the top card may sit anywhere in the three.
+    #[test]
+    fn spec_example_hands_that_capture_the_six_of_diamonds() {
+        for core in ["4D 5D", "5D 7D", "7D 8D"] {
+            let state = Rig::new()
+                .hand(1, "4D 5D 7D 8D")
+                .discard("9C 6D")
+                .opened(1)
+                .turn(1)
+                .build();
+            let next = apply(&state, seat(1), &take_pile(core, MeldTarget::NewMeld))
+                .unwrap_or_else(|e| panic!("{core} should capture the 6D, got {e:?}"));
+            assert_eq!(next.table(seat(1).team()).melds[0].len(), 3);
+            assert_eq!(next.phase, Phase::Melding);
+        }
+    }
+
+    #[test]
+    fn cards_that_do_not_reach_the_top_card_cannot_capture_it() {
+        let state = Rig::new()
+            .hand(1, "8D 9D")
+            .discard("9C 6D")
+            .opened(1)
+            .turn(1)
+            .build();
+        assert_eq!(
+            apply(&state, seat(1), &take_pile("8D 9D", MeldTarget::NewMeld)),
+            Err(RuleViolation::InvalidMeld {
+                reason: MeldError::NotASequence
+            })
+        );
+    }
+
+    /// §5: "2s e coringas não podem ser usados" for this play.
+    #[test]
+    fn a_wild_cannot_be_part_of_the_capturing_three() {
+        let state = Rig::new()
+            .hand(1, "5D 2D")
+            .discard("9C 6D")
+            .opened(1)
+            .turn(1)
+            .build();
+        assert_eq!(
+            apply(&state, seat(1), &take_pile("5D 2D", MeldTarget::NewMeld)),
+            Err(RuleViolation::WildInDiscardCore)
+        );
+    }
+
+    /// §5: "Vale com Ases" — three aces work just as well as a run.
+    #[test]
+    fn three_aces_capture_an_ace_on_top() {
+        let state = Rig::new()
+            .hand(1, "AH AD")
+            .discard("9C AS")
+            .opened(1)
+            .turn(1)
+            .build();
+        let next = apply(&state, seat(1), &take_pile("AH AD", MeldTarget::NewMeld)).unwrap();
+        assert_eq!(next.table(seat(1).team()).melds[0].len(), 3);
+    }
+
+    /// §5: "Todo o restante do lixo vai para a sua mão."
+    #[test]
+    fn the_rest_of_the_pile_goes_to_the_hand() {
+        let state = Rig::new()
+            .hand(1, "4D 5D")
+            .discard("9C TC 6D")
+            .opened(1)
+            .turn(1)
+            .build();
+        let next = apply(&state, seat(1), &take_pile("4D 5D", MeldTarget::NewMeld)).unwrap();
+        assert!(next.discard.is_empty());
+        assert_eq!(next.hand(seat(1)), cards("9C TC"));
+    }
+
+    /// §5: "Nenhuma dessas cartas recolhidas pode ser usada neste turno."
+    #[test]
+    fn cards_swept_up_from_the_pile_cannot_be_melded_this_turn() {
+        let state = Rig::new()
+            .hand(1, "4D 5D")
+            .discard("9H TH JH 6D")
+            .opened(1)
+            .turn(1)
+            .build();
+        let next = apply(&state, seat(1), &take_pile("4D 5D", MeldTarget::NewMeld)).unwrap();
+        assert_eq!(
+            apply(&next, seat(1), &lay("9H TH JH")),
+            Err(RuleViolation::CardFrozen { card: card("9H") })
+        );
+    }
+
+    /// The freeze is counted as a multiset, so a copy the player already held
+    /// stays playable even when an identical card comes up out of the pile.
+    #[test]
+    fn a_copy_you_already_held_stays_playable() {
+        let state = Rig::new()
+            .hand(1, "4D 5D 6H 7H 8H")
+            .discard("8H 6D")
+            .opened(1)
+            .turn(1)
+            .build();
+        let next = apply(&state, seat(1), &take_pile("4D 5D", MeldTarget::NewMeld)).unwrap();
+        assert_eq!(next.turn_context.frozen, cards("8H"));
+        apply(&next, seat(1), &lay("6H 7H 8H")).expect("the 8H they already held");
+    }
+
+    /// CLAUDE.md clarification #5: "usada" means melded. A player who took the
+    /// pile still has to discard, and may have nothing but frozen cards left.
+    #[test]
+    fn frozen_cards_may_still_be_discarded() {
+        let state = Rig::new()
+            .hand(1, "4D 5D")
+            .discard("9H 6D")
+            .stock("2C 3S")
+            .opened(1)
+            .turn(1)
+            .build();
+        let next = apply(&state, seat(1), &take_pile("4D 5D", MeldTarget::NewMeld)).unwrap();
+        assert_eq!(next.hand(seat(1)), cards("9H"));
+        apply(&next, seat(1), &Action::Discard { card: card("9H") })
+            .expect("a frozen card can still be thrown away");
+    }
+
+    /// §5: a black 3 on top blocks the pile — that is its whole purpose.
+    #[test]
+    fn a_black_three_on_top_blocks_the_pile() {
+        let state = Rig::new()
+            .hand(1, "4D 5D")
+            .discard("9C 3S")
+            .opened(1)
+            .turn(1)
+            .build();
+        assert_eq!(
+            apply(&state, seat(1), &take_pile("4D 5D", MeldTarget::NewMeld)),
+            Err(RuleViolation::DiscardPileBlocked { card: card("3S") })
+        );
+    }
+
+    /// §5: a 2 on top blocks too — a wild is not a card you can capture.
+    #[test]
+    fn a_two_on_top_blocks_the_pile() {
+        let state = Rig::new()
+            .hand(1, "4D 5D")
+            .discard("9C 2S")
+            .opened(1)
+            .turn(1)
+            .build();
+        assert_eq!(
+            apply(&state, seat(1), &take_pile("4D 5D", MeldTarget::NewMeld)),
+            Err(RuleViolation::DiscardPileBlocked { card: card("2S") })
+        );
+    }
+
+    #[test]
+    fn an_empty_pile_cannot_be_taken() {
+        let state = Rig::new().hand(1, "4D 5D").opened(1).turn(1).build();
+        assert_eq!(
+            apply(&state, seat(1), &take_pile("4D 5D", MeldTarget::NewMeld)),
+            Err(RuleViolation::DiscardPileEmpty)
+        );
+    }
+
+    /// §5: the three may join a meld the partnership already has down, so long
+    /// as they go in as one block. Here `6♦7♦8♦` lands under an existing
+    /// `9♦10♦J♦`, so the block has to be fed in from the top down.
+    #[test]
+    fn the_capturing_three_may_join_an_existing_meld() {
+        let state = Rig::new()
+            .hand(1, "7D 8D")
+            .discard("9C 6D")
+            .meld(1, "9D TD JD")
+            .turn(1)
+            .build();
+        let next = apply(
+            &state,
+            seat(1),
+            &take_pile("7D 8D", MeldTarget::Existing { meld: 0 }),
+        )
+        .unwrap();
+        assert_eq!(next.table(seat(1).team()).melds.len(), 1);
+        assert_eq!(next.table(seat(1).team()).melds[0].len(), 6);
+    }
+
+    /// §5: "No mesmo bloco, porém, 2s e Coringas continuam proibidos."
+    #[test]
+    fn no_wild_may_join_the_capturing_meld_that_turn() {
+        let state = Rig::new()
+            .hand(1, "4D 5D JOKER")
+            .discard("9C 6D")
+            .opened(1)
+            .turn(1)
+            .build();
+        let next = apply(&state, seat(1), &take_pile("4D 5D", MeldTarget::NewMeld)).unwrap();
+        assert_eq!(
+            apply(
+                &next,
+                seat(1),
+                &Action::AddToMeld {
+                    meld: 0,
+                    cards: cards("JOKER")
+                }
+            ),
+            Err(RuleViolation::WildInPileCoreMeld)
+        );
+    }
+
+    /// §5: "em outros jogos são livres" — the restriction is on that meld only.
+    #[test]
+    fn a_wild_may_still_join_a_different_meld_that_turn() {
+        let state = Rig::new()
+            .hand(1, "4D 5D JOKER QS KS")
+            .discard("9C 6D")
+            .opened(1)
+            .turn(1)
+            .build();
+        let next = apply(&state, seat(1), &take_pile("4D 5D", MeldTarget::NewMeld)).unwrap();
+        apply(&next, seat(1), &lay("JOKER QS KS")).expect("a different meld is unrestricted");
+    }
+
+    /// §5 worked example: with the 6♦ on top and `4♦ 5♦` in hand, laying
+    /// `4♦5♦6♦` (15) alongside `Coringa-Q♠-K♠-A♠` (85) reaches 100 — enough to
+    /// open and take the pile in the same turn.
+    #[test]
+    fn opening_and_taking_the_pile_in_one_turn() {
+        let state = Rig::new()
+            .hand(1, "4D 5D JOKER QS KS AS 8C")
+            .discard("9C 6D")
+            .stock("2C 3S")
+            .turn(1)
+            .build();
+        let taken = apply(&state, seat(1), &take_pile("4D 5D", MeldTarget::NewMeld)).unwrap();
+        assert_eq!(taken.turn_context.laid_value, 15);
+
+        let laid = apply(&taken, seat(1), &lay("JOKER QS KS AS")).unwrap();
+        assert_eq!(laid.turn_context.laid_value, 100);
+
+        let done = apply(&laid, seat(1), &Action::Discard { card: card("8C") }).unwrap();
+        assert!(done.table(seat(1).team()).opened);
+    }
+
+    #[test]
+    fn the_pile_is_taken_instead_of_drawing_not_after() {
+        let state = Rig::new()
+            .hand(1, "4D 5D")
+            .discard("9C 6D")
+            .stock("2C")
+            .opened(1)
+            .turn(1)
+            .phase(Phase::Melding)
+            .build();
+        assert_eq!(
+            apply(&state, seat(1), &take_pile("4D 5D", MeldTarget::NewMeld)),
+            Err(RuleViolation::WrongPhase {
+                phase: Phase::Melding
+            })
+        );
     }
 
     #[test]

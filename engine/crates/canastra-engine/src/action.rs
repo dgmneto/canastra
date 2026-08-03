@@ -29,12 +29,27 @@ pub enum Action {
     KeepDrawnCard,
     /// §3: the lead player throws their first card away and takes another.
     RefuseDrawnCard,
+    /// §5: take the whole discard pile instead of drawing.
+    ///
+    /// `core` is the two natural cards from hand that, together with the card on
+    /// top of the pile, form the compulsory three. All three land in one meld —
+    /// splitting them across melds is not allowed.
+    TakeDiscardPile { core: [Card; 2], target: MeldTarget },
     /// §4.2: put a new meld on your partnership's table.
     LayMeld { cards: Vec<Card> },
     /// §4.2: add cards to a meld your partnership already has down.
     AddToMeld { meld: usize, cards: Vec<Card> },
     /// §4.3: put a card on the pile, ending the turn.
     Discard { card: Card },
+}
+
+/// Where the three cards captured from the discard pile are going.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MeldTarget {
+    /// Open a new meld with them.
+    NewMeld,
+    /// Fold them into a meld the partnership already has down.
+    Existing { meld: usize },
 }
 
 /// Why a move was refused.
@@ -60,6 +75,19 @@ pub enum RuleViolation {
     InvalidMeld { reason: MeldError },
     /// §6: a partnership's first melds have to clear the bar inside one turn.
     OpeningMinimumNotMet { laid: u32, required: u32 },
+    /// §5: there is no pile to take.
+    DiscardPileEmpty,
+    /// §5: a black 3 or a wild on top puts the pile out of reach. This is
+    /// exactly what makes a black 3 worth holding.
+    DiscardPileBlocked { card: Card },
+    /// §5: "2s e coringas não podem ser usados" to capture the pile.
+    WildInDiscardCore,
+    /// §5: the meld that captured the pile takes no wild for the rest of the
+    /// turn. Other melds are unaffected, and the restriction lifts next turn.
+    WildInPileCoreMeld,
+    /// §5: a card swept up from the pile cannot be melded until the next turn.
+    /// It can still be discarded (CLAUDE.md clarification #5).
+    CardFrozen { card: Card },
 }
 
 impl fmt::Display for RuleViolation {
@@ -78,6 +106,19 @@ impl fmt::Display for RuleViolation {
             RuleViolation::InvalidMeld { reason } => write!(f, "{reason}"),
             RuleViolation::OpeningMinimumNotMet { laid, required } => {
                 write!(f, "laid {laid} of the {required} needed to open")
+            }
+            RuleViolation::DiscardPileEmpty => f.write_str("the discard pile is empty"),
+            RuleViolation::DiscardPileBlocked { card } => {
+                write!(f, "the {card} on top blocks the pile")
+            }
+            RuleViolation::WildInDiscardCore => {
+                f.write_str("the three that take the pile must all be natural")
+            }
+            RuleViolation::WildInPileCoreMeld => {
+                f.write_str("no wild card may join that meld this turn")
+            }
+            RuleViolation::CardFrozen { card } => {
+                write!(f, "the {card} came out of the pile and is frozen this turn")
             }
         }
     }

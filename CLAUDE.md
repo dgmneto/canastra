@@ -35,6 +35,7 @@ Update this file's "Commands" and "Architecture" sections as each component is s
 2. **Exact tie at 5000+:** if both duplas cross 5000 in the same hand with equal points, play another hand (sudden death) instead of declaring a draw.
 3. **Stock depleted via red-3 replacement draw** (not a normal turn-draw): treat identically to section 11.2 — the player whose replacement draw empties the stock completes their turn normally (may lay down/bater), then the hand ends.
 4. **First-turn refusal when the first card drawn is a red 3:** the red 3 goes to the table + replacement draw as usual, but the refusal privilege is *not* burned — it carries over and applies to the replacement card.
+5. **Cards frozen by taking the discard pile:** §5 says they "não pode ser usada neste turno" without saying whether discarding counts as using. Read "usada" as *melded* — a frozen card may be discarded but not melded. This case is reachable: a player who takes the pile holding only the two core cards melds both and is left holding nothing but frozen cards, yet still owes a discard.
 
 ## Commands
 
