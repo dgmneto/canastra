@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+canastra-engine = { path = "crates/canastra-engine" }
+
+# ChaCha8 is a specified, frozen algorithm, so `seed -> deal` stays reproducible
+# across dependency upgrades. Shuffling is hand-rolled Fisher-Yates for the same
+# reason: `rand`'s `shuffle` makes no cross-version stability guarantee, and a
+# routine bump would silently invalidate every recorded replay log.
+rand_chacha = "0.9"
+rand_core = "0.9"
+
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
