@@ -11,9 +11,11 @@ pub mod meld;
 pub mod score;
 pub mod state;
 pub mod testkit;
+pub mod view;
 
 pub use action::{Action, RuleViolation};
 pub use apply::{apply, validate};
 pub use deal::new_game;
 pub use score::{HandScore, score_hand, settle_hand};
 pub use state::{GameState, Phase, Seat, Team};
+pub use view::{PlayerView, observe};

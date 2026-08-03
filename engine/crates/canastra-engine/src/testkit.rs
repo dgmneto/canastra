@@ -53,6 +53,13 @@ impl Rig {
         }
     }
 
+    /// §5: cards swept out of the pile this turn, unusable until the next.
+    pub fn frozen(mut self, spec: &str) -> Rig {
+        self.state.turn_context.frozen = cards(spec);
+        self.state.turn_context.took_pile = true;
+        self
+    }
+
     /// §11.1: record that this seat went out.
     pub fn went_out(mut self, seat: usize) -> Rig {
         self.state.went_out = Some(Seat::new(seat as u8).expect("valid seat"));
