@@ -39,8 +39,69 @@ Update this file's "Commands" and "Architecture" sections as each component is s
 
 ## Commands
 
-Not yet applicable — no build tooling exists in the repo yet.
+All Rust commands run from `engine/`.
+
+```bash
+cargo test --workspace
+```
+
+```bash
+cargo test -p canastra-engine wildcard_is_locked -- --exact --nocapture
+```
+
+Gates that must pass before any change is done:
+
+```bash
+cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --check
+```
+
+The wasm promise is checked by building, not by assertion:
+
+```bash
+cargo build -p canastra-wasm --target wasm32-unknown-unknown
+```
 
 ## Architecture
 
-Not yet applicable — no code exists in the repo yet.
+`engine/` is a self-contained Cargo workspace. `crates/canastra-engine` is the rules core and has no
+binding dependencies; `crates/canastra-wasm` holds the JavaScript glue. The `bot/` and web app
+projects will be sibling top-level directories — nothing but shared docs lives at the repo root.
+
+**The engine is a pure function.** `apply(&GameState, Seat, &Action) -> Result<GameState, RuleViolation>`
+never mutates its input. This is load-bearing, not stylistic: §6 requires a partnership's opening melds
+to clear 75 (or 120) within a *single turn*, and that total is only knowable when the player tries to
+discard. Rather than staging melds in a side buffer, a player who lays too little simply cannot end
+their turn, and the caller backs out by reusing the state it held when the turn began. `canastra-wasm`'s
+`Game` handle does exactly this to implement `rewindTurn`. The same purity lets a searching bot clone
+positions freely.
+
+`seat` is an explicit parameter rather than being read from `state.turn`, so the engine itself rejects
+out-of-turn moves. A multiplayer server must never have to trust a client's claim about which player it is.
+
+**Sequences are contiguous slot arrays.** `Sequence { suit, low, slots }` where `slots[i]` covers rank
+`low + i` and every position is filled. This collapses §9's wild-card locking rule — "naturais dos dois
+lados" — into one invariant: **a wild is locked exactly when it sits at an interior index.** A free wild
+at either end accepts the same future cards, so it is stored canonically high and only drops low when the
+Ace is already taken.
+
+**`GameState` is omniscient; `PlayerView` is what goes on the wire.** The state holds all four hands and
+the stock order. `observe(state, seat)` redacts it, and the redaction is structural — `PlayerView` has
+nowhere to put another player's cards. Never send a `GameState` to a client.
+
+**Randomness only exists at deal time.** Canastra fixes the stock when cards are dealt and never
+reshuffles, so no RNG lives in `GameState`. A whole match replays from `seed` plus its action log. The
+shuffle is hand-rolled Fisher-Yates over ChaCha8 rather than a helper crate's `shuffle`, because no
+shuffle helper promises a stable algorithm across releases and a routine upgrade would silently
+invalidate every recorded game. `tests/boundary.rs` pins a literal opening hand to catch exactly that.
+
+**Cross-language boundary.** Other languages never construct Rust types — they send plain data and serde
+validates it. Two constraints follow and must be preserved: no `Action` variant may be a *tuple* variant
+(serde's internal tagging cannot express them; unit and struct variants are both fine), and `Card`
+serializes as a compact string via its `Display`/`FromStr` codec. `tests/boundary.rs` pins these shapes
+as literals — changing one changes every consumer.
+
+`testkit::Rig` builds arbitrary positions (`Rig::new().hand(1, "4D 5D").discard("9C 6D").build()`). It
+lives in the library rather than a `#[cfg(test)]` module so integration tests and downstream crates can
+reproduce a reported position, which is usually a table rather than a seed.
+
+Section references throughout the code (§5, §9, …) point at the rules spec.
