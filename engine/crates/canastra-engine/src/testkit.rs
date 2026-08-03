@@ -48,8 +48,15 @@ impl Rig {
                 turn_context: TurnContext::default(),
                 hand_number: 1,
                 went_out: None,
+                seed: 0,
             },
         }
+    }
+
+    /// §11.1: record that this seat went out.
+    pub fn went_out(mut self, seat: usize) -> Rig {
+        self.state.went_out = Some(Seat::new(seat as u8).expect("valid seat"));
+        self
     }
 
     pub fn hand(mut self, seat: usize, spec: &str) -> Rig {

@@ -91,6 +91,8 @@ pub enum RuleViolation {
     /// §11.1: going out needs a clean canastra on the table. A dirty one does
     /// not qualify, so this move would have emptied the hand illegally.
     NoCleanCanastra,
+    /// The hand is still being played, so there is nothing to settle yet.
+    HandNotOver,
 }
 
 impl fmt::Display for RuleViolation {
@@ -126,6 +128,7 @@ impl fmt::Display for RuleViolation {
             RuleViolation::NoCleanCanastra => {
                 f.write_str("going out needs a clean canastra on the table")
             }
+            RuleViolation::HandNotOver => f.write_str("the hand is still being played"),
         }
     }
 }

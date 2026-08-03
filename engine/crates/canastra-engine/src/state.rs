@@ -150,6 +150,9 @@ pub struct GameState {
     /// §11.1: who went out, if anyone. `None` after a hand that ended because
     /// the stock ran dry (§11.2), where nobody collects the bonus.
     pub went_out: Option<Seat>,
+    /// The match seed. Every hand's shuffle is derived from it, so a whole
+    /// match replays from this one number plus its action log.
+    pub seed: u64,
 }
 
 impl GameState {
@@ -168,6 +171,21 @@ impl GameState {
     /// §6: what this partnership must lay in one turn to open.
     pub fn opening_minimum_for(&self, team: Team) -> u32 {
         opening_minimum(self.score(team))
+    }
+
+    /// §14: the partnership that won, once the match is over.
+    ///
+    /// Derived rather than stored, so it cannot disagree with the scores.
+    pub fn winner(&self) -> Option<Team> {
+        if self.phase != Phase::MatchOver {
+            return None;
+        }
+        let [first, second] = self.scores;
+        match first.cmp(&second) {
+            std::cmp::Ordering::Greater => Some(Team::ALL[0]),
+            std::cmp::Ordering::Less => Some(Team::ALL[1]),
+            std::cmp::Ordering::Equal => None,
+        }
     }
 
     /// §11.1 and §12: whether the partnership holds a clean canastra.

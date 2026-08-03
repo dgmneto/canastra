@@ -24,22 +24,33 @@ fn shuffled(seed: u64) -> Vec<Card> {
     cards
 }
 
-/// Start a fresh match: seat 0 deals the first hand.
-pub fn new_game(seed: u64) -> GameState {
-    deal_hand(shuffled(seed), Seat::ALL[0], [0, 0], 1)
+/// Derive one hand's shuffle from the match seed.
+///
+/// A match runs to 5000 and takes several hands, but the whole thing should
+/// still replay from a single number, so each hand mixes the match seed with its
+/// own number rather than carrying RNG state around in [`GameState`]. The mixer
+/// is SplitMix64's finaliser, chosen because it is fully specified and will not
+/// drift.
+fn hand_seed(match_seed: u64, hand_number: u32) -> u64 {
+    let mut mixed =
+        match_seed.wrapping_add(u64::from(hand_number).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    mixed ^ (mixed >> 31)
 }
 
-/// Deal one hand from `stock`.
+/// Start a fresh match: seat 0 deals the first hand.
+pub fn new_game(seed: u64) -> GameState {
+    deal_hand(seed, Seat::ALL[0], [0, 0], 1)
+}
+
+/// Deal one hand of a match.
 ///
 /// §2: fifteen cards each, dealt round-robin starting to the dealer's right, and
 /// the discard pile starts empty. §12: any red 3 among the opening fifteen goes
 /// straight to its partnership's table and pulls a replacement.
-pub fn deal_hand(
-    mut stock: Vec<Card>,
-    dealer: Seat,
-    scores: [i32; 2],
-    hand_number: u32,
-) -> GameState {
+pub fn deal_hand(match_seed: u64, dealer: Seat, scores: [i32; 2], hand_number: u32) -> GameState {
+    let mut stock = shuffled(hand_seed(match_seed, hand_number));
     let mut hands: [Vec<Card>; 4] = Default::default();
     let mut seat = dealer.next();
     for _ in 0..HAND_SIZE {
@@ -66,6 +77,7 @@ pub fn deal_hand(
         },
         hand_number,
         went_out: None,
+        seed: match_seed,
     };
 
     for seat in Seat::ALL {
