@@ -88,6 +88,14 @@ pub enum RuleViolation {
     InvalidMeld { reason: MeldError },
     /// §6: a partnership's first melds have to clear the bar inside one turn.
     OpeningMinimumNotMet { laid: u32, required: u32 },
+    /// §6, caught early: this lay has already put the opening minimum out of
+    /// reach for the rest of the turn. `best_possible` is what the player could
+    /// still get to even by laying every remaining card at face value.
+    CannotReachOpeningMinimum {
+        laid: u32,
+        best_possible: u32,
+        required: u32,
+    },
     /// §5: there is no pile to take.
     DiscardPileEmpty,
     /// §5: a black 3 or a wild on top puts the pile out of reach. This is
@@ -136,6 +144,15 @@ impl fmt::Display for RuleViolation {
             RuleViolation::OpeningMinimumNotMet { laid, required } => {
                 write!(f, "laid {laid} of the {required} needed to open")
             }
+            RuleViolation::CannotReachOpeningMinimum {
+                laid,
+                best_possible,
+                required,
+            } => write!(
+                f,
+                "that leaves you at most {best_possible} this turn ({laid} down), \
+                 short of the {required} needed to open"
+            ),
             RuleViolation::DiscardPileEmpty => f.write_str("the discard pile is empty"),
             RuleViolation::DiscardPileBlocked { card } => {
                 write!(f, "the {card} on top blocks the pile")

@@ -16,10 +16,10 @@ full: the reproduction is the useful part, and it documents what the regression 
 | F2 | Malformed JSON builds invalid melds; accessors panic | high | **fixed** |
 | F3 | `GameState` deserializes with impossible contents | high | **fixed** |
 | F4 | Empty `AddToMeld` poisons the turn | medium | **fixed** |
-| F5 | `rewindTurn` can revert to the wrong turn | medium | **needs a design decision first** |
-| F6 | Trust boundary undefended by construction | medium | open — *not* covered by F2/F3 |
+| F5 | Opening minimum only judged at the discard | medium | **fixed** (eager check) |
+| F6 | Trust boundary undefended by construction | medium | open — a server obligation |
 | F7 | No `legal_actions`; `validate` clones | low | open, deliberately |
-| F8 | Meld JSON awkward for other languages | low | open |
+| F8 | Meld JSON awkward for other languages | low | **fixed** |
 | F9 | One weak test | low | **fixed** |
 | F10 | proptest and ts-rs not delivered | low | closed, not relevant |
 | F11 | A lay could strand the player's last card | medium | **fixed** |
@@ -148,41 +148,41 @@ lay-off on a mis-click hands the player a dead turn with no explanation.
 
 ---
 
-## F5 — `rewindTurn` reverts too far — and should it exist at all? (medium, blocked on a decision)
+## F5 — The opening minimum was only judged at the discard (medium) — FIXED
 
-**By code reading**, not reproduced — exercising it needs a JS host.
+The original finding was a bug in `rewindTurn`. The real issue turned out to be
+why `rewindTurn` existed at all.
 
-`canastra-wasm/src/lib.rs` refreshes `turn_start` inside `apply`, but only when the phase *before* the
-action is `AwaitingDraw`, so the checkpoint is written on the first action of a turn. Call
-`rewindTurn()` before taking any action — a player clicking "restart turn" as their opening move — and
-`turn_start` still holds the *previous* player's turn start, silently rewinding a whole turn too far.
-Fixing the bug is two lines: also refresh after applying, whenever the resulting phase is
-`AwaitingDraw`.
+§6 requires the opening minimum to be met across a single turn, and the engine only judged it when the
+player tried to discard. A player who laid 45 toward a 75 minimum had made a move the rules would not
+let them complete, and the only escape was to abandon the turn. That is undo by another name, and this
+game's moves are final.
 
-**But the prior question is whether rewind belongs in this game at all.** The project's stated
-philosophy is that every action is final and nothing can be taken back, and a general undo plainly
-violates that.
+**Fix applied.** `check_opening_reachable` now runs after every lay. It bounds what the player could
+still add — every card still usable, at full face value — and refuses the lay outright if even that
+cannot reach the minimum. The error carries `laid`, `best_possible` and `required`, so a UI can say
+exactly how short they would be. §5's frozen cards are excluded, since they cannot be melded this turn.
 
-It was never meant as an undo. It exists because §6 cannot be judged until the discard: the opening
-minimum has to be met across a single turn, and whether it was met is unknowable until the player tries
-to end the turn. A player who lays 45 toward a 75 minimum has made a move the rules will not let them
-complete, and without some escape the game stops. It is closer to "that turn was never legal" than to
-"I changed my mind".
+**The bound is deliberately optimistic, and that is the safe direction.** It asks whether the points
+could still be laid, not whether they can be arranged into legal melds. A player holding 95 points of
+cards that cannot form a single meld will still be allowed to lay, and will still fail at the discard.
 
-That said, F11 has since removed the *other* route into a stuck turn, and the same treatment could
-remove this one. Two ways to get there:
+Erring the other way would be much worse. A check that is too generous leaves a turn that has to be
+abandoned — an annoyance. A check that is too strict refuses a move the rules permit — a broken game.
+So the check only ever fires when it is *certain*.
 
-1. **Make opening atomic.** A single `Open { melds }` action, validated as a whole, so a partnership
-   can never lay part of an opening. Matches how the opening is actually declared at a physical table
-   ("I'm opening with these"), and rewind disappears entirely. The complication is §5: taking the pile
-   can be part of the same opening, so `TakeDiscardPile` would have to fold into the same action or be
-   allowed to precede it.
-2. **Validate eagerly.** Refuse a lay if the minimum can no longer be reached from what remains in
-   hand. Keeps the API as it is, but requires enumerating meld combinations over the remaining hand at
-   every lay — the same combinatorial problem F7 defers, dragged into the hot path.
+**What is left open.** Closing the gap completely means computing the best possible melding of an
+arbitrary hand: choosing per suit which runs to form from up to two copies of each rank, deciding
+whether each ace serves a run or the ace meld, and allocating wild cards one per meld. That is the same
+combinatorial problem `legal_actions` faces (F7) — which is the connection between the two, though the
+version needed here is strictly easier, since it only needs the best achievable *value* rather than the
+full list of moves.
 
-**Recommendation: option 1**, and drop `rewindTurn` when it lands. Until then the escape hatch is
-load-bearing, so the two-line bug is worth fixing regardless of which way this goes.
+Until that exists, `rewindTurn` remains as a backstop for the residual case. With F11 closing the other
+route into a stuck turn and this check closing most of this one, it should be reachable far less often.
+The original two-line bug — `turn_start` refreshed only when the phase *before* an action is
+`AwaitingDraw`, so calling `rewindTurn` as the first move of a turn reverts a whole turn too far — is
+still worth fixing while the method exists.
 
 ---
 
@@ -224,60 +224,54 @@ enumerates. Meld enumeration is the combinatorially interesting part and deserve
 
 ---
 
-## F8 — Meld JSON is awkward for other languages (low, open)
+## F8 — Meld JSON was awkward for other languages (low) — FIXED
 
-Everything else on the wire is self-describing. Cards are `"6D"`. Actions are tagged objects a
-TypeScript author can write from memory. Melds are the one exception.
+Everything else on the wire was self-describing. Cards are `"6D"`. Actions are tagged objects a
+TypeScript author can write from memory. Melds were the exception.
 
-What the engine emits today for `6♥ 7♥ 8♥`:
+What the engine used to emit for `6♥ 7♥ 8♥`:
 
 ```json
 {"kind":"Sequence","meld":{"suit":"Hearts","low":2,"slots":[
-  {"kind":"Natural","card":"6H"},
-  {"kind":"Natural","card":"7H"},
-  {"kind":"Natural","card":"8H"}]}}
+  {"kind":"Natural","card":"6H"}, {"kind":"Natural","card":"7H"}, {"kind":"Natural","card":"8H"}]}}
 ```
 
-`low` is `2` because it is an internal index into the 4..=A range, where `4` is `0`. Nothing in the
-payload says so. A client rendering this has to hardcode that offset, and get it right again for every
-language that consumes the engine.
+`low` was `2` because it is an internal index into the 4..=A range where `4` is `0`. Nothing in the
+payload said so. Worse, for `Coringa-Q♠-K♠-A♠` the single thing a UI most needs — which rank the Joker
+stands in for — was absent entirely, recoverable only by computing `low + index` and inverting that
+same undocumented offset. Whether the wild was locked (§9), which decides whether the player may still
+slide it, was missing too.
 
-It is worse for a wild card. `Coringa-Q♠-K♠-A♠`:
-
-```json
-{"kind":"Sequence","meld":{"suit":"Spades","low":7,"slots":[
-  {"kind":"Wild","card":"JOKER"},
-  {"kind":"Natural","card":"QS"},
-  {"kind":"Natural","card":"KS"},
-  {"kind":"Natural","card":"AS"}]}}
-```
-
-The single most important thing a UI needs here is **which rank the Joker is standing in for** — it is
-the Jack — and it is not in the payload at all. The client can only recover it by computing
-`low + index` and then inverting the same undocumented offset. Whether the wild is locked (§9), which
-decides whether the player may still slide it, is likewise absent and has to be re-derived from its
-position.
-
-An ideal shape says what it means and carries the two facts the client cannot cheaply compute:
+**Fix applied.** Melds are now internally tagged and say what they mean:
 
 ```json
 {"kind":"Sequence","suit":"Spades","cards":[
-  {"card":"JOKER","standingIn":"J","wild":true,"locked":false},
-  {"card":"QS","wild":false},
-  {"card":"KS","wild":false},
-  {"card":"AS","wild":false}]}
+  {"card":"JOKER","standingInRank":"J","locked":false},
+  {"card":"QS"},{"card":"KS"},{"card":"AS"}]}
 ```
-
-Ace melds are already fine, since there is no ordering to encode:
 
 ```json
-{"kind":"Aces","meld":{"aces":["AH","AD","AS"],"wild":null}}
+{"kind":"Sequence","suit":"Hearts","cards":[
+  {"card":"6H"},{"card":"7H"},
+  {"card":"2H","standingInRank":"8","locked":true},
+  {"card":"9H"}]}
 ```
 
-**Suggested fix.** A hand-written `Serialize` for `Sequence` emitting explicit ranks plus
-`standingIn` and `locked`, with `Deserialize` continuing to accept it through the validated `TryFrom`
-added in F2. Whatever shape is chosen should be pinned in `tests/boundary.rs` alongside the rest of the
-contract. Worth doing before the first client is written, since it is a breaking change afterwards.
+```json
+{"kind":"Aces","aces":["AH","AD","AS"],"wild":null}
+```
+
+A natural card carries nothing but itself, since its rank is in the code. A wild carries the two facts
+a client cannot cheaply compute. `locked` is derived on the way out and recomputed on the way in, so a
+payload cannot lie about it.
+
+**`standingInRank` is a bare rank (`"J"`), not a card (`"JS"`).** The deck holds two real J♠, and
+emitting a third would invite a client to render an actual Jack of Spades, or to trip over it when
+matching cards for animation. The field name carries the type, so nothing is ambiguous. `Rank` now
+serializes as the same single character cards use, rather than as `"Jack"`.
+
+Deserialization goes through the F2 validation, so the new shape cannot be used to smuggle in an
+invalid meld either. All of it is pinned in `tests/boundary.rs`.
 
 ---
 

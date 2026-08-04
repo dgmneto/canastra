@@ -199,7 +199,7 @@ fn take_discard_pile(
     state.turn_context.pile_core_meld = Some(index);
 
     state.phase = Phase::Melding;
-    Ok(())
+    check_opening_reachable(state, seat)
 }
 
 /// Fold the captured three into an existing meld as one block.
@@ -236,7 +236,8 @@ fn lay_meld(state: &mut GameState, seat: Seat, cards: &[Card]) -> Result<(), Rul
     take_all_from_hand(state, seat, cards)?;
     record_laid(state, cards);
     state.tables[seat.team().index()].melds.push(meld);
-    maybe_go_out(state, seat)
+    maybe_go_out(state, seat)?;
+    check_opening_reachable(state, seat)
 }
 
 /// §4.2: add cards to one of your own partnership's melds.
@@ -275,7 +276,8 @@ fn add_to_meld(
     take_all_from_hand(state, seat, cards)?;
     record_laid(state, cards);
     state.tables[team].melds[index] = extended;
-    maybe_go_out(state, seat)
+    maybe_go_out(state, seat)?;
+    check_opening_reachable(state, seat)
 }
 
 /// §11.1: emptying your hand is going out, which needs a clean canastra.
@@ -360,6 +362,57 @@ fn take_all_from_hand(
 fn record_laid(state: &mut GameState, cards: &[Card]) {
     state.turn_context.laid_value += cards.iter().map(|card| card.points()).sum::<u32>();
     state.turn_context.laid_anything = true;
+}
+
+/// §6, checked as early as it can be: refuse a lay that has already put the
+/// opening minimum out of reach for the rest of the turn.
+///
+/// The bound is every card still usable, counted at full face value — the most
+/// the player could possibly add even if every last card went down. If that
+/// still falls short, no sequence of further moves can save the turn, so the lay
+/// that caused it is refused while the player still has a choice.
+///
+/// It is deliberately **optimistic**: it asks whether the points could still be
+/// laid, not whether they can be arranged into legal melds. That direction is
+/// the safe one. A check that is too generous leaves a turn that has to be
+/// abandoned — annoying. A check that is too strict refuses a move the rules
+/// allow — a broken game. Tightening it further means computing the best melding
+/// of an arbitrary hand, which is the combinatorial problem `legal_actions` also
+/// runs into.
+fn check_opening_reachable(state: &GameState, seat: Seat) -> Result<(), RuleViolation> {
+    let team = seat.team();
+    if state.table(team).opened || !state.turn_context.laid_anything {
+        return Ok(());
+    }
+    // An empty hand means the turn is over; §6 is judged exactly, not predicted.
+    if state.hands[seat.index()].is_empty() {
+        return Ok(());
+    }
+
+    let required = state.opening_minimum_for(team);
+    let laid = state.turn_context.laid_value;
+    if laid >= required {
+        return Ok(());
+    }
+
+    // §5: cards frozen this turn cannot be melded, so they cannot help.
+    let held: u32 = state.hand(seat).iter().map(|card| card.points()).sum();
+    let frozen: u32 = state
+        .turn_context
+        .frozen
+        .iter()
+        .map(|card| card.points())
+        .sum();
+    let best_possible = laid + held.saturating_sub(frozen);
+
+    if best_possible < required {
+        return Err(RuleViolation::CannotReachOpeningMinimum {
+            laid,
+            best_possible,
+            required,
+        });
+    }
+    Ok(())
 }
 
 /// §6: a partnership's first melds must clear the bar within a single turn.
@@ -859,7 +912,10 @@ mod tests {
     #[test]
     fn a_partnership_past_twenty_five_hundred_needs_one_hundred_and_twenty() {
         let state = Rig::new()
-            .hand(1, "JOKER QS KS AS 4D 8C")
+            // The 2D is dead weight they choose not to lay, but its 20 points
+            // keep the minimum nominally in reach so the failure lands at the
+            // discard, which is the rule under test.
+            .hand(1, "JOKER QS KS AS 4D 8C 2D")
             .stock("9C 2C")
             .scores(0, 2500)
             .phase(Phase::Melding)
@@ -889,6 +945,83 @@ mod tests {
         assert!(apply(&laid, seat(1), &Action::Discard { card: card("2S") }).is_ok());
     }
 
+    /// §6, caught at the lay rather than at the discard. Laying `4♥5♥6♥` is 15,
+    /// and the 8♣ and 9♣ left behind are only 20 more — 35 can never become 75,
+    /// so the lay that commits them to it is refused straight away.
+    #[test]
+    fn a_lay_that_puts_the_minimum_out_of_reach_is_refused_at_once() {
+        let state = Rig::new()
+            .hand(1, "4H 5H 6H 8C 9C")
+            .stock("2C 3C")
+            .phase(Phase::Melding)
+            .turn(1)
+            .build();
+        assert_eq!(
+            apply(&state, seat(1), &lay("4H 5H 6H")),
+            Err(RuleViolation::CannotReachOpeningMinimum {
+                laid: 15,
+                best_possible: 35,
+                required: 75
+            })
+        );
+    }
+
+    #[test]
+    fn a_lay_stands_while_the_minimum_is_still_within_reach() {
+        let state = Rig::new()
+            .hand(1, "4H 5H 6H JOKER QS KS AS 8D")
+            .stock("2C 3C")
+            .phase(Phase::Melding)
+            .turn(1)
+            .build();
+        apply(&state, seat(1), &lay("4H 5H 6H")).expect("95 points still in hand");
+    }
+
+    /// The check is deliberately optimistic, and that is the safe direction. It
+    /// asks whether the points could still be laid, not whether they can be
+    /// arranged into legal melds. Here the 50-point Joker keeps the minimum
+    /// nominally in reach even though nothing in hand can actually be melded
+    /// with it — so the lay stands, and the turn fails later at the discard.
+    ///
+    /// Erring the other way would be far worse: refusing a move the rules allow
+    /// is a broken game, while allowing a turn that has to be abandoned is only
+    /// an annoyance.
+    #[test]
+    fn the_reachability_check_never_refuses_a_lay_the_rules_permit() {
+        let state = Rig::new()
+            .hand(1, "4H 5H 6H JOKER 8C")
+            .stock("2C 3C")
+            .phase(Phase::Melding)
+            .turn(1)
+            .build();
+        let laid = apply(&state, seat(1), &lay("4H 5H 6H")).expect("optimistically allowed");
+        assert!(matches!(
+            apply(&laid, seat(1), &Action::Discard { card: card("8C") }),
+            Err(RuleViolation::OpeningMinimumNotMet { .. })
+        ));
+    }
+
+    /// §5: cards swept out of the pile cannot be melded this turn, so they
+    /// cannot count toward what is still reachable either.
+    #[test]
+    fn frozen_cards_do_not_count_toward_what_is_still_reachable() {
+        let state = Rig::new()
+            .hand(1, "4D 5D 8C")
+            .discard("JOKER 6D")
+            .turn(1)
+            .build();
+        // The Joker swept up is worth 50, but it is frozen, so the 15 laid plus
+        // the 8C's 10 is the real ceiling.
+        assert_eq!(
+            apply(&state, seat(1), &take_pile("4D 5D", MeldTarget::NewMeld)),
+            Err(RuleViolation::CannotReachOpeningMinimum {
+                laid: 15,
+                best_possible: 25,
+                required: 75
+            })
+        );
+    }
+
     /// §6: laying nothing at all is always fine, opened or not.
     #[test]
     fn a_turn_without_melding_never_trips_the_minimum() {
@@ -906,7 +1039,7 @@ mod tests {
     #[test]
     fn red_threes_do_not_count_toward_the_opening_minimum() {
         let state = Rig::new()
-            .hand(1, "4H 5H 6H 2S 8D")
+            .hand(1, "4H 5H 6H 2S 8D JOKER")
             .red_threes(1, "3H 3D")
             .stock("9C 2C")
             .phase(Phase::Melding)

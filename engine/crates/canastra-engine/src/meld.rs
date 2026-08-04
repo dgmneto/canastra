@@ -111,61 +111,132 @@ impl CanastraKind {
 /// since a sequence has no holes and holds at most one wild, a wild has naturals
 /// on both sides exactly when it sits at an interior index.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "RawSequence")]
+#[serde(into = "WireSequence", try_from = "WireSequence")]
 pub struct Sequence {
     suit: Suit,
     low: u8,
     slots: Vec<Slot>,
 }
 
-/// The wire shape of a [`Sequence`], before validation.
+/// One card of a sequence as it goes over the wire.
 ///
-/// Deriving `Deserialize` straight onto `Sequence` would let serde build one
-/// field by field, walking past every invariant the constructors enforce — a
-/// crafted payload could produce an empty slot array or a `low` outside 4..=A,
-/// and the accessors would then panic. Everything from outside the process
-/// comes through here instead, so an invalid sequence never exists as a value.
-#[derive(Deserialize)]
-struct RawSequence {
-    suit: Suit,
-    low: u8,
-    slots: Vec<Slot>,
+/// A natural card needs nothing but itself — its rank is right there in the
+/// code. A wild card carries the two facts a client cannot cheaply work out and
+/// should not have to: which rank it is standing in for, and whether §9 has
+/// locked it in place.
+///
+/// `standing_in_rank` is a bare rank (`"J"`) rather than a card (`"JS"`) on
+/// purpose. The deck holds two real J♠, and emitting a third would invite a
+/// client to render an actual Jack of Spades, or to trip over it when matching
+/// cards for animation. A rank cannot be mistaken for a card.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireSlot {
+    card: Card,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    standing_in_rank: Option<Rank>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    locked: Option<bool>,
 }
 
-impl TryFrom<RawSequence> for Sequence {
+/// The wire shape of a [`Sequence`].
+///
+/// This replaced an earlier form that published the private `low` field as a
+/// raw index into the 4..=A range, where `4` was `0`. Nothing in the payload
+/// said so, so every client had to hardcode that offset — and the rank a wild
+/// stood in for, the single thing a UI most needs, was not present at all.
+///
+/// Deserializing rebuilds the sequence through the same validation the
+/// constructors use, so a hand-written or corrupted payload cannot produce a
+/// sequence the engine would refuse to build itself.
+#[derive(Serialize, Deserialize)]
+struct WireSequence {
+    suit: Suit,
+    cards: Vec<WireSlot>,
+}
+
+impl From<Sequence> for WireSequence {
+    fn from(sequence: Sequence) -> WireSequence {
+        let locked = sequence.wild_is_locked();
+        let cards = sequence
+            .slots
+            .iter()
+            .enumerate()
+            .map(|(offset, slot)| match *slot {
+                Slot::Natural(card) => WireSlot {
+                    card,
+                    standing_in_rank: None,
+                    locked: None,
+                },
+                Slot::Wild(card) => WireSlot {
+                    card,
+                    standing_in_rank: Rank::from_sequence_index(sequence.low + offset as u8),
+                    locked: Some(locked),
+                },
+            })
+            .collect();
+        WireSequence {
+            suit: sequence.suit,
+            cards,
+        }
+    }
+}
+
+impl TryFrom<WireSequence> for Sequence {
     type Error = MeldError;
 
-    fn try_from(raw: RawSequence) -> Result<Sequence, MeldError> {
-        if raw.slots.len() < 3 {
+    fn try_from(wire: WireSequence) -> Result<Sequence, MeldError> {
+        if wire.cards.len() < 3 {
             return Err(MeldError::TooFewCards);
         }
-        // Checking the top end also bounds `low`, which is what stops
-        // `Sequence::low` and `Sequence::high` from indexing off the rank table.
-        let high = usize::from(raw.low) + raw.slots.len() - 1;
-        if high >= MAX_SEQUENCE_LEN {
+        if wire.cards.len() > MAX_SEQUENCE_LEN {
+            return Err(MeldError::TooLong);
+        }
+
+        // The first card fixes where the run starts. A wild can only say where
+        // it sits by naming the rank it stands in for.
+        let first = &wire.cards[0];
+        let low = if first.card.is_wild() {
+            first
+                .standing_in_rank
+                .ok_or(MeldError::NotASequence)?
+                .sequence_index()
+                .ok_or(MeldError::NotASequence)?
+        } else {
+            first
+                .card
+                .rank()
+                .and_then(Rank::sequence_index)
+                .ok_or(MeldError::NotASequence)?
+        };
+
+        if usize::from(low) + wire.cards.len() > MAX_SEQUENCE_LEN {
             return Err(MeldError::TooLong);
         }
 
         let mut wilds = 0;
-        for (offset, slot) in raw.slots.iter().enumerate() {
-            let index = raw.low + offset as u8;
-            match *slot {
-                Slot::Natural(card) => {
-                    if card.suit() != Some(raw.suit) {
-                        return Err(MeldError::MixedSuits);
-                    }
-                    // The card has to actually be the rank its position claims.
-                    if card.rank().and_then(Rank::sequence_index) != Some(index) {
-                        return Err(MeldError::NotASequence);
-                    }
+        let mut slots = Vec::with_capacity(wire.cards.len());
+        for (offset, entry) in wire.cards.iter().enumerate() {
+            let index = low + offset as u8;
+            if entry.card.is_wild() {
+                wilds += 1;
+                check_two_suit(Some(entry.card), wire.suit)?;
+                // `locked` is derived from position, so whatever the payload
+                // claimed is ignored and recomputed.
+                if let Some(claimed) = entry.standing_in_rank
+                    && claimed.sequence_index() != Some(index)
+                {
+                    return Err(MeldError::NotASequence);
                 }
-                Slot::Wild(card) => {
-                    if !card.is_wild() {
-                        return Err(MeldError::NotASequence);
-                    }
-                    check_two_suit(Some(card), raw.suit)?;
-                    wilds += 1;
+                slots.push(Slot::Wild(entry.card));
+            } else {
+                if entry.card.suit() != Some(wire.suit) {
+                    return Err(MeldError::MixedSuits);
                 }
+                if entry.card.rank().and_then(Rank::sequence_index) != Some(index) {
+                    return Err(MeldError::NotASequence);
+                }
+                slots.push(Slot::Natural(entry.card));
             }
         }
         if wilds > 1 {
@@ -173,9 +244,9 @@ impl TryFrom<RawSequence> for Sequence {
         }
 
         Ok(Sequence {
-            suit: raw.suit,
-            low: raw.low,
-            slots: raw.slots,
+            suit: wire.suit,
+            low,
+            slots,
         })
     }
 }
@@ -485,7 +556,7 @@ impl AcesMeld {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "meld")]
+#[serde(tag = "kind")]
 pub enum Meld {
     Sequence(Sequence),
     Aces(AcesMeld),

@@ -246,38 +246,82 @@ fn a_rigged_position_survives_persistence() {
 
 use canastra_engine::meld::Meld;
 
+/// The meld wire format, pinned. A natural card says everything about itself;
+/// a wild carries the rank it stands in for and whether §9 has locked it, so a
+/// client never has to re-derive either.
+#[test]
+fn melds_publish_the_rank_a_wild_stands_in_for() {
+    let plain = Meld::new(&cards("6H 7H 8H")).unwrap();
+    assert_eq!(
+        serde_json::to_string(&plain).unwrap(),
+        r#"{"kind":"Sequence","suit":"Hearts","cards":[{"card":"6H"},{"card":"7H"},{"card":"8H"}]}"#
+    );
+
+    // §9: the Joker caps `Q-K-A` from below, standing in for the Jack, and stays
+    // free because it sits on an end.
+    let free_wild = Meld::new(&cards("JOKER QS KS AS")).unwrap();
+    assert_eq!(
+        serde_json::to_string(&free_wild).unwrap(),
+        r#"{"kind":"Sequence","suit":"Spades","cards":[{"card":"JOKER","standingInRank":"J","locked":false},{"card":"QS"},{"card":"KS"},{"card":"AS"}]}"#
+    );
+
+    // §9: naturals on both sides, so the 2 is locked on the 8 for good.
+    let locked_wild = Meld::new(&cards("6H 7H 2H 9H")).unwrap();
+    assert_eq!(
+        serde_json::to_string(&locked_wild).unwrap(),
+        r#"{"kind":"Sequence","suit":"Hearts","cards":[{"card":"6H"},{"card":"7H"},{"card":"2H","standingInRank":"8","locked":true},{"card":"9H"}]}"#
+    );
+
+    assert_eq!(
+        serde_json::to_string(&Meld::new(&cards("AH AD AS")).unwrap()).unwrap(),
+        r#"{"kind":"Aces","aces":["AH","AD","AS"],"wild":null}"#
+    );
+}
+
+/// Ranks are the same single characters cards use, not `"Jack"`.
+#[test]
+fn ranks_are_spelled_the_way_cards_are() {
+    assert_eq!(
+        serde_json::to_string(&canastra_engine::card::Rank::Jack).unwrap(),
+        r#""J""#
+    );
+    assert_eq!(
+        serde_json::to_string(&canastra_engine::card::Rank::Ten).unwrap(),
+        r#""T""#
+    );
+}
+
 /// F2: serde reconstructs a struct field by field, which walks straight past
-/// every check the constructors make. These payloads all parsed before the fix,
-/// and reading the resulting meld panicked.
+/// every check the constructors make. Deserializing through a validated
+/// conversion is what stops a hand-written payload building a meld the engine
+/// would never have produced.
 #[test]
 fn a_malformed_sequence_is_refused_at_the_boundary() {
     let bad = [
-        // No slots at all, and a `low` far outside 4..=A. Sequence::low() used
-        // to panic on this one.
-        r#"{"kind":"Sequence","meld":{"suit":"Hearts","low":250,"slots":[]}}"#,
-        // A natural card that is not the rank its position claims it is.
-        r#"{"kind":"Sequence","meld":{"suit":"Hearts","low":0,"slots":[
-            {"kind":"Natural","card":"KH"},{"kind":"Natural","card":"5H"},
-            {"kind":"Natural","card":"6H"}]}}"#,
-        // Two wild cards, which §8 forbids.
-        r#"{"kind":"Sequence","meld":{"suit":"Hearts","low":0,"slots":[
-            {"kind":"Wild","card":"JOKER"},{"kind":"Wild","card":"2H"},
-            {"kind":"Natural","card":"6H"}]}}"#,
+        // A wild leading the run with no rank to place it by.
+        r#"{"kind":"Sequence","suit":"Hearts","cards":[
+            {"card":"JOKER"},{"card":"5H"},{"card":"6H"}]}"#,
+        // A natural card that is not the rank its position implies.
+        r#"{"kind":"Sequence","suit":"Hearts","cards":[
+            {"card":"6H"},{"card":"8H"},{"card":"9H"}]}"#,
+        // The wild claims a rank other than the slot it occupies.
+        r#"{"kind":"Sequence","suit":"Hearts","cards":[
+            {"card":"6H"},{"card":"2H","standingInRank":"K"},{"card":"8H"}]}"#,
+        // §8: two wild cards.
+        r#"{"kind":"Sequence","suit":"Hearts","cards":[
+            {"card":"JOKER","standingInRank":"4"},{"card":"2H","standingInRank":"5"},
+            {"card":"6H"}]}"#,
         // A natural of the wrong suit.
-        r#"{"kind":"Sequence","meld":{"suit":"Hearts","low":0,"slots":[
-            {"kind":"Natural","card":"4S"},{"kind":"Natural","card":"5H"},
-            {"kind":"Natural","card":"6H"}]}}"#,
-        // §8: a 2 standing in for a rank of another suit.
-        r#"{"kind":"Sequence","meld":{"suit":"Hearts","low":0,"slots":[
-            {"kind":"Natural","card":"4H"},{"kind":"Natural","card":"5H"},
-            {"kind":"Wild","card":"2S"}]}}"#,
-        // Shorter than a meld can be.
-        r#"{"kind":"Sequence","meld":{"suit":"Hearts","low":0,"slots":[
-            {"kind":"Natural","card":"4H"},{"kind":"Natural","card":"5H"}]}}"#,
+        r#"{"kind":"Sequence","suit":"Hearts","cards":[
+            {"card":"4S"},{"card":"5H"},{"card":"6H"}]}"#,
+        // §8: a 2 standing in inside another suit's run.
+        r#"{"kind":"Sequence","suit":"Hearts","cards":[
+            {"card":"4H"},{"card":"5H"},{"card":"2S","standingInRank":"6"}]}"#,
+        // Shorter than any meld can be.
+        r#"{"kind":"Sequence","suit":"Hearts","cards":[{"card":"4H"},{"card":"5H"}]}"#,
         // Runs off the top of the Ace.
-        r#"{"kind":"Sequence","meld":{"suit":"Hearts","low":9,"slots":[
-            {"kind":"Natural","card":"KH"},{"kind":"Natural","card":"AH"},
-            {"kind":"Wild","card":"JOKER"}]}}"#,
+        r#"{"kind":"Sequence","suit":"Spades","cards":[
+            {"card":"QS"},{"card":"KS"},{"card":"AS"},{"card":"JOKER"}]}"#,
     ];
     for json in bad {
         assert!(
@@ -290,9 +334,9 @@ fn a_malformed_sequence_is_refused_at_the_boundary() {
 #[test]
 fn a_malformed_ace_meld_is_refused_at_the_boundary() {
     let bad = [
-        r#"{"kind":"Aces","meld":{"aces":["KH","AD","AS"],"wild":null}}"#,
-        r#"{"kind":"Aces","meld":{"aces":["AH","AD"],"wild":"7C"}}"#,
-        r#"{"kind":"Aces","meld":{"aces":["AH"],"wild":null}}"#,
+        r#"{"kind":"Aces","aces":["KH","AD","AS"],"wild":null}"#,
+        r#"{"kind":"Aces","aces":["AH","AD"],"wild":"7C"}"#,
+        r#"{"kind":"Aces","aces":["AH"],"wild":null}"#,
     ];
     for json in bad {
         assert!(

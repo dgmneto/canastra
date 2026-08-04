@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
+use std::fmt::Write as _;
 use std::str::FromStr;
 
 /// How a Joker is spelled in the string codec.
@@ -42,7 +43,11 @@ impl Suit {
     }
 }
 
+/// Ranks travel as the same single characters cards use — `"J"`, `"T"`, `"A"` —
+/// rather than as `"Jack"`. One rank spelling across the whole API, and a client
+/// that can render a card can render a rank.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(into = "String", try_from = "String")]
 pub enum Rank {
     Two,
     Three,
@@ -126,7 +131,7 @@ impl Rank {
         }
     }
 
-    fn code(self) -> char {
+    pub(crate) fn code(self) -> char {
         match self {
             Rank::Two => '2',
             Rank::Three => '3',
@@ -144,7 +149,7 @@ impl Rank {
         }
     }
 
-    fn from_code(code: char) -> Option<Rank> {
+    pub(crate) fn from_code(code: char) -> Option<Rank> {
         Some(match code {
             '2' => Rank::Two,
             '3' => Rank::Three,
@@ -161,6 +166,30 @@ impl Rank {
             'A' => Rank::Ace,
             _ => return None,
         })
+    }
+}
+
+impl fmt::Display for Rank {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_char(self.code())
+    }
+}
+
+impl From<Rank> for String {
+    fn from(rank: Rank) -> String {
+        rank.to_string()
+    }
+}
+
+impl TryFrom<String> for Rank {
+    type Error = ParseCardError;
+
+    fn try_from(encoded: String) -> Result<Rank, ParseCardError> {
+        let mut chars = encoded.chars();
+        let (Some(code), None) = (chars.next(), chars.next()) else {
+            return Err(ParseCardError(encoded));
+        };
+        Rank::from_code(code).ok_or(ParseCardError(encoded))
     }
 }
 
