@@ -6,7 +6,8 @@
 //! malformed one comes back as an error rather than undefined behaviour.
 
 use canastra_engine::{
-    Action, GameState, Phase, RuleViolation, Seat, apply, new_game, observe, settle_hand,
+    Action, GameState, Phase, RuleViolation, Seat, Team, apply, new_game, observe, score_hand,
+    settle_hand,
 };
 use wasm_bindgen::prelude::*;
 
@@ -64,6 +65,22 @@ impl Game {
     #[wasm_bindgen(js_name = rewindTurn)]
     pub fn rewind_turn(&mut self) {
         self.state = self.turn_start.clone();
+    }
+
+    /// §13: what this hand would bank for one partnership right now, itemised.
+    ///
+    /// Mid-hand this is a running total, not a result — `going_out_bonus` is
+    /// still zero and `hand_cards` keeps falling as cards are laid down.
+    ///
+    /// **Not for a player's eyes in a real game.** `hand_cards` sums *both*
+    /// partners' hands, and partners do not see each other's cards, so this
+    /// answers a question no seat is entitled to ask. It belongs on the same
+    /// side of the boundary as [`Game::snapshot`].
+    #[wasm_bindgen(js_name = handScore)]
+    pub fn hand_score(&self, team: u8) -> Result<JsValue, JsValue> {
+        let team = Team::new(team).ok_or_else(|| message("team must be 0 or 1"))?;
+        serde_wasm_bindgen::to_value(&score_hand(&self.state, team))
+            .map_err(|error| message(&error.to_string()))
     }
 
     /// §13 and §14: bank a finished hand, then deal on or end the match.
