@@ -38,20 +38,24 @@ Go has three real options for reaching the engine:
    wasm-bindgen), run under `wazero`. Keeps the Go build pure and sandboxes the engine. More upfront
    work than option 1.
 
-The existing `canastra-wasm` remains useful — for the **frontend**, so the browser can validate moves
-and drive the UI without a round trip. That is a separate consumer from the Go server, and both talk
-the same serde contract.
+**The engine is server-side only, by decision.** No build of it goes to the browser for now, so the
+browser is a thin client that round-trips every move. That closes a whole class of problem (see F6 in
+the review) and it means `canastra-wasm` currently has no consumer at all: it needs a JavaScript host,
+so a Go server cannot load it either.
+
+If in-browser play or client-side validation is picked up later, F6 reopens and has to be dealt with
+first — `snapshot` must not be reachable from a browser build, and the seat must never come from the
+client.
 
 ## Rules the server has to enforce, not the client
 
 - **Never send a `GameState` to a client.** It holds all four hands, the stock order, and the match
-  seed. Send `observe(state, seat)` instead. The redaction is structural, so using it is enough.
-- **`Game::snapshot()` in the wasm crate returns the full state**, seed included. It exists for
-  server-side persistence. Do not expose it to a browser in a multiplayer game — anyone holding it
-  can reconstruct the entire deal.
+  seed — and the seed alone is enough to reconstruct the entire deal, including cards not yet dealt.
+  Send `observe(state, seat)` instead. The redaction is structural, so using it is enough.
 - **The engine takes `seat` as an explicit parameter** so it rejects out-of-turn moves, but it cannot
   know *who is asking*. Bind the authenticated session to a seat on the server and pass that. Never
-  pass a seat the client supplied.
+  pass a seat the client supplied. This is the one obligation the engine genuinely cannot cover for
+  you.
 - **Some turns cannot be finished.** §6 requires the opening minimum to be met inside a single turn,
   and that is only knowable at the discard. A player who lays too little simply cannot discard. The
   server must offer a "restart turn" that replays from the state the turn began with — this is why

@@ -17,7 +17,7 @@ full: the reproduction is the useful part, and it documents what the regression 
 | F3 | `GameState` deserializes with impossible contents | high | **fixed** |
 | F4 | Empty `AddToMeld` poisons the turn | medium | **fixed** |
 | F5 | Opening minimum only judged at the discard | medium | **fixed** (eager check) |
-| F6 | Trust boundary undefended by construction | medium | open — a server obligation |
+| F6 | Trust boundary undefended by construction | medium | closed — server-only deployment |
 | F7 | No `legal_actions`; `validate` clones | low | open, deliberately |
 | F8 | Meld JSON awkward for other languages | low | **fixed** |
 | F9 | One weak test | low | **fixed** |
@@ -186,30 +186,28 @@ still worth fixing while the method exists.
 
 ---
 
-## F6 — Trust boundary undefended by construction (medium, open)
+## F6 — Trust boundary undefended by construction (medium) — CLOSED
 
-**Not addressed by F2/F3 — they solve the opposite direction.** F2 and F3 validate what comes *in*:
-they stop a malformed or impossible state from being loaded. F6 is about what goes *out*, and about who
-is allowed to ask. `check_invariants` will happily accept a perfectly valid game and then hand every
-card in it to whoever called `snapshot()`.
+Closed by a deployment decision: the engine runs on servers only, and no build of it is shipped to a
+browser.
 
-Two specifics, both by code reading:
+**This is an assumption rather than a code change, so it is worth stating what it rests on.** The
+finding was never a bug in the rules core — `apply` guards turn order correctly and `observe` redacts
+correctly. It was about two things a hostile *caller* could do:
 
-- `Game::snapshot()` returns the entire `GameState` as JSON — all four hands, the stock order, and the
-  match seed. The seed is the worst of it: with it, the whole deal is reconstructible from scratch.
-  It exists for server-side persistence, and nothing stops a browser build from calling it.
-- `Game::apply(seat, action)` takes the seat from the caller. The engine correctly rejects moves made
-  out of turn, but it cannot know *who is asking*. In a browser the caller is the player, so client-side
-  wasm cannot enforce identity at all.
+- `Game::snapshot()` returns the whole `GameState`: all four hands, the stock order, and the match
+  seed. The seed is the sharp end — with it the entire deal is reconstructible, including cards not yet
+  dealt. It exists so a server can persist a game in progress.
+- `Game::apply(seat, action)` takes the seat from its caller. The engine can check *whether it is seat
+  2's turn*, but not *whether the caller is seat 2*.
 
-Neither is a bug in the rules core — `apply` guards the turn order and `observe` redacts properly. They
-are obligations that land on whoever embeds the engine, and nothing in the code says so at the point
-where it matters.
+With the engine confined to the server, the only caller is trusted code and both collapse into an
+ordinary server responsibility: bind an authenticated session to a seat, pass that seat, and send each
+player `observe(state, seat)` rather than the state itself.
 
-**Suggested fix.** Document both at the `Game` type. Better, split the wasm surface so a browser build
-cannot reach `snapshot` at all, and have the server bind an authenticated session to a seat and pass
-that rather than anything the client sent. See `web/README.md`, which states these as server
-obligations for whoever builds the Go app.
+**This finding reopens the moment any build of the engine reaches a browser** — which is what
+`canastra-wasm` was originally written for. If in-browser play or client-side move validation is ever
+picked up, `snapshot` must not be reachable from that build, and the seat must not come from the client.
 
 ---
 
