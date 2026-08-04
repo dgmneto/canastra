@@ -7,22 +7,22 @@ so nobody re-opens it.
 
 State at time of review: commit `261e6bf`, 158 tests passing, clippy and rustfmt clean.
 
-**Update.** F1, F2 and F3 have since been fixed, with regression tests, in a follow-up commit. Their
-sections below are kept in full — the reproduction is the useful part, and it documents what the
-regression tests are defending. F4 through F10 are still open.
+**Update.** F1–F4, F9 and F11 have since been fixed with regression tests. Fixed sections are kept in
+full: the reproduction is the useful part, and it documents what the regression test is defending.
 
 | | Finding | Severity | Status |
 |---|---|---|---|
 | F1 | Unwinnable deadlock when a red 3 empties the stock | critical | **fixed** |
 | F2 | Malformed JSON builds invalid melds; accessors panic | high | **fixed** |
 | F3 | `GameState` deserializes with impossible contents | high | **fixed** |
-| F4 | Empty `AddToMeld` poisons the turn | medium | open |
-| F5 | `rewindTurn` can revert to the wrong turn | medium | open |
-| F6 | Trust boundary undefended by construction | medium | open (documented) |
-| F7 | No `legal_actions`; `validate` clones | low | open (deferred by plan) |
+| F4 | Empty `AddToMeld` poisons the turn | medium | **fixed** |
+| F5 | `rewindTurn` can revert to the wrong turn | medium | **needs a design decision first** |
+| F6 | Trust boundary undefended by construction | medium | open — *not* covered by F2/F3 |
+| F7 | No `legal_actions`; `validate` clones | low | open, deliberately |
 | F8 | Meld JSON awkward for other languages | low | open |
-| F9 | One weak test | low | open |
-| F10 | proptest and ts-rs not delivered | low | open |
+| F9 | One weak test | low | **fixed** |
+| F10 | proptest and ts-rs not delivered | low | closed, not relevant |
+| F11 | A lay could strand the player's last card | medium | **fixed** |
 
 ---
 
@@ -134,7 +134,7 @@ individually valid melds and still invent cards.
 
 ---
 
-## F4 — An empty `AddToMeld` poisons the turn (medium)
+## F4 — An empty `AddToMeld` poisons the turn (medium) — FIXED
 
 **Confirmed by reproduction.** `Action::AddToMeld { meld: 0, cards: [] }` is accepted and sets
 `laid_anything = true` with `laid_value = 0`.
@@ -143,42 +143,73 @@ For a partnership that has not yet opened, that is a trap: `commit_opening` now 
 laid, so the player cannot discard (0 < 75) and must abandon the turn. A UI that sends an empty
 lay-off on a mis-click hands the player a dead turn with no explanation.
 
-**Suggested fix.** Reject empty `cards` in `add_to_meld`, or only set `laid_anything` when at least one
-card actually moved. `LayMeld` is already safe — `Meld::new` rejects fewer than three cards.
+**Fix applied.** `add_to_meld` refuses an empty `cards` list with `RuleViolation::NoCardsGiven`.
+`LayMeld` was already safe — `Meld::new` rejects fewer than three cards.
 
 ---
 
-## F5 — `rewindTurn` can revert to the wrong turn (medium)
+## F5 — `rewindTurn` reverts too far — and should it exist at all? (medium, blocked on a decision)
 
 **By code reading**, not reproduced — exercising it needs a JS host.
 
 `canastra-wasm/src/lib.rs` refreshes `turn_start` inside `apply`, but only when the phase *before* the
-action is `AwaitingDraw`. So the checkpoint is written on the first action of a turn. Call
-`rewindTurn()` before taking any action in a turn — a player clicking "restart turn" as their opening
-move — and `turn_start` still holds the *previous* player's turn start. The game silently rewinds a
-whole turn too far.
+action is `AwaitingDraw`, so the checkpoint is written on the first action of a turn. Call
+`rewindTurn()` before taking any action — a player clicking "restart turn" as their opening move — and
+`turn_start` still holds the *previous* player's turn start, silently rewinding a whole turn too far.
+Fixing the bug is two lines: also refresh after applying, whenever the resulting phase is
+`AwaitingDraw`.
 
-**Suggested fix.** Also refresh `turn_start` after applying, whenever the resulting phase is
-`AwaitingDraw`. Then the checkpoint is always the current turn's start regardless of call order. Worth
-a test once there is a JS or `wasm-bindgen-test` harness.
+**But the prior question is whether rewind belongs in this game at all.** The project's stated
+philosophy is that every action is final and nothing can be taken back, and a general undo plainly
+violates that.
+
+It was never meant as an undo. It exists because §6 cannot be judged until the discard: the opening
+minimum has to be met across a single turn, and whether it was met is unknowable until the player tries
+to end the turn. A player who lays 45 toward a 75 minimum has made a move the rules will not let them
+complete, and without some escape the game stops. It is closer to "that turn was never legal" than to
+"I changed my mind".
+
+That said, F11 has since removed the *other* route into a stuck turn, and the same treatment could
+remove this one. Two ways to get there:
+
+1. **Make opening atomic.** A single `Open { melds }` action, validated as a whole, so a partnership
+   can never lay part of an opening. Matches how the opening is actually declared at a physical table
+   ("I'm opening with these"), and rewind disappears entirely. The complication is §5: taking the pile
+   can be part of the same opening, so `TakeDiscardPile` would have to fold into the same action or be
+   allowed to precede it.
+2. **Validate eagerly.** Refuse a lay if the minimum can no longer be reached from what remains in
+   hand. Keeps the API as it is, but requires enumerating meld combinations over the remaining hand at
+   every lay — the same combinatorial problem F7 defers, dragged into the hot path.
+
+**Recommendation: option 1**, and drop `rewindTurn` when it lands. Until then the escape hatch is
+load-bearing, so the two-line bug is worth fixing regardless of which way this goes.
 
 ---
 
-## F6 — Trust boundary is undefended by construction (medium, by design but unenforced)
+## F6 — Trust boundary undefended by construction (medium, open)
 
-**By code reading.**
+**Not addressed by F2/F3 — they solve the opposite direction.** F2 and F3 validate what comes *in*:
+they stop a malformed or impossible state from being loaded. F6 is about what goes *out*, and about who
+is allowed to ask. `check_invariants` will happily accept a perfectly valid game and then hand every
+card in it to whoever called `snapshot()`.
+
+Two specifics, both by code reading:
 
 - `Game::snapshot()` returns the entire `GameState` as JSON — all four hands, the stock order, and the
-  match seed. Anyone holding it can reconstruct the whole deal. It exists for server-side persistence;
-  nothing stops a browser build from exposing it.
-- `Game::apply(seat, action)` takes the seat from the caller. In a browser the caller is the player, so
-  client-side wasm cannot enforce identity at all.
+  match seed. The seed is the worst of it: with it, the whole deal is reconstructible from scratch.
+  It exists for server-side persistence, and nothing stops a browser build from calling it.
+- `Game::apply(seat, action)` takes the seat from the caller. The engine correctly rejects moves made
+  out of turn, but it cannot know *who is asking*. In a browser the caller is the player, so client-side
+  wasm cannot enforce identity at all.
 
-Neither is a bug in the engine — `apply` correctly rejects out-of-turn moves, and `observe` correctly
-redacts. But both are server obligations that nothing in the code reminds you of.
+Neither is a bug in the rules core — `apply` guards the turn order and `observe` redacts properly. They
+are obligations that land on whoever embeds the engine, and nothing in the code says so at the point
+where it matters.
 
-**Suggested fix.** Document at the `Game` type. Consider splitting the wasm surface so a browser build
-cannot reach `snapshot` at all, and make the server bind an authenticated session to a seat.
+**Suggested fix.** Document both at the `Game` type. Better, split the wasm surface so a browser build
+cannot reach `snapshot` at all, and have the server bind an authenticated session to a seat and pass
+that rather than anything the client sent. See `web/README.md`, which states these as server
+obligations for whoever builds the Go app.
 
 ---
 
@@ -193,37 +224,116 @@ enumerates. Meld enumeration is the combinatorially interesting part and deserve
 
 ---
 
-## F8 — Meld JSON is awkward for other languages (low)
+## F8 — Meld JSON is awkward for other languages (low, open)
 
-`Sequence` serializes its private `low` field as a raw sequence index where `4` is `0`. A TypeScript or
-Go consumer has to know that encoding to render a meld. Everything else on the wire is self-describing
-(cards are `"6D"`, actions are tagged objects), so this is the one rough edge.
+Everything else on the wire is self-describing. Cards are `"6D"`. Actions are tagged objects a
+TypeScript author can write from memory. Melds are the one exception.
 
-**Suggested fix.** A custom `Serialize` emitting explicit ranks, or a derived view type for clients.
-Whatever is chosen should be pinned in `tests/boundary.rs` like the rest of the contract.
+What the engine emits today for `6♥ 7♥ 8♥`:
+
+```json
+{"kind":"Sequence","meld":{"suit":"Hearts","low":2,"slots":[
+  {"kind":"Natural","card":"6H"},
+  {"kind":"Natural","card":"7H"},
+  {"kind":"Natural","card":"8H"}]}}
+```
+
+`low` is `2` because it is an internal index into the 4..=A range, where `4` is `0`. Nothing in the
+payload says so. A client rendering this has to hardcode that offset, and get it right again for every
+language that consumes the engine.
+
+It is worse for a wild card. `Coringa-Q♠-K♠-A♠`:
+
+```json
+{"kind":"Sequence","meld":{"suit":"Spades","low":7,"slots":[
+  {"kind":"Wild","card":"JOKER"},
+  {"kind":"Natural","card":"QS"},
+  {"kind":"Natural","card":"KS"},
+  {"kind":"Natural","card":"AS"}]}}
+```
+
+The single most important thing a UI needs here is **which rank the Joker is standing in for** — it is
+the Jack — and it is not in the payload at all. The client can only recover it by computing
+`low + index` and then inverting the same undocumented offset. Whether the wild is locked (§9), which
+decides whether the player may still slide it, is likewise absent and has to be re-derived from its
+position.
+
+An ideal shape says what it means and carries the two facts the client cannot cheaply compute:
+
+```json
+{"kind":"Sequence","suit":"Spades","cards":[
+  {"card":"JOKER","standingIn":"J","wild":true,"locked":false},
+  {"card":"QS","wild":false},
+  {"card":"KS","wild":false},
+  {"card":"AS","wild":false}]}
+```
+
+Ace melds are already fine, since there is no ordering to encode:
+
+```json
+{"kind":"Aces","meld":{"aces":["AH","AD","AS"],"wild":null}}
+```
+
+**Suggested fix.** A hand-written `Serialize` for `Sequence` emitting explicit ranks plus
+`standingIn` and `locked`, with `Deserialize` continuing to accept it through the validated `TryFrom`
+added in F2. Whatever shape is chosen should be pinned in `tests/boundary.rs` alongside the rest of the
+contract. Worth doing before the first client is written, since it is a breaking change afterwards.
 
 ---
 
-## F9 — One weak test (low)
+## F9 — One weak test (low) — FIXED
 
-`going_out_does_not_excuse_the_opening_minimum` in `apply.rs` asserts with
-`matches!(..., Err(NoCleanCanastra | OpeningMinimumNotMet { .. }))`. It passes whichever of the two
-rules fires, so it would not notice if the wrong one did. Split it into two tests with unambiguous
-setups.
+`going_out_does_not_excuse_the_opening_minimum` asserted with
+`matches!(..., Err(NoCleanCanastra | OpeningMinimumNotMet { .. }))`, passing whichever of the two rules
+fired. Worse, the setup put the clean canastra on the *opposing* partnership, so the rule it actually
+exercised was `NoCleanCanastra` — not the one in its name.
+
+**Fix applied.** The test now lays a clean canastra straight out of hand, which satisfies §11.1 so that
+rule cannot be what fires, and picks `5♥..J♥` because it is only 55 in card value — short of the 75
+needed to open. `OpeningMinimumNotMet { laid: 55, required: 75 }` is asserted exactly. A companion test
+runs the identical lay from an already-open partnership and checks it goes out cleanly, which is what
+pins down that the first test fails on the minimum and nothing else.
 
 ---
 
-## F10 — Two things the plan promised and this session did not deliver (low)
+## F10 — proptest and ts-rs not delivered (low, closed)
 
-- **A `proptest` case asserting `apply` never panics on arbitrary input.** F2 is exactly the class of
-  bug it would have caught, which is an argument for adding it early rather than late.
-- **`ts-rs` TypeScript generation.** The interoperability guarantee is the serde contract and that *is*
-  pinned by `tests/boundary.rs`; ts-rs is the compile-time convenience on top of it. Tracked separately.
+Closed as not relevant by the project owner.
 
-**Process note.** For the serialization work the serde derives were written before `tests/boundary.rs`,
-so those 13 tests passed on their first run rather than failing first. Derives are generated code, but
-the shape decisions they encode — `tag = "type"`, cards as strings — are real design and should have
-been driven by tests. They are pinned now; they were not pinned when they were chosen.
+For the record: the plan promised a `proptest` case asserting `apply` never panics on arbitrary input,
+and `ts-rs` TypeScript generation. F2 was exactly the class of bug the proptest would have caught, so
+if fuzzing ever does get added, deserialization is where to point it. The interoperability guarantee
+itself does not depend on ts-rs — that is the serde contract, and it is pinned by `tests/boundary.rs`.
+
+**Process note, still worth keeping.** For the serialization work the serde derives were written before
+`tests/boundary.rs`, so those tests passed on their first run rather than failing first. Derives are
+generated code, but the shape decisions they encode — `tag = "type"`, cards as strings — are real design
+and should have been driven by tests. They are pinned now; they were not pinned when they were chosen.
+
+---
+
+## F11 — A lay could strand the player's last card (medium) — FIXED
+
+**Found while working through F5**, and fixed in the same pass.
+
+A player could lay down to exactly one card with no clean canastra behind them. That position is
+already lost: the compulsory discard would empty their hand, which is going out, which §11.1 refuses
+without a clean canastra. There was no legal move left, and the only escape was the rewind whose
+existence F5 questions.
+
+Three existing tests turned out to be sitting in exactly that position and were corrected rather than
+the rule relaxed — each was testing the opening minimum and happened to lay down to one card on the way.
+
+**Fix applied.** `maybe_go_out` now also refuses a lay that would leave a single card when the
+partnership has no clean canastra and the stock still holds cards. The player is told their lay strands
+them while they still have a choice, instead of finding out a move later that nothing is legal.
+
+The stock-empty case is deliberately excluded: no discard is owed there, so
+`Action::EndTurnWithoutDiscard` carries the turn under clarification #6.
+
+This is a rules *inference*, not something the spec states — it follows from "must discard" plus "may
+not go out without a clean canastra". Worth confirming, since it forbids a move players might expect to
+be able to make.
 
 ---
 

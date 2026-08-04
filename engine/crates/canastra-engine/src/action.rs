@@ -108,6 +108,15 @@ pub enum RuleViolation {
     HandNotOver,
     /// §4.3: the turn ends with a discard, and a legal one is available here.
     MustDiscard,
+    /// A lay-off named no cards. Refused rather than treated as a lay of
+    /// nothing, which would count toward §6's "did this partnership lay
+    /// anything" without adding any value and leave the turn unfinishable.
+    NoCardsGiven,
+    /// §11.1: this lay would leave exactly one card in hand, and the compulsory
+    /// discard would then empty it — which needs a clean canastra the
+    /// partnership does not have. Refused now rather than one move later, when
+    /// there would be no legal move left at all.
+    WouldStrandLastCard,
 }
 
 impl fmt::Display for RuleViolation {
@@ -145,6 +154,11 @@ impl fmt::Display for RuleViolation {
             }
             RuleViolation::HandNotOver => f.write_str("the hand is still being played"),
             RuleViolation::MustDiscard => f.write_str("you must discard to end your turn"),
+            RuleViolation::NoCardsGiven => f.write_str("no cards were named"),
+            RuleViolation::WouldStrandLastCard => f.write_str(
+                "that would leave one card you could not then discard, \
+                 with no clean canastra to go out on",
+            ),
         }
     }
 }

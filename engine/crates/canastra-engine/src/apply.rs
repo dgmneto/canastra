@@ -247,6 +247,9 @@ fn add_to_meld(
     cards: &[Card],
 ) -> Result<(), RuleViolation> {
     require_phase(state, Phase::Melding)?;
+    if cards.is_empty() {
+        return Err(RuleViolation::NoCardsGiven);
+    }
     let team = seat.team().index();
 
     // §5: the meld that captured the pile accepts no wild for the rest of this
@@ -277,20 +280,35 @@ fn add_to_meld(
 
 /// §11.1: emptying your hand is going out, which needs a clean canastra.
 ///
-/// There is no separate "go out" action — running out of cards *is* the act. A
-/// lay that would leave the player with nothing while their partnership has no
-/// clean canastra is refused rather than allowed through into a stuck position.
+/// There is no separate "go out" action — running out of cards *is* the act.
 ///
-/// A player can still lay themselves down to a single card with no clean
-/// canastra and then be unable to discard, since that discard would empty the
-/// hand. That is self-inflicted within the turn — hands only shrink by melding,
-/// and every turn starts with a draw — so the way out is the same as for a
-/// missed opening minimum: abandon the turn and replay it.
+/// This also refuses the move one step earlier than it strictly has to. A lay
+/// that leaves *one* card is already fatal without a clean canastra: the
+/// compulsory discard would empty the hand, and that is going out. Catching it
+/// here means a player is told "that lay strands you" while they still have a
+/// choice, rather than discovering a turn later that no legal move exists.
+///
+/// That matters because moves in this game are final. The engine should never
+/// hand a player a position they cannot play out of, so every way of reaching
+/// one is refused at the move that would cause it.
+///
+/// The exception is an exhausted stock: no discard is owed, so
+/// [`Action::EndTurnWithoutDiscard`] carries the turn (clarification #6).
 fn maybe_go_out(state: &mut GameState, seat: Seat) -> Result<(), RuleViolation> {
-    if !state.hands[seat.index()].is_empty() {
+    let remaining = state.hands[seat.index()].len();
+    if remaining > 1 {
         return Ok(());
     }
-    if !state.has_clean_canastra(seat.team()) {
+    let clean = state.has_clean_canastra(seat.team());
+
+    if remaining == 1 {
+        if !clean && !state.stock.is_empty() {
+            return Err(RuleViolation::WouldStrandLastCard);
+        }
+        return Ok(());
+    }
+
+    if !clean {
         return Err(RuleViolation::NoCleanCanastra);
     }
     commit_opening(state, seat)?;
@@ -802,7 +820,7 @@ mod tests {
     #[test]
     fn forty_five_points_does_not_open_the_partnership() {
         let state = Rig::new()
-            .hand(1, "4H 5H 6H 9C TC JC 2S")
+            .hand(1, "4H 5H 6H 9C TC JC 2S 8D")
             .stock("9D 2D")
             .phase(Phase::Melding)
             .turn(1)
@@ -841,7 +859,7 @@ mod tests {
     #[test]
     fn a_partnership_past_twenty_five_hundred_needs_one_hundred_and_twenty() {
         let state = Rig::new()
-            .hand(1, "JOKER QS KS AS 4D")
+            .hand(1, "JOKER QS KS AS 4D 8C")
             .stock("9C 2C")
             .scores(0, 2500)
             .phase(Phase::Melding)
@@ -888,7 +906,7 @@ mod tests {
     #[test]
     fn red_threes_do_not_count_toward_the_opening_minimum() {
         let state = Rig::new()
-            .hand(1, "4H 5H 6H 2S")
+            .hand(1, "4H 5H 6H 2S 8D")
             .red_threes(1, "3H 3D")
             .stock("9C 2C")
             .phase(Phase::Melding)
@@ -1282,20 +1300,99 @@ mod tests {
         assert_eq!(done.went_out, None);
     }
 
-    /// Going out still has to satisfy §6 — you cannot open and go out on a
-    /// total below the minimum.
+    /// Going out still has to satisfy §6 — opening and going out in one turn
+    /// needs the minimum like any other opening.
+    ///
+    /// The setup has to be picked with care to test the rule it names. The
+    /// partnership goes out by laying a clean canastra straight from hand, so
+    /// §11.1 is satisfied and cannot be what fires; but `5♥..J♥` is only 55 in
+    /// card value, short of the 75 needed to open. Only `OpeningMinimumNotMet`
+    /// can be the answer here.
     #[test]
     fn going_out_does_not_excuse_the_opening_minimum() {
         let state = Rig::new()
-            .hand(1, "4H 5H 6H")
-            .meld(0, CLEAN)
+            .hand(1, "5H 6H 7H 8H 9H TH JH")
             .phase(Phase::Melding)
             .turn(1)
             .build();
-        assert!(matches!(
-            apply(&state, seat(1), &lay("4H 5H 6H")),
-            Err(RuleViolation::NoCleanCanastra | RuleViolation::OpeningMinimumNotMet { .. })
-        ));
+        assert_eq!(
+            apply(&state, seat(1), &lay("5H 6H 7H 8H 9H TH JH")),
+            Err(RuleViolation::OpeningMinimumNotMet {
+                laid: 55,
+                required: 75
+            })
+        );
+    }
+
+    /// The same lay from an already-open partnership goes out cleanly, which is
+    /// what proves the test above is failing on the minimum and nothing else.
+    #[test]
+    fn the_same_lay_goes_out_once_the_partnership_has_opened() {
+        let state = Rig::new()
+            .hand(1, "5H 6H 7H 8H 9H TH JH")
+            .opened(1)
+            .phase(Phase::Melding)
+            .turn(1)
+            .build();
+        let next = apply(&state, seat(1), &lay("5H 6H 7H 8H 9H TH JH")).unwrap();
+        assert_eq!(next.phase, Phase::HandOver);
+        assert_eq!(next.went_out, Some(seat(1)));
+    }
+
+    /// Moves are final, so a lay that would leave a card the player could not
+    /// then discard is refused while they still have the choice.
+    #[test]
+    fn a_lay_that_would_strand_your_last_card_is_refused() {
+        let state = Rig::new()
+            .hand(1, "6H 7H 8H KS")
+            .meld(1, DIRTY)
+            .stock("9C 2C")
+            .phase(Phase::Melding)
+            .turn(1)
+            .build();
+        assert_eq!(
+            apply(&state, seat(1), &lay("6H 7H 8H")),
+            Err(RuleViolation::WouldStrandLastCard)
+        );
+    }
+
+    #[test]
+    fn stranding_is_fine_once_there_is_a_clean_canastra_to_go_out_on() {
+        let state = Rig::new()
+            .hand(1, "6H 7H 8H KS")
+            .meld(1, CLEAN)
+            .stock("9C 2C")
+            .phase(Phase::Melding)
+            .turn(1)
+            .build();
+        let laid = apply(&state, seat(1), &lay("6H 7H 8H")).unwrap();
+        let out = apply(&laid, seat(1), &Action::Discard { card: card("KS") }).unwrap();
+        assert_eq!(out.went_out, Some(seat(1)));
+    }
+
+    /// F4: a lay-off naming no cards used to be accepted, marking the turn as
+    /// having laid something without adding any value — which then made the
+    /// §6 minimum unreachable and the turn unfinishable.
+    #[test]
+    fn an_empty_lay_off_is_refused_rather_than_poisoning_the_turn() {
+        let state = Rig::new()
+            .hand(1, "4H 5H")
+            .meld(1, "9D TD JD")
+            .stock("2C 3C")
+            .phase(Phase::Melding)
+            .turn(1)
+            .build();
+        assert_eq!(
+            apply(
+                &state,
+                seat(1),
+                &Action::AddToMeld {
+                    meld: 0,
+                    cards: vec![]
+                }
+            ),
+            Err(RuleViolation::NoCardsGiven)
+        );
     }
 
     #[test]
