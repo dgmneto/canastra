@@ -186,10 +186,10 @@ still worth fixing while the method exists.
 
 ---
 
-## F6 — Trust boundary undefended by construction (medium) — CLOSED
+## F6 — Trust boundary undefended by construction (medium) — CLOSED, with one exception
 
 Closed by a deployment decision: the engine runs on servers only, and no build of it is shipped to a
-browser.
+browser — **except `web/`, a single-player local sandbox.** See "The sandbox exception" below.
 
 **This is an assumption rather than a code change, so it is worth stating what it rests on.** The
 finding was never a bug in the rules core — `apply` guards turn order correctly and `observe` redacts
@@ -208,6 +208,14 @@ player `observe(state, seat)` rather than the state itself.
 **This finding reopens the moment any build of the engine reaches a browser** — which is what
 `canastra-wasm` was originally written for. If in-browser play or client-side move validation is ever
 picked up, `snapshot` must not be reachable from that build, and the seat must not come from the client.
+
+### The sandbox exception
+
+`web/` ships `canastra-wasm` to a browser, so the condition above is already met once. It is a
+single-player local sandbox — no server, no network, all four seats played by bots in one tab — so
+there is no hostile caller to defend against, and it deliberately renders every hand face up.
+
+Left as-is for the MVP. The obligations above apply unchanged the first time a second person connects.
 
 ---
 

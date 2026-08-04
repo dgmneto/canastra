@@ -1,3 +1,8 @@
 target/
 **/*.rs.bk
 .DS_Store
+node_modules/
+dist/
+
+# wasm-pack output — rebuilt from engine/ by `npm run build:engine`.
+web/src/engine/

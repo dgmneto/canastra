@@ -4,13 +4,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repo status
 
-Brand new repo. No code yet — only the game-rules spec. Three planned components will live here as they're built:
+Three planned components:
 
-1. **Rust engine/state machine** — implements Canastra game rules and turn logic.
-2. **Bot project** — trains/designs AI bots to play against (built after the engine exists).
-3. **Web app** — lets people play Canastra against each other or against a bot.
+1. **Rust engine/state machine** — implements Canastra game rules and turn logic. **Built**, in `engine/`.
+2. **Bot project** — trains/designs AI bots to play against. **Not started.** `web/src/bots/` holds
+   toy policies for watching the engine, behind a `Bot` interface with a per-seat picker so they can
+   play each other. Useful for eyeballing behaviour; it is not a training harness and does not
+   presume the shape the real project will take.
+3. **Web app** — lets people play Canastra against each other or against a bot. **Not started.**
+   `web/` currently holds a single-page *engine sandbox*: no server, no networking, all four seats
+   driven by bots and every hand face up. Real multiplayer is a different program that happens to
+   share a directory name.
 
-Update this file's "Commands" and "Architecture" sections as each component is scaffolded — they're intentionally empty until there's real structure to document.
+Update this file's "Commands" and "Architecture" sections as each component is scaffolded.
 
 ## Source of truth for game rules
 
@@ -62,11 +68,29 @@ The wasm promise is checked by building, not by assertion:
 cargo build -p canastra-wasm --target wasm32-unknown-unknown
 ```
 
+The sandbox in `web/` runs from the repo root. `build:engine` regenerates `web/src/engine/` from the
+Rust crate and has to be re-run after any engine change, or the page keeps the stale wasm:
+
+```bash
+npm install --prefix web && npm run build:engine --prefix web && npm run dev --prefix web
+```
+
+```bash
+npx --prefix web tsc --noEmit
+```
+
 ## Architecture
 
 `engine/` is a self-contained Cargo workspace. `crates/canastra-engine` is the rules core and has no
-binding dependencies; `crates/canastra-wasm` holds the JavaScript glue. The `bot/` and web app
-projects will be sibling top-level directories — nothing but shared docs lives at the repo root.
+binding dependencies; `crates/canastra-wasm` holds the JavaScript glue. The `bot/` project will be a
+sibling top-level directory — nothing but shared docs lives at the repo root.
+
+`web/` is a Vite + React page that loads `canastra-wasm` directly in the browser and drives all four
+seats with bots. It is a **sandbox for watching the engine**, not the multiplayer app: it holds the
+whole `GameState` client-side and renders every hand face up. That is safe only because there is no
+opponent to hide anything from, and it is precisely what a networked client must not do — F6 in
+[ADVERSARIAL-REVIEW.md](ADVERSARIAL-REVIEW.md) states the obligations that reappear the moment a
+second person is involved. See [web/README.md](web/README.md).
 
 **The engine is a pure function.** `apply(&GameState, Seat, &Action) -> Result<GameState, RuleViolation>`
 never mutates its input. This is load-bearing, not stylistic: §6 requires a partnership's opening melds
