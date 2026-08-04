@@ -36,6 +36,7 @@ Update this file's "Commands" and "Architecture" sections as each component is s
 3. **Stock depleted via red-3 replacement draw** (not a normal turn-draw): treat identically to section 11.2 — the player whose replacement draw empties the stock completes their turn normally (may lay down/bater), then the hand ends.
 4. **First-turn refusal when the first card drawn is a red 3:** the red 3 goes to the table + replacement draw as usual, but the refusal privilege is *not* burned — it carries over and applies to the replacement card.
 5. **Cards frozen by taking the discard pile:** §5 says they "não pode ser usada neste turno" without saying whether discarding counts as using. Read "usada" as *melded* — a frozen card may be discarded but not melded. This case is reachable: a player who takes the pile holding only the two core cards melds both and is left holding nothing but frozen cards, yet still owes a discard.
+6. **A player who cannot legally discard keeps the card and the hand ends.** Without a clean canastra a partnership must always keep at least one card in hand, so a player holding exactly one card has no legal discard at all. This is reachable: §12's replacement draw returns nothing when the stock has just run out, leaving a one-card hand intact. The player keeps the card, the hand ends under §11.2, nobody takes the going-out bonus, and the retained card scores against them. Modelled as `Action::EndTurnWithoutDiscard`, legal only in exactly that position.
 
 ## Commands
 

@@ -111,10 +111,73 @@ impl CanastraKind {
 /// since a sequence has no holes and holds at most one wild, a wild has naturals
 /// on both sides exactly when it sits at an interior index.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawSequence")]
 pub struct Sequence {
     suit: Suit,
     low: u8,
     slots: Vec<Slot>,
+}
+
+/// The wire shape of a [`Sequence`], before validation.
+///
+/// Deriving `Deserialize` straight onto `Sequence` would let serde build one
+/// field by field, walking past every invariant the constructors enforce — a
+/// crafted payload could produce an empty slot array or a `low` outside 4..=A,
+/// and the accessors would then panic. Everything from outside the process
+/// comes through here instead, so an invalid sequence never exists as a value.
+#[derive(Deserialize)]
+struct RawSequence {
+    suit: Suit,
+    low: u8,
+    slots: Vec<Slot>,
+}
+
+impl TryFrom<RawSequence> for Sequence {
+    type Error = MeldError;
+
+    fn try_from(raw: RawSequence) -> Result<Sequence, MeldError> {
+        if raw.slots.len() < 3 {
+            return Err(MeldError::TooFewCards);
+        }
+        // Checking the top end also bounds `low`, which is what stops
+        // `Sequence::low` and `Sequence::high` from indexing off the rank table.
+        let high = usize::from(raw.low) + raw.slots.len() - 1;
+        if high >= MAX_SEQUENCE_LEN {
+            return Err(MeldError::TooLong);
+        }
+
+        let mut wilds = 0;
+        for (offset, slot) in raw.slots.iter().enumerate() {
+            let index = raw.low + offset as u8;
+            match *slot {
+                Slot::Natural(card) => {
+                    if card.suit() != Some(raw.suit) {
+                        return Err(MeldError::MixedSuits);
+                    }
+                    // The card has to actually be the rank its position claims.
+                    if card.rank().and_then(Rank::sequence_index) != Some(index) {
+                        return Err(MeldError::NotASequence);
+                    }
+                }
+                Slot::Wild(card) => {
+                    if !card.is_wild() {
+                        return Err(MeldError::NotASequence);
+                    }
+                    check_two_suit(Some(card), raw.suit)?;
+                    wilds += 1;
+                }
+            }
+        }
+        if wilds > 1 {
+            return Err(MeldError::TooManyWilds);
+        }
+
+        Ok(Sequence {
+            suit: raw.suit,
+            low: raw.low,
+            slots: raw.slots,
+        })
+    }
 }
 
 impl Sequence {
@@ -331,9 +394,37 @@ fn assemble(
 
 /// §7.2: a set of aces, any suits. Only eight aces exist across the two decks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawAcesMeld")]
 pub struct AcesMeld {
     aces: Vec<Card>,
     wild: Option<Card>,
+}
+
+/// The wire shape of an [`AcesMeld`]. See [`RawSequence`] for why it exists.
+#[derive(Deserialize)]
+struct RawAcesMeld {
+    aces: Vec<Card>,
+    wild: Option<Card>,
+}
+
+impl TryFrom<RawAcesMeld> for AcesMeld {
+    type Error = MeldError;
+
+    fn try_from(raw: RawAcesMeld) -> Result<AcesMeld, MeldError> {
+        if raw.aces.iter().any(|card| card.rank() != Some(Rank::Ace)) {
+            return Err(MeldError::NotAnAce);
+        }
+        if raw.wild.is_some_and(|card| !card.is_wild()) {
+            return Err(MeldError::NotAnAce);
+        }
+        if raw.aces.len() + usize::from(raw.wild.is_some()) < 3 {
+            return Err(MeldError::TooFewCards);
+        }
+        Ok(AcesMeld {
+            aces: raw.aces,
+            wild: raw.wild,
+        })
+    }
 }
 
 impl AcesMeld {

@@ -241,3 +241,218 @@ fn a_rigged_position_survives_persistence() {
     .expect("the restored position behaves identically");
     assert_eq!(taken.phase, Phase::Melding);
 }
+
+// ---- validated deserialization (adversarial review F2, F3) ----
+
+use canastra_engine::meld::Meld;
+
+/// F2: serde reconstructs a struct field by field, which walks straight past
+/// every check the constructors make. These payloads all parsed before the fix,
+/// and reading the resulting meld panicked.
+#[test]
+fn a_malformed_sequence_is_refused_at_the_boundary() {
+    let bad = [
+        // No slots at all, and a `low` far outside 4..=A. Sequence::low() used
+        // to panic on this one.
+        r#"{"kind":"Sequence","meld":{"suit":"Hearts","low":250,"slots":[]}}"#,
+        // A natural card that is not the rank its position claims it is.
+        r#"{"kind":"Sequence","meld":{"suit":"Hearts","low":0,"slots":[
+            {"kind":"Natural","card":"KH"},{"kind":"Natural","card":"5H"},
+            {"kind":"Natural","card":"6H"}]}}"#,
+        // Two wild cards, which §8 forbids.
+        r#"{"kind":"Sequence","meld":{"suit":"Hearts","low":0,"slots":[
+            {"kind":"Wild","card":"JOKER"},{"kind":"Wild","card":"2H"},
+            {"kind":"Natural","card":"6H"}]}}"#,
+        // A natural of the wrong suit.
+        r#"{"kind":"Sequence","meld":{"suit":"Hearts","low":0,"slots":[
+            {"kind":"Natural","card":"4S"},{"kind":"Natural","card":"5H"},
+            {"kind":"Natural","card":"6H"}]}}"#,
+        // §8: a 2 standing in for a rank of another suit.
+        r#"{"kind":"Sequence","meld":{"suit":"Hearts","low":0,"slots":[
+            {"kind":"Natural","card":"4H"},{"kind":"Natural","card":"5H"},
+            {"kind":"Wild","card":"2S"}]}}"#,
+        // Shorter than a meld can be.
+        r#"{"kind":"Sequence","meld":{"suit":"Hearts","low":0,"slots":[
+            {"kind":"Natural","card":"4H"},{"kind":"Natural","card":"5H"}]}}"#,
+        // Runs off the top of the Ace.
+        r#"{"kind":"Sequence","meld":{"suit":"Hearts","low":9,"slots":[
+            {"kind":"Natural","card":"KH"},{"kind":"Natural","card":"AH"},
+            {"kind":"Wild","card":"JOKER"}]}}"#,
+    ];
+    for json in bad {
+        assert!(
+            serde_json::from_str::<Meld>(json).is_err(),
+            "should have been refused: {json}"
+        );
+    }
+}
+
+#[test]
+fn a_malformed_ace_meld_is_refused_at_the_boundary() {
+    let bad = [
+        r#"{"kind":"Aces","meld":{"aces":["KH","AD","AS"],"wild":null}}"#,
+        r#"{"kind":"Aces","meld":{"aces":["AH","AD"],"wild":"7C"}}"#,
+        r#"{"kind":"Aces","meld":{"aces":["AH"],"wild":null}}"#,
+    ];
+    for json in bad {
+        assert!(
+            serde_json::from_str::<Meld>(json).is_err(),
+            "should have been refused: {json}"
+        );
+    }
+}
+
+/// The validation must not cost legitimate melds their round trip.
+#[test]
+fn every_kind_of_real_meld_still_round_trips() {
+    for spec in [
+        "6H 7H 8H",
+        "6H 7H 2H",
+        "JOKER QS KS AS",
+        "4H 5H 6H 7H 8H 9H TH JH QH KH AH",
+        "AH AD AS",
+        "AH AD AS AC AH AD AS JOKER",
+    ] {
+        let meld = Meld::new(&cards(spec)).expect(spec);
+        let json = serde_json::to_string(&meld).unwrap();
+        assert_eq!(serde_json::from_str::<Meld>(&json).unwrap(), meld, "{spec}");
+    }
+}
+
+/// F3: a whole state can be tampered with even when every meld inside it is
+/// individually valid, so conservation has to be checked separately.
+#[test]
+fn a_dealt_game_satisfies_its_invariants() {
+    for seed in 0..20 {
+        new_game(seed)
+            .check_invariants()
+            .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+    }
+}
+
+#[test]
+fn a_state_that_invented_cards_is_caught() {
+    let mut raw = serde_json::to_value(new_game(5)).unwrap();
+    raw["hands"][1] = serde_json::json!(["6H", "6H", "6H", "6H", "6H", "6H", "6H", "6H"]);
+    let tampered: GameState = serde_json::from_value(raw).expect("shape is still valid");
+    assert!(
+        tampered.check_invariants().is_err(),
+        "eight copies of one card"
+    );
+}
+
+/// §12: a red 3 goes to the table on sight, so it can never be in a hand or in
+/// the pile. A state claiming otherwise did not come from play.
+#[test]
+fn a_red_three_where_it_cannot_be_is_caught() {
+    let mut raw = serde_json::to_value(new_game(5)).unwrap();
+    raw["discard"] = serde_json::json!(["3H"]);
+    let tampered: GameState = serde_json::from_value(raw).expect("shape is still valid");
+    assert!(tampered.check_invariants().is_err());
+}
+
+#[test]
+fn a_frozen_card_the_player_does_not_hold_is_caught() {
+    let mut raw = serde_json::to_value(new_game(5)).unwrap();
+    raw["turn_context"]["frozen"] = serde_json::json!(["3H"]);
+    let tampered: GameState = serde_json::from_value(raw).expect("shape is still valid");
+    assert!(tampered.check_invariants().is_err());
+}
+
+/// Invariants have to survive real play, not just the deal.
+#[test]
+fn invariants_hold_all_the_way_through_a_played_hand() {
+    let mut state = new_game(77);
+    for _ in 0..30 {
+        if state.phase == Phase::HandOver || state.phase == Phase::MatchOver {
+            break;
+        }
+        let seat = state.turn;
+        state = apply(&state, seat, &Action::Draw).unwrap();
+        if state.phase == Phase::AwaitingRefusalChoice {
+            state = apply(&state, seat, &Action::KeepDrawnCard).unwrap();
+        }
+        let throwaway = state.hand(seat)[0];
+        state = apply(&state, seat, &Action::Discard { card: throwaway }).unwrap();
+        state.check_invariants().expect("still a legal position");
+    }
+}
+
+// ---- F1: the position with no legal discard ----
+
+/// CLAUDE.md clarification #6. A player holding one card draws a red 3 as the
+/// last card of the stock, so §12's replacement never arrives and the hand is
+/// left at one card. With no clean canastra they may not empty their hand, and
+/// they may not keep it either — before the fix there was no legal move at all.
+#[test]
+fn a_player_with_no_legal_discard_keeps_the_card_and_the_hand_ends() {
+    let state = Rig::new()
+        .hand(1, "4H")
+        .meld(1, "5S 6S 7S 8S 9S TS 2S") // dirty canastra only
+        .stock("3H")
+        .turn(1)
+        .build();
+    let drawn = apply(&state, seat(1), &Action::Draw).unwrap();
+    assert_eq!(drawn.hand(seat(1)).len(), 1, "the replacement never came");
+    assert!(drawn.stock.is_empty());
+
+    assert_eq!(
+        apply(&drawn, seat(1), &Action::Discard { card: card("4H") }),
+        Err(RuleViolation::NoCleanCanastra)
+    );
+
+    let done = apply(&drawn, seat(1), &Action::EndTurnWithoutDiscard).unwrap();
+    assert_eq!(done.phase, Phase::HandOver);
+    assert_eq!(
+        done.went_out, None,
+        "nobody went out, so nobody gets the bonus"
+    );
+    assert_eq!(
+        done.hand(seat(1)),
+        cards("4H"),
+        "the card stays in hand and scores against them"
+    );
+}
+
+#[test]
+fn the_discard_cannot_be_skipped_while_the_stock_still_has_cards() {
+    let state = Rig::new()
+        .hand(1, "4H")
+        .meld(1, "5S 6S 7S 8S 9S TS 2S")
+        .stock("KC QC")
+        .phase(Phase::Melding)
+        .turn(1)
+        .build();
+    assert_eq!(
+        apply(&state, seat(1), &Action::EndTurnWithoutDiscard),
+        Err(RuleViolation::MustDiscard)
+    );
+}
+
+/// A player who *can* legally discard has to.
+#[test]
+fn the_discard_cannot_be_skipped_when_a_legal_one_exists() {
+    let with_spare = Rig::new()
+        .hand(1, "4H 5H")
+        .meld(1, "5S 6S 7S 8S 9S TS 2S")
+        .phase(Phase::Melding)
+        .turn(1)
+        .build();
+    assert_eq!(
+        apply(&with_spare, seat(1), &Action::EndTurnWithoutDiscard),
+        Err(RuleViolation::MustDiscard)
+    );
+
+    // One card, but a clean canastra behind it: discarding is going out, which
+    // is legal and pays 100, so skipping is not on offer.
+    let can_go_out = Rig::new()
+        .hand(1, "4H")
+        .meld(1, "5S 6S 7S 8S 9S TS JS")
+        .phase(Phase::Melding)
+        .turn(1)
+        .build();
+    assert_eq!(
+        apply(&can_go_out, seat(1), &Action::EndTurnWithoutDiscard),
+        Err(RuleViolation::MustDiscard)
+    );
+}

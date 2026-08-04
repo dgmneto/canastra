@@ -43,6 +43,15 @@ pub enum Action {
     AddToMeld { meld: usize, cards: Vec<Card> },
     /// §4.3: put a card on the pile, ending the turn.
     Discard { card: Card },
+    /// §11.2 with CLAUDE.md clarification #6: end the turn holding your last
+    /// card, because there is no legal discard.
+    ///
+    /// Only reachable in one position. Without a clean canastra a partnership
+    /// must keep at least one card in hand, so a player down to a single card
+    /// cannot discard it — and §12's replacement draw returns nothing once the
+    /// stock has run out, which is how a one-card hand survives a draw. The
+    /// player keeps the card, it scores against them, and nobody goes out.
+    EndTurnWithoutDiscard,
 }
 
 /// Where the three cards captured from the discard pile are going.
@@ -97,6 +106,8 @@ pub enum RuleViolation {
     NoCleanCanastra,
     /// The hand is still being played, so there is nothing to settle yet.
     HandNotOver,
+    /// §4.3: the turn ends with a discard, and a legal one is available here.
+    MustDiscard,
 }
 
 impl fmt::Display for RuleViolation {
@@ -133,6 +144,7 @@ impl fmt::Display for RuleViolation {
                 f.write_str("going out needs a clean canastra on the table")
             }
             RuleViolation::HandNotOver => f.write_str("the hand is still being played"),
+            RuleViolation::MustDiscard => f.write_str("you must discard to end your turn"),
         }
     }
 }

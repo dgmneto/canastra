@@ -3,6 +3,7 @@
 use crate::card::Card;
 use crate::meld::Meld;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// §2: fifteen cards per player.
 pub const HAND_SIZE: usize = 15;
@@ -232,6 +233,110 @@ impl GameState {
             .melds
             .iter()
             .any(|meld| meld.canastra().is_clean())
+    }
+}
+
+/// Why a state could not have arisen from play.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "problem")]
+pub enum StateError {
+    /// The cards in play are not the 108-card deck: some were invented, lost,
+    /// or duplicated beyond the two copies that exist.
+    DeckNotConserved,
+    /// §12: a red 3 goes to the table the moment it is seen, so it can never be
+    /// in a hand, and having never been in a hand it can never reach the pile.
+    RedThreeOutOfPlace,
+    /// A partnership's red-3 pile holds something that is not a red 3.
+    NotARedThree,
+    /// §5: the frozen set is meant to be part of the current player's hand.
+    FrozenCardNotHeld,
+    /// §5: the meld that captured the pile does not exist.
+    DanglingPileCoreMeld,
+}
+
+impl fmt::Display for StateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            StateError::DeckNotConserved => "the cards in play are not the 108-card deck",
+            StateError::RedThreeOutOfPlace => "a red 3 is in a hand or in the discard pile",
+            StateError::NotARedThree => "a partnership's red 3s include another card",
+            StateError::FrozenCardNotHeld => "a frozen card is not in the player's hand",
+            StateError::DanglingPileCoreMeld => "the pile's capturing meld does not exist",
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for StateError {}
+
+impl GameState {
+    /// Check that this state could actually have arisen from play.
+    ///
+    /// serde rebuilds a `GameState` field by field, which walks past every check
+    /// [`crate::apply`] makes. Individually valid melds are not enough: a payload
+    /// can still invent cards, or park a red 3 somewhere §12 says it can never
+    /// be. Call this on anything that came from outside the process — a stored
+    /// snapshot, a client payload — before trusting it.
+    ///
+    /// This is a soundness check, not a rules check. It does not care whether
+    /// the position is *reachable*, only that it is not impossible.
+    pub fn check_invariants(&self) -> Result<(), StateError> {
+        for hand in &self.hands {
+            if hand.iter().any(|card| card.is_red_three()) {
+                return Err(StateError::RedThreeOutOfPlace);
+            }
+        }
+        // A red 3 never enters a hand, so it can never have been discarded
+        // either. One still in the stock is fine — it just has not been drawn.
+        if self.discard.iter().any(|card| card.is_red_three()) {
+            return Err(StateError::RedThreeOutOfPlace);
+        }
+
+        for table in &self.tables {
+            if !table.red_threes.iter().all(|card| card.is_red_three()) {
+                return Err(StateError::NotARedThree);
+            }
+        }
+
+        let held = &self.hands[self.turn.index()];
+        for frozen in &self.turn_context.frozen {
+            let in_hand = held.iter().filter(|card| *card == frozen).count();
+            let frozen_copies = self
+                .turn_context
+                .frozen
+                .iter()
+                .filter(|card| *card == frozen)
+                .count();
+            if in_hand < frozen_copies {
+                return Err(StateError::FrozenCardNotHeld);
+            }
+        }
+
+        if let Some(index) = self.turn_context.pile_core_meld
+            && index >= self.table(self.turn.team()).melds.len()
+        {
+            return Err(StateError::DanglingPileCoreMeld);
+        }
+
+        let mut in_play: Vec<Card> = self.stock.clone();
+        in_play.extend(self.discard.iter().copied());
+        for hand in &self.hands {
+            in_play.extend(hand.iter().copied());
+        }
+        for table in &self.tables {
+            in_play.extend(table.red_threes.iter().copied());
+            for meld in &table.melds {
+                in_play.extend(meld.cards());
+            }
+        }
+        let mut expected = crate::card::deck();
+        in_play.sort_by_key(|card| card.to_string());
+        expected.sort_by_key(|card| card.to_string());
+        if in_play != expected {
+            return Err(StateError::DeckNotConserved);
+        }
+
+        Ok(())
     }
 }
 

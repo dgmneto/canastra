@@ -80,9 +80,17 @@ impl Game {
     }
 
     /// Rebuild a game from [`Game::snapshot`].
+    ///
+    /// Parsing is not enough on its own. serde rebuilds a state field by field,
+    /// so a snapshot that is merely corrupt — let alone crafted — can describe a
+    /// position no game could reach. The invariant check is what stands between
+    /// that and the rest of the engine.
     pub fn restore(snapshot: &str) -> Result<Game, JsValue> {
         let state: GameState = serde_json::from_str(snapshot)
             .map_err(|error| message(&format!("not a game: {error}")))?;
+        state
+            .check_invariants()
+            .map_err(|error| message(&format!("not a reachable position: {error}")))?;
         Ok(Game {
             turn_start: state.clone(),
             state,

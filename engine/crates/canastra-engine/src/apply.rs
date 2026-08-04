@@ -46,6 +46,7 @@ pub fn apply(state: &GameState, seat: Seat, action: &Action) -> Result<GameState
         Action::LayMeld { cards } => lay_meld(&mut next, seat, cards)?,
         Action::AddToMeld { meld, cards } => add_to_meld(&mut next, seat, *meld, cards)?,
         Action::Discard { card } => discard(&mut next, seat, *card)?,
+        Action::EndTurnWithoutDiscard => end_turn_without_discard(&mut next, seat)?,
     }
     Ok(next)
 }
@@ -388,6 +389,33 @@ fn discard(state: &mut GameState, seat: Seat, card: Card) -> Result<(), RuleViol
     }
 
     end_turn(state);
+    Ok(())
+}
+
+/// §11.2 with CLAUDE.md clarification #6: end the turn holding a card that
+/// cannot legally be thrown.
+///
+/// Without a clean canastra a partnership must keep at least one card in hand,
+/// so a player down to a single card has no legal discard at all. Ordinarily
+/// that cannot happen — every turn opens with a draw — but §12's replacement
+/// draw returns nothing once the stock has run out, which leaves a one-card hand
+/// exactly as it was. The hand was ending this turn regardless, so it simply
+/// ends: the card stays in hand and scores against them, and since nobody went
+/// out nobody takes the bonus.
+fn end_turn_without_discard(state: &mut GameState, seat: Seat) -> Result<(), RuleViolation> {
+    require_phase(state, Phase::Melding)?;
+
+    // Two or more cards, and any of them is a legal discard.
+    // Exactly one card plus a clean canastra, and throwing it is going out.
+    let cornered = state.stock.is_empty()
+        && state.hands[seat.index()].len() == 1
+        && !state.has_clean_canastra(seat.team());
+    if !cornered {
+        return Err(RuleViolation::MustDiscard);
+    }
+
+    commit_opening(state, seat)?;
+    state.phase = Phase::HandOver;
     Ok(())
 }
 

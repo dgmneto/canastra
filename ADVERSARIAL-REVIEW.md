@@ -7,9 +7,26 @@ so nobody re-opens it.
 
 State at time of review: commit `261e6bf`, 158 tests passing, clippy and rustfmt clean.
 
+**Update.** F1, F2 and F3 have since been fixed, with regression tests, in a follow-up commit. Their
+sections below are kept in full — the reproduction is the useful part, and it documents what the
+regression tests are defending. F4 through F10 are still open.
+
+| | Finding | Severity | Status |
+|---|---|---|---|
+| F1 | Unwinnable deadlock when a red 3 empties the stock | critical | **fixed** |
+| F2 | Malformed JSON builds invalid melds; accessors panic | high | **fixed** |
+| F3 | `GameState` deserializes with impossible contents | high | **fixed** |
+| F4 | Empty `AddToMeld` poisons the turn | medium | open |
+| F5 | `rewindTurn` can revert to the wrong turn | medium | open |
+| F6 | Trust boundary undefended by construction | medium | open (documented) |
+| F7 | No `legal_actions`; `validate` clones | low | open (deferred by plan) |
+| F8 | Meld JSON awkward for other languages | low | open |
+| F9 | One weak test | low | open |
+| F10 | proptest and ts-rs not delivered | low | open |
+
 ---
 
-## F1 — Unwinnable deadlock when a red 3 empties the stock (critical)
+## F1 — Unwinnable deadlock when a red 3 empties the stock (critical) — FIXED
 
 **Confirmed by reproduction.**
 
@@ -42,17 +59,26 @@ apply(&drawn, seat(1), &Action::Discard { card: card("4H") });  // NoCleanCanast
 clean-canastra gate. But when the stock is already empty the hand is ending under §11.2 regardless, and
 the player is not "batendo" — the hand simply stops.
 
-**Suggested fix.** In `discard`, when `state.stock.is_empty()`, let the discard through and end the
-hand under §11.2 with `went_out = None` — no bonus, no clean-canastra requirement. Read §11.2's "a mão
-termina após o descarte dele e ninguém leva o bônus de batida" as covering this case. Worth confirming
-as a rules decision and recording as a CLAUDE.md clarification, since the spec does not address it.
+**Fix applied.** The rule was settled by the project owner and is now CLAUDE.md clarification #6:
+without a clean canastra a partnership must always keep at least one card in hand, so a player who
+cannot discard **keeps the card and the hand ends**. My original suggestion — letting the discard
+through — was wrong, and would have thrown away a card the rules say is retained and scored against
+them.
 
-The neighbouring case already behaves correctly: the same position *with* a clean canastra ends the
-hand with `went_out = Some(seat)`.
+Modelled as `Action::EndTurnWithoutDiscard`, legal only when the stock is empty, the hand holds exactly
+one card, and the partnership has no clean canastra. The card stays in hand, `went_out` stays `None`,
+and the retained card counts against the partnership at scoring.
+
+An earlier idea — auto-ending the hand as soon as the position was detected — was rejected on
+inspection: a player holding one card may be able to lay it off to *complete* a clean canastra, which
+makes going out legal after all. Ending automatically would silently deny them that.
+
+The neighbouring case already behaved correctly and still does: the same position *with* a clean
+canastra ends the hand with `went_out = Some(seat)`.
 
 ---
 
-## F2 — Malformed JSON builds invalid melds, and reading them panics (high)
+## F2 — Malformed JSON builds invalid melds, and reading them panics (high) — FIXED
 
 **Confirmed by reproduction.**
 
@@ -71,13 +97,18 @@ which underflows.
 take this input. A crafted or merely corrupt payload is a remote panic — a denial of service in a
 multiplayer server, and a crashed tab in the browser.
 
-**Suggested fix.** Deserialize `Sequence` and `AcesMeld` through a validated intermediate
-(`#[serde(try_from = "RawSequence")]`) that runs the same checks `Meld::new` does, so an invalid meld
-can never exist as a value. Same treatment as `Seat`, which already does this correctly.
+**Fix applied.** `Sequence` and `AcesMeld` now deserialize through a private `RawSequence` /
+`RawAcesMeld` intermediate via `#[serde(try_from = ...)]`. The conversion checks length, that the run
+fits inside 4..=A, that each natural card really is the rank its slot position claims, suit agreement,
+the §8 one-wild limit, and the §8 own-suit rule for a 2. An invalid meld can no longer exist as a
+value, which is the same treatment `Seat` already had.
+
+Bounding the top of the run is what removes the panic specifically: it bounds `low` as a side effect,
+so `Sequence::low` and `Sequence::high` can no longer index off the rank table.
 
 ---
 
-## F3 — `GameState` deserializes with impossible contents (high)
+## F3 — `GameState` deserializes with impossible contents (high) — FIXED
 
 **Confirmed by reproduction.** A hand-edited snapshot with ten copies of `6H` in one hand and a red 3
 sitting in the discard pile round-trips without complaint.
@@ -89,10 +120,17 @@ way in.
 **Why it matters.** Same entry points as F2. A client that can influence a restored snapshot can invent
 cards, and the engine will happily score them.
 
-**Suggested fix.** A `GameState::check_invariants() -> Result<(), &'static str>` verifying that the
-union of every zone is exactly the 108-card deck, that no red 3 is in a hand or the pile, and that
-`turn_context.frozen` is a sub-multiset of the current player's hand. Call it on every restore path.
-`tests/boundary.rs` already has the "conserves the whole deck" helper to build on.
+**Fix applied.** `GameState::check_invariants() -> Result<(), StateError>` verifies that the union of
+every zone is exactly the 108-card deck, that no red 3 sits in a hand or the pile, that each
+partnership's red-3 zone holds only red 3s, that `turn_context.frozen` is a sub-multiset of the current
+player's hand, and that `pile_core_meld` points at a meld that exists.
+
+`Game::restore` in `canastra-wasm` now calls it, so a snapshot that parses but describes an unreachable
+position is refused rather than fed to the engine. It is deliberately a *soundness* check, not a rules
+check — it asks whether a position is possible, not whether it was reached legally.
+
+Note that this is separate from F2 and neither subsumes the other: a state can be built entirely from
+individually valid melds and still invent cards.
 
 ---
 
