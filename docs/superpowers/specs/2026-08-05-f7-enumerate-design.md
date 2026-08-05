@@ -94,8 +94,10 @@ change.
       one window yields two distinct melds.
   - Ace melds (§7.2): every sub-multiset of 3+ natural aces held, each with
     and without one held wild (Joker, or a 2 of any suit — an ace meld
-    accepts any 2). Sub-*multiset*, not subset: the deck holds two copies of
-    each ace, a hand may hold duplicates, and the engine accepts them —
+    accepts any 2). As with sequences, each usable wild held produces its own
+    candidate: with a Joker and a 2 both in hand, one ace sub-multiset yields
+    two distinct melds. Sub-*multiset*, not subset: the deck holds two copies
+    of each ace, a hand may hold duplicates, and the engine accepts them —
     `AcesMeld` has no duplicate-rank rejection, so `AH AH AD` is a legal
     meld. `Meld::new` decides whether a candidate is a sequence or an aces
     meld.
@@ -195,6 +197,9 @@ for (const action of bot.candidates(view, legal, context)) {
 match.restartTurn(seat);
 return { action: "restartTurn", refusals };
 ```
+
+This is an excerpt of the loop body only — the `MatchOver` early return and
+the `HandOver`/`settleHand` handling in `step` are unchanged.
 
 `apply` remains the referee, so a bot that returns something outside `legal`
 is still handled exactly as today (refused, then restart). Refusals become
