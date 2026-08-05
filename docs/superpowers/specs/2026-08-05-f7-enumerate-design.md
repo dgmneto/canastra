@@ -89,10 +89,16 @@ change.
   - Every rank window `i..=j` in 4..A (inclusive) with length ≥ 3:
     - all ranks held → candidate = the naturals in the window;
     - exactly one rank missing and a usable wild held (Joker, or a 2 of that
-      suit) → candidate = the naturals + that wild.
-  - Ace melds (§7.2): every subset of 3+ natural aces held, each with and
-    without one held wild (Joker, or a 2 of any suit — an ace meld accepts any
-    2). `Meld::new` decides whether a candidate is a sequence or an aces meld.
+      suit) → candidate = the naturals + that wild. Each usable wild held
+      produces its own candidate: with both a Joker and the suit's 2 in hand,
+      one window yields two distinct melds.
+  - Ace melds (§7.2): every sub-multiset of 3+ natural aces held, each with
+    and without one held wild (Joker, or a 2 of any suit — an ace meld
+    accepts any 2). Sub-*multiset*, not subset: the deck holds two copies of
+    each ace, a hand may hold duplicates, and the engine accepts them —
+    `AcesMeld` has no duplicate-rank rejection, so `AH AH AD` is a legal
+    meld. `Meld::new` decides whether a candidate is a sequence or an aces
+    meld.
 
   This window+wild scheme covers the full span of `Sequence::build` shapes —
   wild filling an interior gap, wild capping either end, including the
@@ -107,10 +113,12 @@ change.
 - **`Discard`** — each distinct hand card. `apply` filters the corollary
   cases (`NoCleanCanastra` on the last card, etc.).
 
-- **`TakeDiscardPile`** — each unordered pair of distinct *natural* cards held
-  × (`NewMeld` + each own-team meld index). Wilds are excluded statically
-  (they can never be in the core, §5), and `apply` filters blocked tops
-  (black 3 / wild, §5), frozen cores, §6 reachability, and invalid joins.
+- **`TakeDiscardPile`** — each unordered pair of natural cards held ×
+  (`NewMeld` + each own-team meld index). Pairs are multiset-based: a
+  same-value pair (two copies held) is a candidate too, since a pair of aces
+  with an ace on top is a legal capture. Wilds are excluded statically (they
+  can never be in the core, §5), and `apply` filters blocked tops (black 3 /
+  wild, §5), frozen cores, §6 reachability, and invalid joins.
 
 - **Phase moves** — `Draw`, `KeepDrawnCard`, `RefuseDrawnCard`,
   `EndTurnWithoutDiscard`: one candidate each, pushed only when the phase
@@ -119,9 +127,12 @@ change.
 
 ### Determinism
 
-Deduplicate the retained list by value and sort by a canonical key (the
-`Debug` representation is sufficient and stable). Deterministic order matters:
-seed + action log must keep replaying, and bots keyed on the list need a stable
+Each candidate's cards are emitted in canonical sorted order (by card string),
+and each `core` pair is ordered the same way, so equivalent candidates are
+already identical `Action` values before validation. The retained list is then
+deduplicated by value and sorted by a canonical key (the `Debug`
+representation is sufficient and stable). Deterministic order matters: seed +
+action log must keep replaying, and bots keyed on the list need a stable
 input.
 
 ## Section B — wasm binding
@@ -222,8 +233,12 @@ Rust (TDD — tests written first, watched fail):
     `4H 5H 6H 7H`.
   - LayMeld wilds: `6H 7H JOKER` yields `6H 7H + JOKER`; a hand with
     `4H 5H 6H` and a Joker yields the plain run and the wild-capped run.
-  - Ace subsets: four aces in hand yield every 3- and 4-ace subset, with and
-    without a held wild.
+  - Ace sub-multisets: four aces in hand yield every 3- and 4-ace
+    sub-multiset, with and without a held wild; duplicated aces are included
+    (a hand holding `AH AH AD AS` yields `AH AH AD`, `AH AH AS`,
+    `AH AH AD AS`, ...).
+  - TakeDiscardPile with a same-value core: `AS` on top and two `AH` in hand
+    yields `TakeDiscardPile { core: [AH, AH], target: NewMeld }`.
   - Frozen exclusion: after taking the pile, frozen cards appear in no
     `AddToMeld` / `LayMeld` candidate.
   - Cornered position (clarification #6): `EndTurnWithoutDiscard` is the only
