@@ -276,7 +276,7 @@ await loadEngine();
 const a = new Match(7n, ['random','random','random','random']);
 a.apply(1, { type: 'Draw' });
 const snap = a.snapshot();
-const b = Match.restore(snap, { seed: 7n, bots: ['random','random','random','random'], startedAt: 'x', log: a.log });
+const b = Match.restore(snap, { seed: 7n, bots: ['random','random','random','random'], startedAt: 'x', log: [...a.log] });
 const va = JSON.stringify(a.views()); const vb = JSON.stringify(b.views());
 if (va !== vb) { console.error('views differ'); process.exit(1); }
 if (b.log.length !== a.log.length) { console.error('log lost'); process.exit(1); }
@@ -918,6 +918,7 @@ git commit -m "Scaffold @canastra/server: one global table, lobby, WS+static ser
 
 **Files:**
 - Modify: `server/src/table.ts` (replace the four Task-3 stubs; add `pump`, `beginHandOver`, `settleNow`, `endMatch`, `name`, `botIdFor`; wire `pump()` into `afterChange`; add the `label`, `step`, `botById` imports)
+- Modify: `server/src/main.ts` (add a `BOT_DELAY_MS` env override, used by Task 4's verification)
 
 - [ ] **Step 1: Replace the match section of `server/src/table.ts`**
 
