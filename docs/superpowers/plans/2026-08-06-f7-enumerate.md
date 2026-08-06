@@ -383,10 +383,12 @@ Append to `tests/enumerate.rs`:
 ```rust
 #[test]
 fn refusal_choice_yields_keep_and_refuse() {
+    // The stock must be non-empty: refusing means drawing a replacement.
     let state = Rig::new()
         .phase(Phase::AwaitingRefusalChoice)
         .pending_refusal("KH")
         .refusal_available()
+        .stock("8C 9D")
         .hand(1, "4D 5D")
         .build();
     let actions = enumerate(&state, seat(1));
@@ -396,11 +398,13 @@ fn refusal_choice_yields_keep_and_refuse() {
 }
 
 #[test]
-fn refusal_spent_leaves_only_keep() {
-    // Defensive: a pending decision without the privilege filters to Keep.
+fn refusal_without_stock_leaves_only_keep() {
+    // Refusing means drawing a replacement, so an empty stock takes the
+    // option off the table even mid-decision.
     let state = Rig::new()
         .phase(Phase::AwaitingRefusalChoice)
         .pending_refusal("KH")
+        .refusal_available()
         .hand(1, "4D 5D")
         .build();
     assert_eq!(enumerate(&state, seat(1)), vec![Action::KeepDrawnCard]);
@@ -421,7 +425,7 @@ fn other_seats_and_terminal_phases_get_nothing() {
 - [ ] **Step 3: Run to verify they pass**
 
 The Task 2 implementation already covers these (refusal candidates filtered by `apply`). Run: `cargo test -p canastra-engine --test enumerate`
-Expected: 4 passed. If `refusal_spent_leaves_only_keep` fails, the engine's `apply` does not gate `RefuseDrawnCard` on `refusal_available` the way this plan assumes — read `apply.rs`'s refusal handling and reconcile with the F7 spec before changing anything.
+Expected: 4 passed. If `refusal_without_stock_leaves_only_keep` fails, check how `apply.rs` handles `RefuseDrawnCard` against an empty stock and reconcile with the F7 spec before changing anything.
 
 - [ ] **Step 4: Commit**
 
@@ -491,10 +495,12 @@ Append:
 ```rust
 #[test]
 fn lay_meld_with_a_joker_filling_the_gap() {
+    // The spare QS keeps the lay from emptying the hand: going out needs a
+    // clean canastra (§11.1), which this table does not have.
     let state = Rig::new()
         .phase(Phase::Melding)
         .opened(1)
-        .hand(1, "6H 7H JOKER")
+        .hand(1, "6H 7H JOKER QS")
         .discard("9C")
         .build();
     let melds = lay_melds(&enumerate(&state, seat(1)));
@@ -506,10 +512,11 @@ fn lay_meld_with_a_joker_filling_the_gap() {
 
 #[test]
 fn lay_meld_plain_and_wild_capped_variants() {
+    // Spare QS as above: a four-card lay must not empty the hand.
     let state = Rig::new()
         .phase(Phase::Melding)
         .opened(1)
-        .hand(1, "4H 5H 6H JOKER")
+        .hand(1, "4H 5H 6H JOKER QS")
         .discard("9C")
         .build();
     let melds = lay_melds(&enumerate(&state, seat(1)));
@@ -585,11 +592,12 @@ Append:
 #[test]
 fn ace_melds_are_sub_multisets_with_and_without_a_wild() {
     // §7.2 with duplicated aces: AH AH AD AS yields every 3- and 4-ace
-    // sub-multiset, each plain and each capped with the held Joker.
+    // sub-multiset, each plain and each capped with the held Joker. The spare
+    // QS keeps even the five-card lay from emptying the hand (§11.1).
     let state = Rig::new()
         .phase(Phase::Melding)
         .opened(1)
-        .hand(1, "AH AH AD AS JOKER")
+        .hand(1, "AH AH AD AS JOKER QS")
         .discard("9C")
         .build();
     let melds = lay_melds(&enumerate(&state, seat(1)));
@@ -933,10 +941,17 @@ import { readFileSync } from 'node:fs';
 await init({ module_or_path: new WebAssembly.Module(readFileSync('./web/src/engine/canastra_bg.wasm')) });
 const game = new Game(7n);
 console.log(JSON.stringify(game.legalActions(1)));
+game.apply(1, { type: 'Draw' });
+console.log(JSON.stringify(game.legalActions(1)));
 "
 ```
 
-Expected: at match start seat 1 faces the first-turn refusal choice, so output is exactly `[{"type":"KeepDrawnCard"},{"type":"RefuseDrawnCard"}]`.
+Expected: a fresh match starts in `AwaitingDraw` (the refusal choice only
+appears once the first card is in hand), so the first line is exactly
+`[{"type":"Draw"}]`. After the draw, seat 1 faces the §3 decision, so the
+second line contains `{"type":"KeepDrawnCard"}` and `{"type":"RefuseDrawnCard"}`
+(if the drawn card was a red 3, clarification #4 carries the privilege to the
+replacement card — the pair still appears once a non-red-3 is shown).
 
 - [ ] **Step 5: Commit**
 
