@@ -116,6 +116,20 @@ The encoder takes `PlayerView`, never `GameState`: training must see exactly
 what a deployed seat may see (`view.rs` doc-comment principle; F6 hygiene).
 `canastra-encode` internally calls `observe(state, seat)` where handed a state.
 
+**`PlayerView` extension (part of M1, first task).** Three observation
+segments — `laid_value`, `took_pile`, `refusal_available` — describe the
+current turn and live in `TurnContext`, which `PlayerView` does not expose.
+They are not derivable from the view (the table carries no per-turn
+attribution), and they are decision-critical (opening-minimum progress).
+The fix is to extend `PlayerView` with `laid_value: u32`, `took_pile: bool`,
+`refusal_available: bool`, populated from the current turn's `TurnContext`.
+This is not a leak: at a real table everyone watches the acting player lay
+melds and take the pile, so these are public facts about the current turn
+(the per-observer redaction of `pending_refusal` is unchanged). It **is** a
+wire-shape change: `tests/boundary.rs` pins and the hand-written TS types in
+`bots/src/types.ts` follow, and M1 includes updating both, plus the wasm
+boundary and any view consumers in `web/`.
+
 **Card identity indexing.** Standard cards: `suit_index * 13 + rank_index`,
 suits in the engine's `Suit` declaration order, ranks in *game* order
 `4,5,6,7,8,9,T,J,Q,K,A,2,3` (sequence-adjacent ranks are encoding-adjacent).
@@ -164,6 +178,13 @@ the documented swap is Deep Sets pooling over the same token features —
 observation-side only; with legal-list scoring there is no WHICH RUN head to
 break.
 
+**Why 33 tokens is the exact bound.** The 8 threes (4 red, 4 black) can never
+appear in a meld, leaving 100 meldable cards; every meld holds ≥3 cards, so
+the table can never exceed `floor(100/3) = 33` melds. Overflow is therefore
+unreachable in a legal game; as belt-and-braces the encoder drops tail tokens
+beyond 33 deterministically (sort order) and the fuzz test asserts it never
+happens.
+
 **Seat relativity.** All segments are encoded from the acting seat: "my",
 "right", "partner", "left" are computed from `view.seat`. The same network
 plays all four seats; partners share a genome.
@@ -190,16 +211,21 @@ Each legal action from `enumerate` becomes a 101-wide feature vector:
 
 The target block's token index uses the **same canonical token ordering** as
 the observation's table segment, so the policy can attend to "the meld this
-action touches" by index. Distinct legal actions may rarely collide to
-identical features; that is acceptable (either choice is fine) and noted, not
-papered over.
+action touches" by index. The translation is explicit: the engine's
+`AddToMeld { meld }` / `MeldTarget::Existing { meld }` address melds
+**per-partnership**, while the target block indexes the shared 33-token pool —
+`canastra-encode` maps team-local index → canonical pool index when featurizing,
+and that mapping is pinned by a test (featurize an `AddToMeld` against a rigged
+two-team table, assert the one-hot lands on the right token). Distinct legal
+actions may rarely collide to identical features; that is acceptable (either
+choice is fine) and noted, not papered over.
 
 Policy forward pass (PyTorch, mirrored exactly in TypeScript):
 
 ```
-emb    = tanh(Linear(2002→512, tanh(Linear(2002→... ))))  # trunk: 2002→512→256
-logit  = Linear(357→128, tanh) → Linear(128→1)            # per action: [emb; feats]
-scores = masked_softmax(logits, menu_mask)                # −inf on padding
+emb    = tanh(Linear(512→256)(tanh(Linear(2002→512)(obs))))   # trunk
+logit  = Linear(128→1)(tanh(Linear(357→128)([emb; feats])))   # per action
+scores = masked_softmax(logits, menu_mask)                    # −inf on padding
 ```
 
 Menus are ragged: pad each batch to the batch's maximum menu length with a
@@ -310,10 +336,12 @@ Sanity gates that must pass before M3 starts:
 - **M0 — F7 enumeration.** Per the F7 spec. Gates: `cargo test --workspace`,
   `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
   wasm build, `npm install && npm run typecheck`, harness smoke match.
-- **M1 — `canastra-encode` + bindings.** Encoder + featurizer + tests;
-  wasm `encodeState`; `training/` scaffold (maturin, pytest, ruff, mypy);
-  pool benchmark. Gates: all of M0 plus `maturin develop`, `pytest`,
-  `ruff check`, `mypy`, and the F6-redaction encoder test.
+- **M1 — `canastra-encode` + bindings.** First the `PlayerView` extension
+  (`laid_value`, `took_pile`, `refusal_available`) with its `boundary.rs` and
+  `bots/src/types.ts` sync; then encoder + featurizer + tests; wasm
+  `encodeState`; `training/` scaffold (maturin, pytest, ruff, mypy); pool
+  benchmark. Gates: all of M0 plus `maturin develop`, `pytest`, `ruff check`,
+  `mypy`, and the F6-redaction encoder test.
 - **M2 — eval harness.** Weights JSON + `JSONWeightsBot` + `eval-nn.ts` +
   Python runner. Gates: both sanity checks above.
 - **M3 — GA trainer.** `ga.py`/`train.py`, checkpointing, JSONL generation
