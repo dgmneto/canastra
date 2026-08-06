@@ -29,9 +29,9 @@
  *     free and throwing one onto a fat pile denies it to the next player.
  */
 
-import type { Action, Card, Meld, PlayerView } from "../types";
-import { cardValue } from "../types";
-import type { Bot, BotContext } from "./types";
+import type { Action, Card, Meld, PlayerView } from "./types";
+import { cardValue } from "./types";
+import type { Bot, BotContext } from "./bot";
 import { findMelds, meldCards, meldValue } from "./melds";
 
 const SEQUENCE_RANKS = "456789TJQKA";

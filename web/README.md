@@ -6,12 +6,14 @@ there is no server, no accounts, and no networking.
 
 ## Running it
 
+The JS projects are an npm workspace rooted at the repo root, so install once there:
+
 ```bash
-npm install --prefix web
+npm install
 ```
 
 ```bash
-npm run build:engine --prefix web
+npm run build:engine
 ```
 
 ```bash
@@ -40,14 +42,17 @@ anything.
 
 ## How it is put together
 
-- `src/match.ts` — the only module that touches wasm. Wraps the `Game` handle, keeps the action log,
-  and holds the turn checkpoint.
-- `src/driver.ts` — the harness that runs a bot against the engine. Not a bot.
-- `src/bots/` — the bots. See below.
-- `src/lab.ts` — headless bot-vs-bot runs, for telling whether a new bot is actually better.
-- `src/types.ts` — the engine's wire shapes, hand-written against the serde derives. The literals they
-  describe are pinned on the Rust side by `engine/crates/canastra-engine/tests/boundary.rs`; that file
-  is the authority, and if it changes these have to follow.
+The engine driver and the bots do not live here — they are workspace packages the page imports:
+
+- `../harness/` (`@canastra/harness`) — `Match` wraps the wasm `Game` handle (the only code that
+  touches wasm), `step` runs a bot against the engine, and `runMatch`/`series` are the headless
+  runs. `src/match.ts`, `src/driver.ts` and `src/lab.ts` here are thin re-exports of it.
+- `../bots/` (`@canastra/bots`) — the bots, the `BOTS` registry, and the engine wire types. See
+  below.
+- `src/loadEngine.ts` — initialises the wasm the browser way. The harness CLI initialises the same
+  wasm the Node way; each environment brings its own loader.
+- `src/types.ts` — re-exports the engine wire shapes from `@canastra/bots`, which stay pinned
+  against `engine/crates/canastra-engine/tests/boundary.rs` on the Rust side.
 - `src/ui/` — React components. They read a `PlayerView` and render it; they hold no game rules.
 
 ## Writing a bot
@@ -65,7 +70,7 @@ export const myBot: Bot = {
 };
 ```
 
-Add the file to `src/bots/`, then add it to `BOTS` in `src/bots/index.ts`. Nothing else changes — the
+Add the file to `../bots/src/`, then add it to `BOTS` in `../bots/src/index.ts`. Nothing else changes — the
 driver, the per-seat pickers and the replay log all read from that list. Each seat picks its own bot,
 so bots compete by sitting at the same table; a change takes effect on the next match, since swapping
 a policy mid-hand would make one log describe two different matches.
@@ -94,7 +99,7 @@ Three rules, and the second is the one that actually bites:
 
 `context.rng` is seeded, not `Math.random`, so a match with bots in it still replays.
 
-`src/bots/melds.ts` holds the shared meld search (which combinations are worth proposing). It is not
+`../bots/src/melds.ts` holds the shared meld search (which combinations are worth proposing). It is not
 rules — the engine remains the only judge of a legal meld — but it is the expensive part to get right,
 so bots share it.
 

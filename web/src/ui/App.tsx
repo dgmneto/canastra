@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Match, loadEngine, logToText } from "../match";
 import { label, step } from "../driver";
 import { makeRng, type Rng } from "../rng";
-import { BOTS, DEFAULT_BOT, botById } from "../bots";
+import { BOTS, DEFAULT_BOT, botById } from "@canastra/bots";
 import type { HandScore, PlayerView } from "../types";
 import { handScoreTotal } from "../types";
 import { Hand, CardChip, MeldView } from "./Cards";

@@ -7,10 +7,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Three planned components:
 
 1. **Rust engine/state machine** — implements Canastra game rules and turn logic. **Built**, in `engine/`.
-2. **Bot project** — trains/designs AI bots to play against. **Not started.** `web/src/bots/` holds
-   toy policies for watching the engine, behind a `Bot` interface with a per-seat picker so they can
-   play each other. Useful for eyeballing behaviour; it is not a training harness and does not
-   presume the shape the real project will take.
+2. **Bot project** — trains/designs AI bots to play against. **Not started** as a training
+   harness, but `bots/` (`@canastra/bots`) is now its own npm package: it holds the toy policies
+   behind a `Bot` interface with a per-seat picker so they can play each other, plus the engine
+   wire types and seeded `rng`, and it is registered in the `BOTS` registry. Useful for eyeballing
+   behaviour; it is not a training harness and does not presume the shape the real project will take.
 3. **Web app** — lets people play Canastra against each other or against a bot. **Not started.**
    `web/` currently holds a single-page *engine sandbox*: no server, no networking, all four seats
    driven by bots and every hand face up. Real multiplayer is a different program that happens to
@@ -70,22 +71,48 @@ The wasm promise is checked by building, not by assertion:
 cargo build -p canastra-wasm --target wasm32-unknown-unknown
 ```
 
+The JS projects form an npm workspace rooted at the repo root, so install once there. TypeScript for
+all three projects (bots, harness, web) is checked with one command:
+
+```bash
+npm install && npm run typecheck
+```
+
 The sandbox in `web/` runs from the repo root. `build:engine` regenerates `web/src/engine/` from the
 Rust crate and has to be re-run after any engine change, or the page keeps the stale wasm:
 
 ```bash
-npm install --prefix web && npm run build:engine --prefix web && npm run dev --prefix web
+npm run build:engine && npm run dev --prefix web
 ```
 
+The harness is an executable that runs a whole match and prints the moves and final score as JSON
+Lines on stdout:
+
 ```bash
-npx --prefix web tsc --noEmit
+npx canastra-harness --seed 7 random random-plus random random-plus
 ```
 
 ## Architecture
 
 `engine/` is a self-contained Cargo workspace. `crates/canastra-engine` is the rules core and has no
-binding dependencies; `crates/canastra-wasm` holds the JavaScript glue. The `bot/` project will be a
-sibling top-level directory — nothing but shared docs lives at the repo root.
+binding dependencies; `crates/canastra-wasm` holds the JavaScript glue.
+
+The JavaScript side is an npm workspace rooted at the repo root, with three packages:
+
+- **`bots/`** (`@canastra/bots`) — the bot policies plus the engine wire types (`PlayerView`,
+  `Action`, …), seeded `rng`, and the `BOTS` registry. It is the leaf everything else depends on:
+  it has no engine, no wasm, only opinions. Add a bot by writing `src/<name>.ts` and registering it
+  in `src/index.ts`.
+- **`harness/`** (`@canastra/harness`) — the thing that actually *plays* a game: the `Match` wasm
+  wrapper, the `step` driver, and `runMatch`/`series`. Its `canastra-harness` bin (see Commands) is
+  the executable that runs a match from a seed + bot names to JSONL. Web and the CLI share this code.
+- **`web/`** (`canastra-web`) — the Vite + React sandbox. It imports the bot registry and the harness
+  driver rather than owning copies. It also owns the generated wasm glue (`web/src/engine/`), which
+  both the browser and the Node harness load.
+
+The committed wasm lives in `web/src/engine/` (gitignored, rebuilt by `build:engine`). The harness
+CLI drives it in Node by compiling the bytes into a `WebAssembly.Module`; the browser loads it by
+`fetch`. In both cases the same `Game` class runs the real engine — no reimplementation.
 
 `web/` is a Vite + React page that loads `canastra-wasm` directly in the browser and drives all four
 seats with bots. It is a **sandbox for watching the engine**, not the multiplayer app: it holds the

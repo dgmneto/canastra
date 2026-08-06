@@ -1,0 +1,18 @@
+{
+  "name": "canastra",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "bots",
+    "harness",
+    "web"
+  ],
+  "scripts": {
+    "build:engine": "npm run build:engine --prefix web",
+    "typecheck:bots": "npm run typecheck --prefix bots",
+    "typecheck:harness": "npm run typecheck --prefix harness",
+    "typecheck:web": "npm run typecheck --prefix web",
+    "typecheck": "npm run typecheck:bots && npm run typecheck:harness && npm run typecheck:web",
+    "harness": "tsx harness/src/cli.ts"
+  }
+}

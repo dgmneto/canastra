@@ -4,11 +4,14 @@
   "type": "module",
   "scripts": {
     "build:engine": "wasm-pack build ../engine/crates/canastra-wasm --target web --out-dir ../../../web/src/engine --out-name canastra",
+    "typecheck": "tsc --noEmit",
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview"
   },
   "dependencies": {
+    "@canastra/bots": "*",
+    "@canastra/harness": "*",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
   },

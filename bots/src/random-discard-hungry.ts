@@ -21,8 +21,8 @@
  * measuring rather than assuming.
  */
 
-import type { Action, Card, PlayerView } from "../types";
-import type { Bot, BotContext } from "./types";
+import type { Action, Card, PlayerView } from "./types";
+import type { Bot, BotContext } from "./bot";
 import { randomBot } from "./random";
 
 /** §7.1: a capturing run lives in 4..A, so 2s and 3s cannot anchor one. */

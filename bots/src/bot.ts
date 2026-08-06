@@ -3,9 +3,9 @@
  *
  * A bot is a *policy* and nothing else: given a position, name the moves worth
  * trying, best first. It does not touch the engine, does not know whether a
- * move was accepted, and cannot end a turn on its own — `driver.ts` does all of
- * that, identically for every bot, so two bots are always judged on the same
- * terms.
+ * move was accepted, and cannot end a turn on its own — the harness's driver
+ * does all of that, identically for every bot, so two bots are always judged on
+ * the same terms.
  *
  * The shape is "propose a list" rather than "return the move" because the
  * engine has no `legal_actions` yet (ADVERSARIAL-REVIEW.md F7). A bot cannot
@@ -15,8 +15,8 @@
  * it is the honest shape.
  */
 
-import type { Action, PlayerView } from "../types";
-import type { Rng } from "../rng";
+import type { Action, PlayerView } from "./types";
+import type { Rng } from "./rng";
 
 export interface BotContext {
   /** Seeded, so a match with bots in it still replays. */

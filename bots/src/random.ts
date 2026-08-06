@@ -9,9 +9,9 @@
  * That is the point: it is the floor a real bot has to beat.
  */
 
-import type { Action } from "../types";
-import { cardValue } from "../types";
-import type { Bot, BotContext } from "./types";
+import type { Action } from "./types";
+import { cardValue } from "./types";
+import type { Bot, BotContext } from "./bot";
 import { findMelds, meldCards, meldValue } from "./melds";
 
 export const randomBot: Bot = {

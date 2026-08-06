@@ -1,0 +1,23 @@
+{
+  "name": "@canastra/harness",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "bin": {
+    "canastra-harness": "./bin/canastra-harness.mjs"
+  },
+  "scripts": {
+    "harness": "tsx src/cli.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@canastra/bots": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.9.0"
+  }
+}

@@ -7,8 +7,8 @@
  * asks, and it is the expensive part to get right.
  */
 
-import type { Card, Meld } from "../types";
-import { cardValue } from "../types";
+import type { Card, Meld } from "./types";
+import { cardValue } from "./types";
 
 /** §7.1: sequences run 4 up to A. 2s and 3s never sit in one as naturals. */
 const SEQUENCE_RANKS = "456789TJQKA";
