@@ -7,7 +7,6 @@ use std::collections::HashSet;
 use canastra_engine::action::MeldTarget;
 use canastra_engine::state::Phase;
 use canastra_engine::testkit::Rig;
-#[allow(unused_imports)]
 use canastra_engine::{Action, GameState, Seat, apply, enumerate, new_game, settle_hand};
 
 fn seat(index: u8) -> Seat {
@@ -150,7 +149,11 @@ fn lay_meld_with_a_joker_filling_the_gap() {
     let melds = lay_melds(&enumerate(&state, seat(1)));
     assert_eq!(
         melds,
-        HashSet::from([vec!["6H".to_string(), "7H".to_string(), "JOKER".to_string()]])
+        HashSet::from([vec![
+            "6H".to_string(),
+            "7H".to_string(),
+            "JOKER".to_string()
+        ]])
     );
 }
 
@@ -266,8 +269,12 @@ fn discards_dedup_identical_cards() {
     assert_same_actions(
         &discards,
         &[
-            Action::Discard { card: "6D".parse().unwrap() },
-            Action::Discard { card: "KH".parse().unwrap() },
+            Action::Discard {
+                card: "6D".parse().unwrap(),
+            },
+            Action::Discard {
+                card: "KH".parse().unwrap(),
+            },
         ],
     );
     // A legal discard exists, so the no-discard escape hatch stays shut.
@@ -289,20 +296,34 @@ fn frozen_cards_can_be_discarded_but_not_melded() {
 
     let frozen = ["7D", "8D", "9D"];
     let melding_with_frozen = actions.iter().any(|action| match action {
-        Action::LayMeld { cards } => cards.iter().any(|c| frozen.contains(&c.to_string().as_str())),
-        Action::AddToMeld { cards, .. } => {
-            cards.iter().any(|c| frozen.contains(&c.to_string().as_str()))
-        }
+        Action::LayMeld { cards } => cards
+            .iter()
+            .any(|c| frozen.contains(&c.to_string().as_str())),
+        Action::AddToMeld { cards, .. } => cards
+            .iter()
+            .any(|c| frozen.contains(&c.to_string().as_str())),
         _ => false,
     });
-    assert!(!melding_with_frozen, "frozen cards must not be melded: {actions:?}");
+    assert!(
+        !melding_with_frozen,
+        "frozen cards must not be melded: {actions:?}"
+    );
 
     // The natural extension that would be legal without the freeze.
-    assert!(!actions.contains(&Action::AddToMeld { meld: 0, cards: vec!["7D".parse().unwrap()] }));
+    assert!(!actions.contains(&Action::AddToMeld {
+        meld: 0,
+        cards: vec!["7D".parse().unwrap()]
+    }));
     // …while discarding a frozen card stays legal (clarification #5).
-    assert!(actions.contains(&Action::Discard { card: "7D".parse().unwrap() }));
+    assert!(actions.contains(&Action::Discard {
+        card: "7D".parse().unwrap()
+    }));
     // And the unfrozen run is still offered.
-    assert!(lay_melds(&actions).contains(&vec!["4H".to_string(), "5H".to_string(), "6H".to_string()]));
+    assert!(lay_melds(&actions).contains(&vec![
+        "4H".to_string(),
+        "5H".to_string(),
+        "6H".to_string()
+    ]));
 }
 
 #[test]
@@ -315,7 +336,10 @@ fn cornered_player_may_only_end_without_discarding() {
         .meld(1, "4H 5H 6H")
         .discard("9C")
         .build();
-    assert_eq!(enumerate(&state, seat(1)), vec![Action::EndTurnWithoutDiscard]);
+    assert_eq!(
+        enumerate(&state, seat(1)),
+        vec![Action::EndTurnWithoutDiscard]
+    );
 }
 
 #[test]
@@ -363,7 +387,11 @@ fn taking_the_pile_with_a_same_value_core() {
         core: ["AH".parse().unwrap(), "AH".parse().unwrap()],
         target: MeldTarget::NewMeld,
     }));
-    assert_eq!(actions.len(), 2, "just Draw and the one capture: {actions:?}");
+    assert_eq!(
+        actions.len(),
+        2,
+        "just Draw and the one capture: {actions:?}"
+    );
 }
 
 #[test]
@@ -375,4 +403,74 @@ fn a_blocked_pile_offers_no_takes() {
         .hand(1, "4S 5S KD QC")
         .build();
     assert_eq!(enumerate(&state, seat(1)), vec![Action::Draw]);
+}
+
+#[test]
+fn enumeration_is_deterministic() {
+    let state = Rig::new()
+        .stock("8C 9D")
+        .discard("9C 6D")
+        .hand(1, "4D 5D 7D 8D KH")
+        .meld(1, "7D 8D 9D")
+        .build();
+    assert_eq!(enumerate(&state, seat(1)), enumerate(&state, seat(1)));
+}
+
+/// SplitMix64 finalizer — a deterministic pseudo-random pick without pulling
+/// an rng dependency into the test suite.
+fn mix(seed: u64, ply: u64) -> usize {
+    let mut x = seed ^ ply.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    (x ^ (x >> 31)) as usize
+}
+
+#[test]
+fn everything_enumerated_is_legal_across_whole_matches() {
+    for seed in 0..20u64 {
+        let mut state: GameState = new_game(seed);
+        let mut turn_start = state.clone();
+        let mut safe = false;
+        for ply in 0..200_000u64 {
+            match state.phase {
+                Phase::HandOver => {
+                    state = settle_hand(&state).expect("settle");
+                    continue;
+                }
+                Phase::MatchOver => break,
+                _ => {}
+            }
+            // A turn can dead-end (§6's eager check is optimistic), so keep
+            // the position it began from — the harness driver does the same.
+            if matches!(
+                state.phase,
+                Phase::AwaitingDraw | Phase::AwaitingRefusalChoice
+            ) {
+                turn_start = state.clone();
+                safe = false;
+            }
+            let turn = state.turn;
+            let actions = enumerate(&state, turn);
+            for action in &actions {
+                assert!(
+                    apply(&state, turn, action).is_ok(),
+                    "offered an illegal {action:?}"
+                );
+            }
+            if actions.is_empty() {
+                // The residual self-strand: back out and finish the turn
+                // plainly, which is exactly the driver's safeMode path.
+                assert!(!safe, "even the plain retry dead-ended (seed {seed})");
+                state = turn_start.clone();
+                safe = true;
+                continue;
+            }
+            let pick = if safe {
+                0
+            } else {
+                mix(seed, ply) % actions.len()
+            };
+            state = apply(&state, turn, &actions[pick]).expect("enumerated action applies");
+        }
+    }
 }
