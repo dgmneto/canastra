@@ -59,9 +59,9 @@ The npm workspace grows from three packages to five:
 2. `Match.restore(snapshot, meta)` static. Today `Match` only constructs from a
    seed, which always deals a fresh game. Persistence and reclaim need to wrap a
    `Game.restore`ed handle in a `Match` (log + checkpoint). `meta` carries at
-   least the seed and the bot lineup, so the restored `Match`'s log header stays
-   a truthful record of the match across a server restart. ~10 lines; the CLI
-   benefits too (resume a replay).
+   least the seed, `startedAt`, and the bot lineup, so the restored `Match`'s
+   log header stays a truthful record of the match across a server restart.
+   ~10 lines; the CLI benefits too (resume a replay).
 
 ### Server modules
 
@@ -95,8 +95,8 @@ engine's `Action` tagging style. Types live in `@canastra/protocol`.
 | message | payload | meaning |
 |---|---|---|
 | `hello` | `{name: string, token?: string}` | identify; `token` from `localStorage` reclaims a seat |
-| `sit` | `{seat: Seat}` | claim an empty/bot seat; mid-match, takes over the bot's hand |
-| `stand` | `{}` | leave the seat; a bot takes over |
+| `sit` | `{seat: Seat}` | claim an empty/bot seat; mid-match, takes over the bot's hand. The server answers with a fresh `welcome` (the token is now bound to the seat) plus a `view` |
+| `stand` | `{}` | leave the seat; a bot takes over. Clears the token→seat binding — a later `hello` with the old token arrives as a new player |
 | `start` | `{}` | begin the match (any seated human); empty seats become bots |
 | `action` | `{action: Action}` | an engine `Action`. **No seat field** — the server passes the connection's bound seat to `Match.apply` (F6 discharged by construction) |
 | `restartTurn` | `{}` | escape hatch for a dead-ended turn; `Match.restartTurn` semantics |
@@ -166,9 +166,12 @@ interface TableState {
   has already taken the seat (via `sit`) before the original returns, the stale
   token no longer maps to anything — that `hello` is treated as a new arrival
   with no seat. First come, first served; acceptable among friends.
-- **Persistence:** after every accepted action, write the snapshot + seats +
-  seed + log to `server/data/game.json`. On boot, if the file exists and passes
-  `Game.restore`'s invariant check, resume; otherwise start in lobby.
+- **Persistence:** after every accepted action, write the snapshot + seats
+  (including each human seat's token) + seed + log to `server/data/game.json`.
+  On boot, if the file exists and passes `Game.restore`'s invariant check,
+  resume; otherwise start in lobby. A restored human seat has no live
+  connection, so it boots bot-driven until a `hello` arrives with the matching
+  token — the same reclaim path as a disconnect.
 
 ## Web client
 
