@@ -299,3 +299,10 @@ h2 {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   padding-left: 0.5rem;
 }
+
+/* --- multiplayer game client --- */
+.lobby { padding: 1rem; display: grid; gap: 1rem; justify-items: start; }
+.lobby-seats { display: flex; gap: 1rem; }
+.lobby-seat { border: 1px solid #444; border-radius: 8px; padding: 0.75rem 1rem; display: grid; gap: 0.35rem; min-width: 10rem; }
+.lobby-seat.mine { border-color: #7c7; }
+.dim { opacity: 0.55; }
