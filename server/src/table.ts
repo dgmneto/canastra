@@ -63,6 +63,8 @@ export class Table {
   private safeMode = false;
   private botTimer: ReturnType<typeof setTimeout> | null = null;
   private settleTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Guards `endMatch` from re-broadcasting once the match is over. */
+  private matchEnded = false;
 
   constructor(private options: TableOptions = {}) {}
 
@@ -249,6 +251,11 @@ export class Table {
       clearTimeout(this.settleTimer);
       this.settleTimer = null;
     }
+    if (this.botTimer) {
+      clearTimeout(this.botTimer);
+      this.botTimer = null;
+    }
+    this.matchEnded = false;
     // Empty seats become bots; human and covered seats stay as they are.
     this.seats = this.seats.map((seat) =>
       seat.kind === "empty" ? { kind: "bot", botId: COVER_BOT } : seat,
@@ -282,6 +289,10 @@ export class Table {
   private restart(client: Client): void {
     if (client.seat === null || !this.match) {
       return this.refuse(client, "NotSeated", "you are not at the table");
+    }
+    const view = this.match.views()[0];
+    if (view.turn !== client.seat) {
+      return this.refuse(client, "NotYourTurn", "only the seat playing can restart its turn");
     }
     this.match.restartTurn(client.seat);
     this.broadcast({
@@ -364,6 +375,8 @@ export class Table {
   }
 
   private endMatch(): void {
+    if (this.matchEnded) return;
+    this.matchEnded = true;
     const scores = this.match!.views()[0].scores;
     this.broadcast({ type: "event", text: `match over — ${scores[0]} vs ${scores[1]}` });
     // The finished match stays on the table until someone presses start again.
