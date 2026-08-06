@@ -65,7 +65,13 @@ export class GameClient {
       this.retryMs = 1_000;
       this.send({ type: "hello", name: this.name || "Jogador", token: this.token });
     };
-    ws.onmessage = (event) => this.receive(JSON.parse(String(event.data)) as ServerMessage);
+    ws.onmessage = (event) => {
+      try {
+        this.receive(JSON.parse(String(event.data)) as ServerMessage);
+      } catch {
+        // Drop a malformed frame silently; only the well-formed server sends here.
+      }
+    };
     ws.onclose = () => {
       this.emit({ connected: false });
       setTimeout(() => this.connect(), this.retryMs);
@@ -88,7 +94,13 @@ export class GameClient {
       case "welcome":
         this.token = message.token;
         localStorage.setItem(TOKEN_KEY, message.token);
-        this.emit({ connected: true, seat: message.seat, table: message.table });
+        // seat-null means reclaim failed: this is a fresh session, so the dead
+        // session's private state must not linger.
+        this.emit(
+          message.seat === null
+            ? { connected: true, seat: null, table: message.table, view: null, handOver: null, refusal: null }
+            : { connected: true, seat: message.seat, table: message.table }
+        );
         break;
       case "table":
         // A settle (or a new match) closes the settlement panel.
