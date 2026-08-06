@@ -104,3 +104,25 @@ fn two_aces_and_a_wild_make_an_aces_meld() {
         ]])
     );
 }
+
+#[test]
+fn lay_meld_windows_from_a_four_card_run() {
+    // §6 note: the partnership is marked open so the eager opening-minimum
+    // check does not filter the small melds this test is about.
+    let state = Rig::new()
+        .phase(Phase::Melding)
+        .opened(1)
+        .hand(1, "4H 5H 6H 7H QS")
+        .discard("9C")
+        .build();
+    let melds = lay_melds(&enumerate(&state, seat(1)));
+    let expected: HashSet<Vec<String>> = [
+        vec!["4H", "5H", "6H"],
+        vec!["5H", "6H", "7H"],
+        vec!["4H", "5H", "6H", "7H"],
+    ]
+    .into_iter()
+    .map(|meld| meld.into_iter().map(String::from).collect())
+    .collect();
+    assert_eq!(melds, expected);
+}
