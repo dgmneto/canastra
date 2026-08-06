@@ -6,3 +6,6 @@ dist/
 
 # wasm-pack output — rebuilt from engine/ by `npm run build:engine`.
 web/src/engine/
+
+# server run-state — the table snapshot, safe to lose.
+server/data/

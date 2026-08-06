@@ -6,6 +6,7 @@
     "bots",
     "protocol",
     "harness",
+    "server",
     "web"
   ],
   "scripts": {
@@ -13,8 +14,9 @@
     "typecheck:bots": "npm run typecheck --prefix bots",
     "typecheck:protocol": "npm run typecheck --prefix protocol",
     "typecheck:harness": "npm run typecheck --prefix harness",
+    "typecheck:server": "npm run typecheck --prefix server",
     "typecheck:web": "npm run typecheck --prefix web",
-    "typecheck": "npm run typecheck:bots && npm run typecheck:protocol && npm run typecheck:harness && npm run typecheck:web",
+    "typecheck": "npm run typecheck:bots && npm run typecheck:protocol && npm run typecheck:harness && npm run typecheck:server && npm run typecheck:web",
     "harness": "tsx harness/src/cli.ts"
   }
 }
