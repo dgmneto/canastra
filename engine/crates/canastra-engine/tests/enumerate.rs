@@ -214,3 +214,38 @@ fn each_usable_wild_yields_its_own_meld() {
         HashSet::from([vec!["4H".to_string(), "5H".to_string(), "6H".to_string()]])
     );
 }
+
+#[test]
+fn ace_melds_are_sub_multisets_with_and_without_a_wild() {
+    // §7.2 with duplicated aces: AH AH AD AS yields every sub-multiset of 3+
+    // aces plain, and every sub-multiset of 2+ aces capped with the held
+    // Joker (the wild counts toward the three-card minimum). The QS also runs
+    // with AS and the Joker into a spade sequence, and keeps even the five-card
+    // lay from emptying the hand (§11.1).
+    let state = Rig::new()
+        .phase(Phase::Melding)
+        .opened(1)
+        .hand(1, "AH AH AD AS JOKER QS")
+        .discard("9C")
+        .build();
+    let melds = lay_melds(&enumerate(&state, seat(1)));
+    let expected: HashSet<Vec<String>> = [
+        vec!["AD", "AH", "AH"],
+        vec!["AH", "AH", "AS"],
+        vec!["AD", "AH", "AS"],
+        vec!["AD", "AH", "AH", "AS"],
+        vec!["AD", "AH", "JOKER"],
+        vec!["AD", "AS", "JOKER"],
+        vec!["AH", "AH", "JOKER"],
+        vec!["AH", "AS", "JOKER"],
+        vec!["AD", "AH", "AH", "JOKER"],
+        vec!["AH", "AH", "AS", "JOKER"],
+        vec!["AD", "AH", "AS", "JOKER"],
+        vec!["AD", "AH", "AH", "AS", "JOKER"],
+        vec!["AS", "JOKER", "QS"],
+    ]
+    .into_iter()
+    .map(|meld| meld.into_iter().map(String::from).collect())
+    .collect();
+    assert_eq!(melds, expected);
+}
