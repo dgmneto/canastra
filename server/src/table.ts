@@ -165,10 +165,20 @@ export class Table {
       : -1;
     if (at >= 0) {
       const seat = this.seats[at] as { name: string; token: string };
-      // Two live tabs with the same token: the newest connection wins the seat.
+      // Replacing one live tab with another: the displaced tab loses the seat,
+      // and the reclaiming client vacates any seat it already held.
       for (const other of this.clients.values()) {
-        if (other !== client && other.seat === at) other.seat = null;
+        if (other !== client && other.seat === at) {
+          other.seat = null;
+          this.send(other.ws, {
+            type: "welcome",
+            token: other.token,
+            seat: null,
+            table: this.tableState(),
+          });
+        }
       }
+      if (client.seat !== null && client.seat !== at) this.vacate(client);
       this.seats[at] = { kind: "human", name: seat.name, token: seat.token, ws: client.ws };
       client.name = seat.name;
       client.token = seat.token;
@@ -189,6 +199,10 @@ export class Table {
 
   private sit(client: Client, seat: Seat): void {
     if (seat < 0 || seat > 3) return;
+    // A client that sits without greeting would otherwise persist an empty
+    // token and an anonymous name — assign both on the spot.
+    if (!client.token) client.token = randomUUID();
+    if (!client.name) client.name = "Jogador";
     const target = this.seats[seat];
     if (target.kind === "human") {
       return this.refuse(client, "SeatTaken", `seat ${seat} is taken`);

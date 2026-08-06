@@ -49,8 +49,14 @@ export async function startServer(options: ServerOptions): Promise<RunningServer
 
   const persist = (save: import("./persistence.js").SaveGame | null): void => {
     if (!options.saveFile) return;
-    if (save) saveGame(options.saveFile, save);
-    else clearGame(options.saveFile);
+    try {
+      if (save) saveGame(options.saveFile, save);
+      else clearGame(options.saveFile);
+    } catch (error) {
+      // The save is explicitly safe to lose — a disk failure must never take
+      // the single server process down with it.
+      console.error("save failed; continuing without it", error);
+    }
   };
 
   // A save that no longer parses or fails the engine's invariant check costs
