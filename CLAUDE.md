@@ -31,6 +31,7 @@ Update this file's "Commands" and "Architecture" sections as each component is s
 - Opening minimum (75 or 120 pts depending on partnership score ≥2500) must be met in a single turn.
 - Canastra (7+ card meld) bonus tiers: dirty (contains a 2) 200, clean (no 2, joker OK) 500, clean Aces (7-8 natural aces) 1000.
 - Going out ("bater") requires at least one clean canastra on the table.
+- A partnership that never opened by hand end scores a flat −300: no hand negatives, no red-3 points (§13.3).
 - Game ends when a partnership reaches 5000 points at the end of a hand.
 
 ## Rules clarifications (resolved ambiguities)
@@ -43,6 +44,7 @@ Update this file's "Commands" and "Architecture" sections as each component is s
 4. **First-turn refusal when the first card drawn is a red 3:** the red 3 goes to the table + replacement draw as usual, but the refusal privilege is *not* burned — it carries over and applies to the replacement card.
 5. **Cards frozen by taking the discard pile:** §5 says they "não pode ser usada neste turno" without saying whether discarding counts as using. Read "usada" as *melded* — a frozen card may be discarded but not melded. This case is reachable: a player who takes the pile holding only the two core cards melds both and is left holding nothing but frozen cards, yet still owes a discard.
 6. **A player who cannot legally discard keeps the card and the hand ends.** Without a clean canastra a partnership must always keep at least one card in hand, so a player holding exactly one card has no legal discard at all. This is reachable: §12's replacement draw returns nothing when the stock has just run out, leaving a one-card hand intact. The player keeps the card, the hand ends under §11.2, nobody takes the going-out bonus, and the retained card scores against them. Modelled as `Action::EndTurnWithoutDiscard`, legal only in exactly that position.
+7. **A partnership that never opened at all scores a flat −300 at hand end (§13.3).** "Never opened" is exactly `TeamTable.opened == false`, which is the same as "put down no cards" — the engine already forbids ending a turn having laid cards without meeting §6's minimum. The flat −300 replaces the whole itemized score: hand negatives are not counted, red 3s contribute nothing (not even the usual −100 for lacking a clean canastra), and there is nothing on the table to score. Mid-hand this reads as a running penalty in `score_hand`, but `settle_hand` banks it only when the hand is actually over.
 
 ## Commands
 

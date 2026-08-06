@@ -104,6 +104,11 @@ export interface HandScore {
   red_three_bonus: number;
   table_cards: number;
   hand_cards: number;
+  /**
+   * §13.3: a partnership that never opened takes a flat −300 and nothing else
+   * counts — no hand negatives, no red 3s. Zero for a team that opened.
+   */
+  unopened_penalty: number;
 }
 
 export function handScoreTotal(score: HandScore): number {
@@ -112,7 +117,8 @@ export function handScoreTotal(score: HandScore): number {
     score.going_out_bonus +
     score.red_three_bonus +
     score.table_cards -
-    score.hand_cards
+    score.hand_cards +
+    score.unopened_penalty
   );
 }
 

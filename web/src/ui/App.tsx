@@ -302,13 +302,15 @@ export function App() {
  */
 function HandTotal({ score }: { score: HandScore }) {
   const total = handScoreTotal(score);
-  const parts = [
-    `${score.table_cards} on the table`,
-    `${signed(-score.hand_cards)} in hand`,
-    score.canastra_bonus ? `${score.canastra_bonus} canastras` : null,
-    score.red_three_bonus ? `${signed(score.red_three_bonus)} red 3s` : null,
-    score.going_out_bonus ? `${score.going_out_bonus} for going out` : null,
-  ].filter(Boolean);
+  const parts = score.unopened_penalty
+    ? [`${signed(score.unopened_penalty)} never opened — nothing else counts`]
+    : [
+        `${score.table_cards} on the table`,
+        `${signed(-score.hand_cards)} in hand`,
+        score.canastra_bonus ? `${score.canastra_bonus} canastras` : null,
+        score.red_three_bonus ? `${signed(score.red_three_bonus)} red 3s` : null,
+        score.going_out_bonus ? `${score.going_out_bonus} for going out` : null,
+      ].filter(Boolean);
 
   return (
     <span className={`hand-total${total < 0 ? " negative" : ""}`} title={parts.join(" · ")}>

@@ -137,7 +137,7 @@ bonus and its red 3s turn negative.
    instead of 500. Worse, §12 pays red 3s ±100 each on whether a *clean* canastra exists, so one
    careless 2 can cost 300 in bonus and swing up to 800 more in red 3s. A Joker does none of this, so
    Jokers are spent freely and 2s are held. The exception is §6: opening beats purity, because a
-   partnership that never opens scores nothing at all.
+   partnership that never opens takes a flat −300 (§13.3).
 2. **Deepen before widening.** A seventh card on a six-card meld is worth 500; a fresh three-card meld
    is worth about 15. Lay-offs are proposed before new melds, longest meld first.
 3. **Discard what has no future.** Random throws its cheapest card — which is exactly the 4–7 that

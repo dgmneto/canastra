@@ -2,7 +2,9 @@
 
 use crate::action::RuleViolation;
 use crate::deal::deal_hand;
-use crate::state::{GOING_OUT_BONUS, GameState, Phase, RED_THREE_VALUE, Seat, TARGET_SCORE, Team};
+use crate::state::{
+    GOING_OUT_BONUS, GameState, Phase, RED_THREE_VALUE, Seat, TARGET_SCORE, Team, UNOPENED_PENALTY,
+};
 use serde::{Deserialize, Serialize};
 
 /// §13: one partnership's score for one hand, itemised.
@@ -21,18 +23,36 @@ pub struct HandScore {
     pub table_cards: i32,
     /// §13.2: every card still held counts against the partnership.
     pub hand_cards: i32,
+    /// §13.3: a partnership that never opened takes a flat −300 and nothing
+    /// else counts — no hand negatives, no red 3s. Zero for a team that opened.
+    pub unopened_penalty: i32,
 }
 
 impl HandScore {
     pub fn total(self) -> i32 {
         self.canastra_bonus + self.going_out_bonus + self.red_three_bonus + self.table_cards
             - self.hand_cards
+            + self.unopened_penalty
     }
 }
 
 /// §13: score one hand for one partnership.
 pub fn score_hand(state: &GameState, team: Team) -> HandScore {
     let table = state.table(team);
+
+    // §13.3: a partnership that never opened at all scores a flat −300. The
+    // hand negatives and the red 3s (whose ±100 already assumed a clean
+    // canastra) are deliberately ignored, and there is nothing on the table.
+    if !table.opened {
+        return HandScore {
+            canastra_bonus: 0,
+            going_out_bonus: 0,
+            red_three_bonus: 0,
+            table_cards: 0,
+            hand_cards: 0,
+            unopened_penalty: -UNOPENED_PENALTY,
+        };
+    }
 
     let canastra_bonus = table
         .melds
@@ -77,6 +97,7 @@ pub fn score_hand(state: &GameState, team: Team) -> HandScore {
         red_three_bonus,
         table_cards,
         hand_cards,
+        unopened_penalty: 0,
     }
 }
 
@@ -159,7 +180,11 @@ mod tests {
     /// §13.2: "Cartas na mão: subtraem", counted across both partners.
     #[test]
     fn cards_left_in_hand_are_subtracted_from_both_partners() {
-        let state = Rig::new().hand(1, "AS JOKER").hand(3, "KS").build();
+        let state = Rig::new()
+            .hand(1, "AS JOKER")
+            .hand(3, "KS")
+            .opened(1)
+            .build();
         let score = score_hand(&state, team(1));
         assert_eq!(score.hand_cards, 15 + 50 + 10);
         assert_eq!(score.total(), -75);
@@ -168,7 +193,7 @@ mod tests {
     /// §12: black 3s are free to hold — zero points wherever they sit.
     #[test]
     fn black_threes_in_hand_cost_nothing() {
-        let state = Rig::new().hand(1, "3S 3C").build();
+        let state = Rig::new().hand(1, "3S 3C").opened(1).build();
         assert_eq!(score_hand(&state, team(1)).total(), 0);
     }
 
@@ -205,6 +230,32 @@ mod tests {
         assert_eq!(score_hand(&state, team(1)).table_cards, 55);
     }
 
+    /// §13.3: a partnership that never opened scores a flat −300. The hand
+    /// negatives are ignored and the red 3s count for nothing — not even the
+    /// −100 each that §12 would otherwise exact.
+    #[test]
+    fn an_unopened_partnership_scores_a_flat_minus_three_hundred() {
+        let state = Rig::new()
+            .hand(1, "AS JOKER KS")
+            .hand(3, "8D")
+            .red_threes(1, "3H 3D")
+            .build();
+        let score = score_hand(&state, team(1));
+        assert_eq!(score.total(), -300);
+        assert_eq!(score.hand_cards, 0, "hand negatives are not counted");
+        assert_eq!(score.red_three_bonus, 0, "red 3s count for nothing");
+        assert_eq!(score.unopened_penalty, -300);
+    }
+
+    /// §13.3: an unopened partnership with nothing on the table and nothing in
+    /// hand still takes the flat −300.
+    #[test]
+    fn an_unopened_partnership_with_nothing_still_scores_minus_three_hundred() {
+        let state = Rig::new().build();
+        assert_eq!(score_hand(&state, team(0)).total(), -300);
+        assert_eq!(score_hand(&state, team(1)).total(), -300);
+    }
+
     /// §10: a clean canastra of aces is worth 1000.
     #[test]
     fn a_clean_ace_canastra_is_worth_a_thousand() {
@@ -220,7 +271,7 @@ mod tests {
     fn settling_banks_the_score_and_deals_the_next_hand() {
         let state = Rig::new().meld(1, CLEAN).phase(Phase::HandOver).build();
         let next = settle_hand(&state).unwrap();
-        assert_eq!(next.scores, [0, 555]);
+        assert_eq!(next.scores, [-300, 555]);
         assert_eq!(next.hand_number, 2);
         assert_eq!(next.phase, Phase::AwaitingDraw);
         for hand in &next.hands {
@@ -253,7 +304,7 @@ mod tests {
             .phase(Phase::HandOver)
             .build();
         let next = settle_hand(&state).unwrap();
-        assert_eq!(next.scores, [0, 5055]);
+        assert_eq!(next.scores, [-300, 5055]);
         assert_eq!(next.phase, Phase::MatchOver);
         assert_eq!(next.winner(), Some(team(1)));
     }
@@ -264,6 +315,7 @@ mod tests {
     fn when_both_pass_five_thousand_the_higher_score_wins() {
         let state = Rig::new()
             .scores(5200, 4500)
+            .opened(0)
             .meld(1, CLEAN)
             .phase(Phase::HandOver)
             .build();
@@ -275,7 +327,12 @@ mod tests {
     /// CLAUDE.md clarification #2: a dead-even finish plays on.
     #[test]
     fn an_exact_tie_above_five_thousand_plays_another_hand() {
-        let state = Rig::new().scores(5000, 5000).phase(Phase::HandOver).build();
+        let state = Rig::new()
+            .scores(5000, 5000)
+            .opened(0)
+            .opened(1)
+            .phase(Phase::HandOver)
+            .build();
         let next = settle_hand(&state).unwrap();
         assert_eq!(next.scores, [5000, 5000]);
         assert_eq!(next.phase, Phase::AwaitingDraw);
@@ -287,6 +344,7 @@ mod tests {
     fn a_match_below_the_target_simply_continues() {
         let state = Rig::new().scores(100, 200).phase(Phase::HandOver).build();
         let next = settle_hand(&state).unwrap();
+        assert_eq!(next.scores, [-200, -100]);
         assert_eq!(next.phase, Phase::AwaitingDraw);
         assert_eq!(next.winner(), None);
     }

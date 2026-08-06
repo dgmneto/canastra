@@ -239,6 +239,8 @@ Quando a última carta do monte é comprada, o jogador que a comprou **completa 
 | Tem pelo menos **uma canastra limpa** (500 ou 1.000) | **+100** |
 | Não tem canastra limpa | **−100** |
 
+> **Exceção:** uma dupla que **não abriu nada** na mão (§13.3) não conta 3 vermelho nenhum — leva apenas o −300 fixo.
+
 Canastra limpa de Ases e canastra limpa contendo Coringa **habilitam** o bônus.
 
 **3 vermelho nas 15 cartas iniciais:** vai à mesa igualmente, com direito à carta de reposição.
@@ -281,6 +283,16 @@ A pontuação da dupla em cada mão é a soma de:
 
 **Exemplo:** canastra limpa `5♥ 6♥ 7♥ 8♥ 9♥ 10♥ J♥` = 500 (bônus) + 55 (cartas) = **555 pontos**.
 
+### 13.3 Dupla que não abriu
+
+Uma dupla que termina a mão **sem ter aberto** — ou seja, sem ter baixado carta nenhuma na mesa — não soma nada do 13.1 nem do 13.2:
+
+- **Não contam** as cartas negativas que sobrarem na mão.
+- **Não contam** os 3 vermelhos (nem o −100 de quem não tem canastra limpa).
+- Não há canastra, bônus de batida nem cartas na mesa para somar.
+
+Essa dupla leva apenas **−300 pontos, fixos**, seja qual for o conteúdo da mão.
+
 ---
 
 ## 14. Fim da partida
@@ -304,7 +316,7 @@ A pontuação da dupla em cada mão é a soma de:
 
 **Curinga:** máx. 1 por jogo. Coringa não suja. 2 suja e só entra no próprio naipe (ou em Ases).
 
-**Bônus:** suja 200 · limpa 500 · Ases limpa 1.000 (7 Ases naturais) · batida 100 · 3 vermelho ±100
+**Bônus:** suja 200 · limpa 500 · Ases limpa 1.000 (7 Ases naturais) · batida 100 · 3 vermelho ±100 · dupla que não abre **−300 fixo**
 
 **Cartas:** 3♠♣ = 0 · 4-7 = 5 · 8-K = 10 · A = 15 · 2 = 20 · Coringa = 50
 

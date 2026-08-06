@@ -26,6 +26,9 @@ pub const GOING_OUT_BONUS: i32 = 100;
 /// §12: what each red 3 is worth, positive or negative.
 pub const RED_THREE_VALUE: i32 = 100;
 
+/// §13.3: a flat penalty for a partnership that never opened in a hand.
+pub const UNOPENED_PENALTY: i32 = 300;
+
 /// §6: what a partnership on `score` must lay to open.
 ///
 /// The rising bar is a catch-up mechanic — the trailing partnership opens on 75
