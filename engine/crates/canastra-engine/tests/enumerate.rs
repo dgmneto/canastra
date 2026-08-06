@@ -249,3 +249,72 @@ fn ace_melds_are_sub_multisets_with_and_without_a_wild() {
     .collect();
     assert_eq!(melds, expected);
 }
+
+#[test]
+fn discards_dedup_identical_cards() {
+    let state = Rig::new()
+        .phase(Phase::Melding)
+        .hand(1, "6D 6D KH")
+        .meld(1, "4H 5H 6H")
+        .discard("9C")
+        .build();
+    let actions = enumerate(&state, seat(1));
+    let discards: Vec<Action> = actions
+        .iter()
+        .filter(|a| matches!(a, Action::Discard { .. }))
+        .cloned()
+        .collect();
+    assert_same_actions(
+        &discards,
+        &[
+            Action::Discard { card: "6D".parse().unwrap() },
+            Action::Discard { card: "KH".parse().unwrap() },
+        ],
+    );
+    // A legal discard exists, so the no-discard escape hatch stays shut.
+    assert!(!actions.contains(&Action::EndTurnWithoutDiscard));
+}
+
+#[test]
+fn frozen_cards_can_be_discarded_but_not_melded() {
+    // §5 + clarification #5: cards swept from the pile are frozen this turn —
+    // unmeldable, still discardable.
+    let state = Rig::new()
+        .phase(Phase::Melding)
+        .hand(1, "7D 8D 9D 4H 5H 6H")
+        .frozen("7D 8D 9D")
+        .meld(1, "4D 5D 6D")
+        .discard("9C")
+        .build();
+    let actions = enumerate(&state, seat(1));
+
+    let frozen = ["7D", "8D", "9D"];
+    let melding_with_frozen = actions.iter().any(|action| match action {
+        Action::LayMeld { cards } => cards.iter().any(|c| frozen.contains(&c.to_string().as_str())),
+        Action::AddToMeld { cards, .. } => {
+            cards.iter().any(|c| frozen.contains(&c.to_string().as_str()))
+        }
+        _ => false,
+    });
+    assert!(!melding_with_frozen, "frozen cards must not be melded: {actions:?}");
+
+    // The natural extension that would be legal without the freeze.
+    assert!(!actions.contains(&Action::AddToMeld { meld: 0, cards: vec!["7D".parse().unwrap()] }));
+    // …while discarding a frozen card stays legal (clarification #5).
+    assert!(actions.contains(&Action::Discard { card: "7D".parse().unwrap() }));
+    // And the unfrozen run is still offered.
+    assert!(lay_melds(&actions).contains(&vec!["4H".to_string(), "5H".to_string(), "6H".to_string()]));
+}
+
+#[test]
+fn cornered_player_may_only_end_without_discarding() {
+    // CLAUDE.md clarification #6: one card in hand, no clean canastra — no
+    // legal discard exists, so EndTurnWithoutDiscard is the only way out.
+    let state = Rig::new()
+        .phase(Phase::Melding)
+        .hand(1, "KH")
+        .meld(1, "4H 5H 6H")
+        .discard("9C")
+        .build();
+    assert_eq!(enumerate(&state, seat(1)), vec![Action::EndTurnWithoutDiscard]);
+}
