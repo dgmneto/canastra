@@ -99,6 +99,8 @@ fn melding_candidates(state: &GameState, seat: Seat) -> Vec<Action> {
     distinct.dedup();
 
     for meld in 0..state.table(seat.team()).melds.len() {
+        // Laying off several cards at once is recovered as successive
+        // single-card adds, so single-card candidates are complete.
         for &card in &distinct {
             candidates.push(Action::AddToMeld {
                 meld,
@@ -152,7 +154,7 @@ fn lay_meld_candidates(hand: &[Card]) -> Vec<Action> {
                             .copied()
                     })
                     .collect();
-                match (start + len - start) as usize - present.len() {
+                match len as usize - present.len() {
                     0 => candidates.push(lay(present)),
                     1 => {
                         for &wild in &wilds {
@@ -167,10 +169,12 @@ fn lay_meld_candidates(hand: &[Card]) -> Vec<Action> {
         }
     }
 
-    // §7.2: every sub-multiset of 3+ natural aces held, each with and without
-    // one held wild (an ace meld takes a Joker or any 2). Sub-multiset, not
-    // subset: the deck holds two copies of each ace and `AcesMeld` accepts
-    // duplicates, so `AH AH AD` is a legal meld.
+    // §7.2: every sub-multiset of natural aces held, each with and without one
+    // held wild (an ace meld takes a Joker or any 2). The wild counts toward
+    // the three-card minimum (`Meld::new`), so a pair of natural aces plus a
+    // wild is a legal meld and must be offered. Sub-multiset, not subset: the
+    // deck holds two copies of each ace and `AcesMeld` accepts duplicates, so
+    // `AH AH AD` is a legal meld.
     let mut aces: Vec<Card> = hand
         .iter()
         .copied()
@@ -182,9 +186,13 @@ fn lay_meld_candidates(hand: &[Card]) -> Vec<Action> {
     wilds.sort_by_key(|card| card.to_string());
     wilds.dedup();
 
-    for size in 3..=aces.len() {
+    for size in 2..=aces.len() {
         for combo in combinations(&aces, size) {
-            candidates.push(lay(combo.clone()));
+            // Three or more natural aces can stand alone; a backbone of two
+            // aces needs a wild to clear the three-card minimum.
+            if size >= 3 {
+                candidates.push(lay(combo.clone()));
+            }
             for &wild in &wilds {
                 let mut cards = combo.clone();
                 cards.push(wild);
@@ -198,6 +206,9 @@ fn lay_meld_candidates(hand: &[Card]) -> Vec<Action> {
 
 /// Every `size`-card combination of `cards`, deduplicated by value (the hand
 /// may hold two copies of the same card).
+///
+/// `cards` must arrive sorted and let indices ascend, so each emitted combination
+/// is already in sorted order. Output order follows `next` ascending.
 fn combinations(cards: &[Card], size: usize) -> Vec<Vec<Card>> {
     fn pick(
         cards: &[Card],
@@ -208,8 +219,7 @@ fn combinations(cards: &[Card], size: usize) -> Vec<Vec<Card>> {
         out: &mut Vec<Vec<Card>>,
     ) {
         if stack.len() == size {
-            let mut combo: Vec<Card> = stack.iter().map(|&i| cards[i]).collect();
-            combo.sort_by_key(|card| card.to_string());
+            let combo: Vec<Card> = stack.iter().map(|&i| cards[i]).collect();
             if seen.insert(combo.clone()) {
                 out.push(combo);
             }

@@ -17,7 +17,6 @@ fn seat(index: u8) -> Seat {
 
 /// The `LayMeld` payloads in a list, as sorted card strings for
 /// order-free comparison.
-#[allow(dead_code)]
 fn lay_melds(actions: &[Action]) -> HashSet<Vec<String>> {
     actions
         .iter()
@@ -83,4 +82,25 @@ fn other_seats_and_terminal_phases_get_nothing() {
             "{phase:?} decides nothing"
         );
     }
+}
+
+#[test]
+fn two_aces_and_a_wild_make_an_aces_meld() {
+    // The wild counts toward the three-card minimum (Meld::new), so a pair of
+    // natural aces plus one wild is a legal lay — and must be offered.
+    let state = Rig::new()
+        .phase(Phase::Melding)
+        .opened(1)
+        .hand(1, "AH AD JOKER QS")
+        .discard("9C")
+        .build();
+    let melds = lay_melds(&enumerate(&state, seat(1)));
+    assert_eq!(
+        melds,
+        HashSet::from([vec![
+            "AD".to_string(),
+            "AH".to_string(),
+            "JOKER".to_string()
+        ]])
+    );
 }
