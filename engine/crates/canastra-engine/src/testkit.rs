@@ -109,6 +109,12 @@ impl Rig {
         self
     }
 
+    /// §3: the card the lead player is currently deciding whether to keep.
+    pub fn pending_refusal(mut self, spec: &str) -> Rig {
+        self.state.turn_context.pending_refusal = Some(card(spec));
+        self
+    }
+
     /// §6: mark the partnership as having already met its opening minimum.
     pub fn opened(mut self, team: usize) -> Rig {
         self.state.tables[team].opened = true;

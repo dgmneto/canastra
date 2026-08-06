@@ -68,7 +68,11 @@ fn draw_candidates(state: &GameState, seat: Seat) -> Vec<Action> {
 /// excluded statically; `apply` filters blocked tops, frozen cores, §6
 /// reachability, and invalid joins.
 fn natural_pairs(hand: &[Card]) -> Vec<[Card; 2]> {
-    let mut uniques: Vec<Card> = hand.iter().copied().filter(|card| card.is_natural()).collect();
+    let mut uniques: Vec<Card> = hand
+        .iter()
+        .copied()
+        .filter(|card| card.is_natural())
+        .collect();
     uniques.sort_by_key(|card| card.to_string());
     uniques.dedup();
 
@@ -132,8 +136,7 @@ fn lay_meld_candidates(hand: &[Card]) -> Vec<Action> {
             .iter()
             .copied()
             .filter(|card| {
-                card.is_joker()
-                    || (card.suit() == Some(suit) && card.rank() == Some(Rank::Two))
+                card.is_joker() || (card.suit() == Some(suit) && card.rank() == Some(Rank::Two))
             })
             .collect();
         wilds.sort_by_key(|card| card.to_string());
@@ -145,9 +148,7 @@ fn lay_meld_candidates(hand: &[Card]) -> Vec<Action> {
                 let present: Vec<Card> = (start..start + len)
                     .filter_map(|index| {
                         held.iter()
-                            .find(|card| {
-                                card.rank().and_then(Rank::sequence_index) == Some(index)
-                            })
+                            .find(|card| card.rank().and_then(Rank::sequence_index) == Some(index))
                             .copied()
                     })
                     .collect();
