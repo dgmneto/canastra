@@ -4,15 +4,17 @@
   "type": "module",
   "workspaces": [
     "bots",
+    "protocol",
     "harness",
     "web"
   ],
   "scripts": {
     "build:engine": "npm run build:engine --prefix web",
     "typecheck:bots": "npm run typecheck --prefix bots",
+    "typecheck:protocol": "npm run typecheck --prefix protocol",
     "typecheck:harness": "npm run typecheck --prefix harness",
     "typecheck:web": "npm run typecheck --prefix web",
-    "typecheck": "npm run typecheck:bots && npm run typecheck:harness && npm run typecheck:web",
+    "typecheck": "npm run typecheck:bots && npm run typecheck:protocol && npm run typecheck:harness && npm run typecheck:web",
     "harness": "tsx harness/src/cli.ts"
   }
 }
