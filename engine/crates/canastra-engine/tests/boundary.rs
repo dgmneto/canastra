@@ -126,6 +126,27 @@ fn a_whole_game_state_survives_a_round_trip() {
     assert_eq!(serde_json::from_str::<GameState>(&json).unwrap(), state);
 }
 
+/// A state in the first-turn refusal phase holds the card on offer only inside
+/// `pending_refusal`, so a round trip must not read short a card. This is the
+/// exact position a driver persists one move into a fresh match.
+#[test]
+fn a_refusal_state_survives_a_round_trip() {
+    let mut state = new_game(7);
+    let seat = state.turn;
+    state = apply(&state, seat, &Action::Draw).expect("a draw offers the first card");
+    assert_eq!(state.phase, Phase::AwaitingRefusalChoice);
+    state
+        .check_invariants()
+        .expect("a refusal state is a valid deck");
+
+    let json = serde_json::to_string(&state).unwrap();
+    let restored = serde_json::from_str::<GameState>(&json).unwrap();
+    restored
+        .check_invariants()
+        .expect("restored refusal state is still a valid deck");
+    assert_eq!(restored, state);
+}
+
 #[test]
 fn a_player_view_survives_a_round_trip() {
     let state = new_game(31);

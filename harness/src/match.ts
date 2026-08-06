@@ -31,8 +31,8 @@ export type LogLine =
   | { settleHand: true };
 
 export class Match {
-  readonly seed: bigint;
-  readonly log: LogLine[];
+  seed: bigint;
+  log: LogLine[];
   private game: Game;
   /**
    * The position the current turn began from.
@@ -117,6 +117,39 @@ export class Match {
     this.game.free();
     this.game = restored;
     this.log.push({ seat, restartTurn: true });
+  }
+
+  /**
+   * The whole state as JSON. This is F6's sharp end — all four hands, the
+   * stock order, the seed — so it is for the server's persistence only and
+   * must never reach a browser.
+   */
+  snapshot(): string {
+    return this.game.snapshot();
+  }
+
+  /**
+   * Rebuild a match from a snapshot, for server persistence and replay
+   * resume. `meta` carries what the snapshot does not: which bot (or human
+   * name) sat where and when the match started, so the log header stays a
+   * truthful record across a restart.
+   *
+   * The turn checkpoint becomes the restored position itself: a `restartTurn`
+   * shortly after a restore replays at most the turn in progress, which is
+   * the same position the restart would have produced anyway.
+   */
+  static restore(
+    snapshot: string,
+    meta: { seed: bigint; bots: string[]; startedAt: string; log?: LogLine[] },
+  ): Match {
+    const match = Object.create(Match.prototype) as Match;
+    match.seed = meta.seed;
+    match.game = Game.restore(snapshot);
+    match.turnStart = snapshot;
+    match.log = meta.log ?? [
+      { seed: meta.seed.toString(), startedAt: meta.startedAt, bots: meta.bots },
+    ];
+    return match;
   }
 
   private checkpoint(): void {

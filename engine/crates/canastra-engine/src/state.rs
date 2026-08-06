@@ -332,6 +332,13 @@ impl GameState {
                 in_play.extend(meld.cards());
             }
         }
+        // §3: before the lead player resolves the refusal, the card on offer is
+        // out of the stock, not yet in hand, and not on the table — it lives
+        // only in `pending_refusal`, so it must be counted separately or a state
+        // in `AwaitingRefusalChoice` reads as short one card.
+        if let Some(offered) = self.turn_context.pending_refusal {
+            in_play.push(offered);
+        }
         let mut expected = crate::card::deck();
         in_play.sort_by_key(|card| card.to_string());
         expected.sort_by_key(|card| card.to_string());
