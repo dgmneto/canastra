@@ -4,7 +4,6 @@
 
 use std::collections::HashSet;
 
-#[allow(unused_imports)]
 use canastra_engine::action::MeldTarget;
 use canastra_engine::state::Phase;
 use canastra_engine::testkit::Rig;
@@ -317,4 +316,63 @@ fn cornered_player_may_only_end_without_discarding() {
         .discard("9C")
         .build();
     assert_eq!(enumerate(&state, seat(1)), vec![Action::EndTurnWithoutDiscard]);
+}
+
+#[test]
+fn taking_the_pile_the_rules_spec_worked_example() {
+    // §5: with the 6♦ on top, the legal cores are 4D 5D, 5D 7D and 7D 8D —
+    // each into a new meld, and into whichever existing meld the three join.
+    let state = Rig::new()
+        .stock("8C 9D")
+        .discard("9C 6D")
+        .hand(1, "4D 5D 7D 8D KH")
+        .meld(1, "7D 8D 9D")
+        .meld(1, "8D 9D TD")
+        .build();
+    let takes: Vec<Action> = enumerate(&state, seat(1))
+        .into_iter()
+        .filter(|a| matches!(a, Action::TakeDiscardPile { .. }))
+        .collect();
+    let take = |a: &str, b: &str, target: MeldTarget| Action::TakeDiscardPile {
+        core: [a.parse().unwrap(), b.parse().unwrap()],
+        target,
+    };
+    assert_same_actions(
+        &takes,
+        &[
+            take("4D", "5D", MeldTarget::NewMeld),
+            take("4D", "5D", MeldTarget::Existing { meld: 0 }),
+            take("5D", "7D", MeldTarget::NewMeld),
+            take("5D", "7D", MeldTarget::Existing { meld: 1 }),
+            take("7D", "8D", MeldTarget::NewMeld),
+        ],
+    );
+}
+
+#[test]
+fn taking_the_pile_with_a_same_value_core() {
+    // A pair of aces with an ace on top is a legal capture (aces meld).
+    let state = Rig::new()
+        .stock("8C 9D")
+        .discard("9C AS")
+        .hand(1, "AH AH KD QC")
+        .opened(1)
+        .build();
+    let actions = enumerate(&state, seat(1));
+    assert!(actions.contains(&Action::TakeDiscardPile {
+        core: ["AH".parse().unwrap(), "AH".parse().unwrap()],
+        target: MeldTarget::NewMeld,
+    }));
+    assert_eq!(actions.len(), 2, "just Draw and the one capture: {actions:?}");
+}
+
+#[test]
+fn a_blocked_pile_offers_no_takes() {
+    // §5: a black 3 on top puts the pile out of reach.
+    let state = Rig::new()
+        .stock("8C 9D")
+        .discard("9C 3S")
+        .hand(1, "4S 5S KD QC")
+        .build();
+    assert_eq!(enumerate(&state, seat(1)), vec![Action::Draw]);
 }
