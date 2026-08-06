@@ -12,9 +12,9 @@
 
 import { randomUUID } from "node:crypto";
 import type { WebSocket } from "ws";
-import { Match } from "@canastra/harness";
+import { Match, label, step } from "@canastra/harness";
 import type { LogLine } from "@canastra/harness";
-import { makeRng } from "@canastra/bots";
+import { makeRng, botById } from "@canastra/bots";
 import type { Action, Rng, Seat } from "@canastra/bots";
 import type { ClientMessage, SeatOccupant, ServerMessage, TableState } from "@canastra/protocol";
 import type { SaveGame, SaveSeat } from "./persistence.js";
@@ -64,14 +64,7 @@ export class Table {
   private botTimer: ReturnType<typeof setTimeout> | null = null;
   private settleTimer: ReturnType<typeof setTimeout> | null = null;
 
-  constructor(private options: TableOptions = {}) {
-    // Task 4's pump() consumes these; name them here so noUnusedLocals stays
-    // quiet while the scaffold is lobby-only.
-    void this.rng;
-    void this.safeMode;
-    void this.botTimer;
-    void this.settleTimer;
-  }
+  constructor(private options: TableOptions = {}) {}
 
   /** Rebuild a table from a save. Human seats come back covered: their owners reclaim by token. */
   static restore(save: SaveGame, options: TableOptions = {}): Table {
@@ -245,23 +238,147 @@ export class Table {
     }
   }
 
-  // --- match (implemented in Task 4) ---
+  // --- match ---
 
   private start(client: Client): void {
-    this.refuse(client, "NotRunning", "match flow lands in Task 4");
+    if (client.seat === null) return this.refuse(client, "NotSeated", "sit first");
+    if (this.match && this.match.views()[0].phase !== "MatchOver") {
+      return this.refuse(client, "MatchRunning", "a match is already in progress");
+    }
+    if (this.settleTimer) {
+      clearTimeout(this.settleTimer);
+      this.settleTimer = null;
+    }
+    // Empty seats become bots; human and covered seats stay as they are.
+    this.seats = this.seats.map((seat) =>
+      seat.kind === "empty" ? { kind: "bot", botId: COVER_BOT } : seat,
+    );
+    // The header records who sat where — bot ids and human names alike,
+    // because the log is a record of a match.
+    const lineup = this.seats.map((seat) =>
+      seat.kind === "bot" ? seat.botId : (seat as { name: string }).name,
+    );
+    const seed = BigInt(Math.floor(Math.random() * 2 ** 31));
+    this.match = new Match(seed, lineup);
+    this.rng = makeRng(Number(seed % 2147483647n) || 1);
+    this.safeMode = false;
+    this.broadcast({ type: "event", text: `match started (seed ${seed})` });
+    this.afterChange();
   }
 
   private act(client: Client, action: Action): void {
-    void action;
-    this.refuse(client, "NotRunning", "no match in progress");
+    if (client.seat === null || !this.match) {
+      return this.refuse(client, "NotSeated", "you are not at the table");
+    }
+    const refused = this.match.apply(client.seat, action);
+    if (refused) return this.refuse(client, refused.error, JSON.stringify(refused));
+    this.broadcast({
+      type: "event",
+      text: label(action, client.seat, this.name(client.seat)),
+    });
+    this.afterChange();
   }
 
   private restart(client: Client): void {
-    this.refuse(client, "NotRunning", "no match in progress");
+    if (client.seat === null || !this.match) {
+      return this.refuse(client, "NotSeated", "you are not at the table");
+    }
+    this.match.restartTurn(client.seat);
+    this.broadcast({
+      type: "event",
+      text: label("restartTurn", client.seat, this.name(client.seat)),
+    });
+    this.afterChange();
   }
 
   private settleMessage(client: Client): void {
-    this.refuse(client, "NotRunning", "no hand to settle");
+    if (client.seat === null) return this.refuse(client, "NotSeated", "spectators cannot settle");
+    this.settleNow();
+  }
+
+  private settleNow(): void {
+    if (!this.match) return;
+    if (this.match.views()[0].phase !== "HandOver") return;
+    if (this.settleTimer) {
+      clearTimeout(this.settleTimer);
+      this.settleTimer = null;
+    }
+    const refused = this.match.settleHand();
+    if (refused) return;
+    this.broadcast({ type: "event", text: "hand settled" });
+    this.afterChange();
+  }
+
+  /**
+   * Drive the bots until the game needs a human, a hand ends, or the match
+   * ends. Each bot action is paced by a timer so people can follow; anything
+   * that changes the state re-enters through `afterChange`.
+   */
+  private pump(): void {
+    if (!this.match || this.botTimer) return;
+    const view = this.match.views()[0];
+    if (view.phase === "HandOver") return this.beginHandOver();
+    if (view.phase === "MatchOver") return this.endMatch();
+    if (this.seats[view.turn].kind === "human") return; // a person decides
+
+    this.botTimer = setTimeout(() => {
+      this.botTimer = null;
+      if (!this.match) return;
+      const now = this.match.views()[0];
+      // The state may have moved while the timer was pending (a stand, a reclaim).
+      if (now.phase === "HandOver" || now.phase === "MatchOver") return this.pump();
+      const acting = now.turn as Seat;
+      if (this.seats[acting].kind === "human") return;
+      const bot = botById(this.botIdFor(acting));
+      const result = step(this.match, this.match.views()[acting], bot, {
+        rng: this.rng,
+        safeMode: this.safeMode,
+      });
+      if (!result) return;
+      // The same safeMode rule as the harness CLI: a restarted turn retries
+      // with draw-and-discard only, cleared by the next completed turn.
+      if (result.action === "restartTurn") this.safeMode = true;
+      else if (
+        result.action !== "settleHand" &&
+        (result.action.type === "Discard" || result.action.type === "EndTurnWithoutDiscard")
+      )
+        this.safeMode = false;
+      this.broadcast({
+        type: "event",
+        text: label(result.action, acting, this.name(acting)),
+      });
+      this.afterChange();
+    }, this.options.botDelayMs ?? 500);
+  }
+
+  private beginHandOver(): void {
+    if (this.settleTimer || !this.match) return;
+    // §13 is only safe to show now: the hand is over, and partners would be
+    // counting together at a physical table. Mid-hand it would leak the sum
+    // of both partners' hands.
+    this.broadcast({ type: "handOver", scores: this.match.handScores() });
+    this.settleTimer = setTimeout(() => {
+      this.settleTimer = null;
+      this.settleNow();
+    }, this.options.settleDelayMs ?? 10_000);
+  }
+
+  private endMatch(): void {
+    const scores = this.match!.views()[0].scores;
+    this.broadcast({ type: "event", text: `match over — ${scores[0]} vs ${scores[1]}` });
+    // The finished match stays on the table until someone presses start again.
+  }
+
+  private name(seat: Seat): string {
+    const occupant = this.seats[seat];
+    if (occupant.kind === "human" || occupant.kind === "covered") return occupant.name;
+    if (occupant.kind === "bot") return botById(occupant.botId).name;
+    return `seat ${seat}`;
+  }
+
+  private botIdFor(seat: Seat): string {
+    const occupant = this.seats[seat];
+    return occupant.kind === "bot" ? occupant.botId : COVER_BOT;
   }
 
   // --- plumbing ---
@@ -317,5 +434,6 @@ export class Table {
     this.broadcastTable();
     for (let seat = 0; seat < 4; seat++) this.sendView(seat as Seat);
     this.options.onChange?.(this.serialize());
+    this.pump();
   }
 }

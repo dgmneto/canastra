@@ -6,6 +6,6 @@ import { startServer } from "./server.js";
 const port = Number(process.env.PORT ?? 3001);
 const saveFile = fileURLToPath(new URL("../data/game.json", import.meta.url));
 
-startServer({ port, saveFile }).then((server) => {
+startServer({ port, saveFile, botDelayMs: Number(process.env.BOT_DELAY_MS ?? 500) }).then((server) => {
   console.log(`canastra server on http://localhost:${server.port()}`);
 });
