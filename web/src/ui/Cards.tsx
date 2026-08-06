@@ -88,7 +88,7 @@ export function MeldView({ meld, index }: { meld: Meld; index: number }) {
 
 const RANK_ORDER = "23456789TJQKA";
 
-function compareCards(a: Card, b: Card): number {
+export function compareCards(a: Card, b: Card): number {
   if (a === "JOKER") return b === "JOKER" ? 0 : 1;
   if (b === "JOKER") return -1;
   if (a[1] !== b[1]) return a[1].localeCompare(b[1]);

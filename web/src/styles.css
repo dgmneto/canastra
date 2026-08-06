@@ -306,3 +306,7 @@ h2 {
 .lobby-seat { border: 1px solid #444; border-radius: 8px; padding: 0.75rem 1rem; display: grid; gap: 0.35rem; min-width: 10rem; }
 .lobby-seat.mine { border-color: #7c7; }
 .dim { opacity: 0.55; }
+
+.panel { border: 1px solid #557; border-radius: 8px; padding: 0.75rem 1rem; margin: 0.5rem 1rem; }
+.refusal-banner { background: #5c2e2e; color: #fdd; padding: 0.4rem 1rem; }
+.spectate { display: flex; gap: 0.5rem; padding: 1rem; }
