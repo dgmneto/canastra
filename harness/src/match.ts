@@ -134,14 +134,21 @@ export class Match {
    * name) sat where and when the match started, so the log header stays a
    * truthful record across a restart.
    *
-   * The turn checkpoint becomes the restored position itself: a `restartTurn`
-   * shortly after a restore replays at most the turn in progress, which is
-   * the same position the restart would have produced anyway.
+   * The turn checkpoint becomes the restored position itself. After a
+   * *mid-turn* restore that is not the true turn start: the pre-restore part of
+   * the turn is already lost, so a `restartTurn` replays only the stretch after
+   * the restore point rather than the whole turn. This is the conservative
+   * direction — it can only ever make a restart undo *less*, never a whole turn
+   * too far — and the spec accepted it (Risks / open points).
    */
   static restore(
     snapshot: string,
     meta: { seed: bigint; bots: string[]; startedAt: string; log?: LogLine[] },
   ): Match {
+    // `Object.create` bypasses the constructor; the field assignments below
+    // stay legal because these are ordinary TS-`private` runtime properties.
+    // Converting them to `#private` ECMAScript fields would break this at
+    // runtime, since `restore` builds the instance externally.
     const match = Object.create(Match.prototype) as Match;
     match.seed = meta.seed;
     match.game = Game.restore(snapshot);
