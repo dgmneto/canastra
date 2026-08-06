@@ -58,7 +58,9 @@ The npm workspace grows from three packages to five:
    way, same as the CLI.
 2. `Match.restore(snapshot, meta)` static. Today `Match` only constructs from a
    seed, which always deals a fresh game. Persistence and reclaim need to wrap a
-   `Game.restore`ed handle in a `Match` (log + checkpoint). ~10 lines; the CLI
+   `Game.restore`ed handle in a `Match` (log + checkpoint). `meta` carries at
+   least the seed and the bot lineup, so the restored `Match`'s log header stays
+   a truthful record of the match across a server restart. ~10 lines; the CLI
    benefits too (resume a replay).
 
 ### Server modules
@@ -98,7 +100,17 @@ engine's `Action` tagging style. Types live in `@canastra/protocol`.
 | `start` | `{}` | begin the match (any seated human); empty seats become bots |
 | `action` | `{action: Action}` | an engine `Action`. **No seat field** — the server passes the connection's bound seat to `Match.apply` (F6 discharged by construction) |
 | `restartTurn` | `{}` | escape hatch for a dead-ended turn; `Match.restartTurn` semantics |
-| `settle` | `{}` | at `HandOver`, skip the pause and bank the hand now |
+| `settle` | `{}` | at `HandOver`, skip the pause and bank the hand now. Accepted from seated humans only; ignored from spectators |
+
+### When `view` is pushed
+
+A seat's `PlayerView` is pushed whenever it may have changed: after every
+accepted engine action, **on deal (`start`)**, **on `sit`/takeover**, and **on
+reclaim**. The non-action pushes matter: a player who presses `start` must see
+their freshly dealt hand immediately (it may be their turn), and a human taking
+over a bot seat mid-match must receive the position before being asked to
+decide. `Match.views()` is an omniscient driver API — the server picks
+`views()[seat]` for the bound seat only, and that pick never leaves the server.
 
 ### Server → client
 
@@ -106,7 +118,7 @@ engine's `Action` tagging style. Types live in `@canastra/protocol`.
 |---|---|---|
 | `welcome` | `{token, seat: Seat \| null, table: TableState}` | token to store; `seat` non-null means a reclaim happened |
 | `table` | `TableState` | broadcast lobby/table state after any change |
-| `view` | `{view: PlayerView}` | **private**, per seated player, after every action — the engine's `observe(state, seat)` |
+| `view` | `{view: PlayerView}` | **private**, per seated player — the engine's `observe(state, seat)` |
 | `event` | `{text: string}` | one move-log line (harness `label`), broadcast |
 | `refused` | `{violation: RuleViolation}` | the rule that rejected your action, to the actor only |
 | `handOver` | `{scores: [HandScore, HandScore]}` | itemised §13 settlement, broadcast at hand end |
@@ -145,9 +157,15 @@ interface TableState {
 - **Match end:** broadcast final scores, table returns to lobby. Seats persist
   (humans stay seated); anyone may press `start` again.
 - **Disconnect:** seat's occupant becomes `{kind:"bot", ...}` immediately and
-  the game never stalls; the seat remembers the token. **Reconnect:** `hello`
+  the game never stalls; the seat remembers the token. **Detection:** the
+  server pings every ~10 s and terminates a socket that misses two consecutive
+  pongs — a clean `close` (tab closed) and a dead network (WiFi drop, laptop
+  sleep) both end in the same bot-takeover path. **Reconnect:** `hello`
   with the stored token rebinds the connection and returns the current
-  `PlayerView` via `welcome` + `view`.
+  `PlayerView` via `welcome` + `view`. **Reclaim collision:** if another human
+  has already taken the seat (via `sit`) before the original returns, the stale
+  token no longer maps to anything — that `hello` is treated as a new arrival
+  with no seat. First come, first served; acceptable among friends.
 - **Persistence:** after every accepted action, write the snapshot + seats +
   seed + log to `server/data/game.json`. On boot, if the file exists and passes
   `Game.restore`'s invariant check, resume; otherwise start in lobby.
