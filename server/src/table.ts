@@ -112,6 +112,16 @@ export class Table {
 
   // --- connection management (called by server.ts) ---
 
+  /**
+   * Kick the bot pump after server boot. A freshly restored match is mid-flow
+   * with everyone covered, but nothing has driven a bot yet — the pump only
+   * runs from `afterChange`, which a restore never triggers. Without this a
+   * restored match stalls on the first bot/covered seat.
+   */
+  resume(): void {
+    this.afterChange();
+  }
+
   connect(ws: WebSocket): void {
     this.clients.set(ws, { ws, name: "", token: "", seat: null });
   }

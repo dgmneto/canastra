@@ -70,6 +70,8 @@ export async function startServer(options: ServerOptions): Promise<RunningServer
   } catch {
     table = new Table({ ...options, onChange: persist });
   }
+  // Resume a restored match so its bots keep playing; a lobby table is a no-op.
+  table.resume();
 
   const http: HttpServer = createServer((req, res) => {
     if (!existsSync(distDir)) {
