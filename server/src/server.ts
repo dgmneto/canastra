@@ -62,16 +62,21 @@ export async function startServer(options: ServerOptions): Promise<RunningServer
   // A save that no longer parses or fails the engine's invariant check costs
   // the match in progress, not the server.
   let table: Table;
+  let resumed = false;
   const restored = options.saveFile ? loadGame(options.saveFile) : null;
   try {
-    table = restored
-      ? Table.restore(restored, { ...options, onChange: persist })
-      : new Table({ ...options, onChange: persist });
+    if (restored) {
+      table = Table.restore(restored, { ...options, onChange: persist });
+      resumed = true;
+    } else {
+      table = new Table({ ...options, onChange: persist });
+    }
   } catch {
     table = new Table({ ...options, onChange: persist });
+    resumed = false;
   }
-  // Resume a restored match so its bots keep playing; a lobby table is a no-op.
-  table.resume();
+  // Resume a restored match so its bots keep playing; a fresh lobby table is a no-op.
+  if (resumed) table.resume();
 
   const http: HttpServer = createServer((req, res) => {
     if (!existsSync(distDir)) {
@@ -134,6 +139,7 @@ export async function startServer(options: ServerOptions): Promise<RunningServer
     close: () =>
       new Promise((resolve) => {
         clearInterval(keepalive);
+        table.dispose(); // stop the bot/settle timers before the sockets die
         for (const ws of wss.clients) ws.terminate();
         wss.close();
         http.close(() => resolve());

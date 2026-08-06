@@ -60,9 +60,11 @@ class Player {
   private driving = false;
   private pending: ((accepted: boolean) => void) | null = null;
   private settledHand = -1;
+  /** The last few move-log lines this client saw, newest last. */
+  readonly events: string[] = [];
 
   constructor(
-    private name: string,
+    readonly name: string,
     private port: number,
     token?: string,
   ) {
@@ -122,8 +124,11 @@ class Player {
       case "handOver":
         this.handOvers++;
         break;
-      case "event":
+      case "event": {
+        this.events.push(message.text);
+        if (this.events.length > 10) this.events.splice(0, this.events.length - 10);
         break;
+      }
     }
   }
 
@@ -175,26 +180,54 @@ class Player {
   }
 }
 
+/** The players seen so far, for the failure dump (reachable from main's catch). */
+let smokePlayers: Player[] = [];
+
+/** Make a failure actionable: each connected player's table state, then the last events. */
+function dumpState(): void {
+  console.error("--- failure state ---");
+  for (const p of smokePlayers) {
+    if (p.table) {
+      console.error(
+        `  ${p.name}: phase=${p.table.phase} turn=${p.table.turn} ` +
+          `scores=${JSON.stringify(p.table.scores)} hand=${p.table.handNumber}`,
+      );
+    } else {
+      console.error(`  ${p.name}: no table state yet`);
+    }
+  }
+  const events = smokePlayers.flatMap((p) => p.events);
+  if (events.length) {
+    console.error("  last events:");
+    for (const e of events.slice(-10)) console.error(`    ${e}`);
+  }
+}
+
 async function main(): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), "canastra-smoke-"));
   const saveFile = join(dir, "game.json");
-  let server: RunningServer | null = await startServer({
-    port: 0,
-    saveFile,
-    botDelayMs: 0,
-    settleDelayMs: 50,
-  });
+  let server: RunningServer | null = null;
 
   try {
+    server = await startServer({
+      port: 0,
+      saveFile,
+      botDelayMs: 0,
+      settleDelayMs: 50,
+    });
     const port = server.port();
+    const players: Player[] = [];
+    smokePlayers = players;
 
     // --- lobby ---
     const ana = new Player("Ana", port);
+    players.push(ana);
     await ana.connect();
     ana.sit(0);
     await waitFor(() => ana.seat === 0 && ana.table?.seats[0].kind === "human", "Ana sits at seat 0");
 
     const bruno = new Player("Bruno", port);
+    players.push(bruno);
     await bruno.connect();
     bruno.sit(1);
     await waitFor(() => bruno.seat === 1, "Bruno sits at seat 1");
@@ -213,21 +246,25 @@ async function main(): Promise<void> {
       "a dropped seat is covered by a bot",
     );
     const brunoReturns = new Player("Bruno", port, bruno.token ?? undefined);
+    players.push(brunoReturns);
     await brunoReturns.connect();
     const reclaimed = await waitFor(
       () => brunoReturns.seat === 1 && brunoReturns.view !== null,
       "the token reclaims the seat mid-match",
     );
-    let activeBruno: Player = reclaimed ? brunoReturns : bruno;
-    void activeBruno;
+    void reclaimed;
 
     // --- a restarted server resumes the table ---
     await waitFor(() => existsSync(saveFile), "the save file exists");
-    const scoresBefore = ana.table?.scores ?? null;
+    // Dispose quiesces the old table at close, freezing ana's last view. Capture
+    // the comparison value only after close resolves, so the restarted server is
+    // not racing a live game.
     await server.close();
+    const scoresBefore = ana.table?.scores ?? null;
     server = await startServer({ port: 0, saveFile, botDelayMs: 0, settleDelayMs: 50 });
     const port2 = server.port();
     const carla = new Player("Carla", port2);
+    players.push(carla);
     await carla.connect();
     await waitFor(
       () => carla.table !== null && carla.table.phase !== "lobby" && carla.table.phase !== undefined,
@@ -238,6 +275,7 @@ async function main(): Promise<void> {
       "the resumed table kept the scores",
     );
     const anaReturns = new Player("Ana", port2, ana.token ?? undefined);
+    players.push(anaReturns);
     await anaReturns.connect();
     await waitFor(() => anaReturns.seat === 0 && anaReturns.view !== null, "Ana reclaims after the restart");
 
@@ -256,6 +294,7 @@ async function main(): Promise<void> {
   }
 
   if (failures) {
+    dumpState();
     console.error(`${failures} check(s) failed`);
     process.exit(1);
   }
@@ -263,6 +302,7 @@ async function main(): Promise<void> {
 }
 
 main().catch((error) => {
+  dumpState();
   console.error(error);
   process.exit(1);
 });

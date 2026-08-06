@@ -122,6 +122,18 @@ export class Table {
     this.afterChange();
   }
 
+  /** Stop driving: cancel the bot and settle timers so the table quiesces. */
+  dispose(): void {
+    if (this.botTimer) {
+      clearTimeout(this.botTimer);
+      this.botTimer = null;
+    }
+    if (this.settleTimer) {
+      clearTimeout(this.settleTimer);
+      this.settleTimer = null;
+    }
+  }
+
   connect(ws: WebSocket): void {
     this.clients.set(ws, { ws, name: "", token: "", seat: null });
   }
