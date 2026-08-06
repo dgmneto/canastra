@@ -8,10 +8,8 @@
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
-  "dependencies": {
-    "@canastra/bots": "*"
-  },
   "devDependencies": {
+    "@canastra/bots": "*",
     "typescript": "^5.9.0"
   }
 }

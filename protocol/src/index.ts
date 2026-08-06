@@ -3,7 +3,7 @@
  *
  * One WebSocket at `/ws`, JSON messages discriminated by `type` — the same
  * tagging style the engine uses for `Action`. This package is the shared
- * language of `web/` (the game client) and `server/`; it holds no logic and
+ * language of `web/` (the game client) and `server/`; it holds no game logic and
  * no runtime dependencies (the wire types themselves live in `@canastra/bots`,
  * the leaf everything else depends on).
  *
@@ -87,13 +87,39 @@ export type ServerMessage =
  * throwing — a garbage frame should cost nothing.
  */
 export function parseClientMessage(text: string): ClientMessage | null {
+  let value: unknown;
   try {
-    const value: unknown = JSON.parse(text);
-    if (typeof value === "object" && value !== null && typeof (value as { type?: unknown }).type === "string") {
-      return value as ClientMessage;
-    }
+    value = JSON.parse(text);
   } catch {
-    // fall through
+    return null;
   }
-  return null;
+  if (typeof value !== "object" || value === null) {
+    return null;
+  }
+  const msg = value as { type?: unknown; name?: unknown; seat?: unknown; action?: unknown };
+  switch (msg.type) {
+    case "hello":
+      if (typeof msg.name !== "string") return null;
+      break;
+    case "sit":
+      if (typeof msg.seat !== "number") return null;
+      break;
+    case "action":
+      if (
+        typeof msg.action !== "object" ||
+        msg.action === null ||
+        typeof (msg.action as { type?: unknown }).type !== "string"
+      ) {
+        return null;
+      }
+      break;
+    case "stand":
+    case "start":
+    case "restartTurn":
+    case "settle":
+      break;
+    default:
+      return null;
+  }
+  return msg as ClientMessage;
 }
