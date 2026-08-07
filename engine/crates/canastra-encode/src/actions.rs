@@ -18,6 +18,7 @@
 
 use canastra_engine::action::MeldTarget;
 use canastra_engine::card::{Card, Rank};
+use canastra_engine::meld::Meld;
 use canastra_engine::{Action, PlayerView};
 
 use crate::ACT_DIM;
@@ -33,17 +34,23 @@ use crate::tokens;
 pub fn encode_actions(view: &PlayerView, legal: &[Action], out: &mut [f32]) {
     assert_eq!(out.len(), legal.len() * ACT_DIM);
     out.fill(0.0);
+    let pool = tokens::sorted_tokens(view);
     for (row, action) in legal.iter().enumerate() {
         let mut w = Writer {
             out: &mut out[row * ACT_DIM..(row + 1) * ACT_DIM],
             at: 0,
         };
-        encode_action(view, action, &mut w);
+        encode_action(view, action, &pool, &mut w);
         w.finish();
     }
 }
 
-fn encode_action(view: &PlayerView, action: &Action, w: &mut Writer) {
+fn encode_action(
+    view: &PlayerView,
+    action: &Action,
+    pool: &[(&Meld, tokens::TokenSource)],
+    w: &mut Writer,
+) {
     w.one_hot(8, Some(kind_index(action)));
 
     match action {
@@ -69,11 +76,11 @@ fn encode_action(view: &PlayerView, action: &Action, w: &mut Writer) {
     }
 
     let token = match action {
-        Action::AddToMeld { meld, .. } => Some(tokens::target_index(view, *meld)),
+        Action::AddToMeld { meld, .. } => Some(tokens::target_index_in(pool, *meld)),
         Action::TakeDiscardPile {
             target: MeldTarget::Existing { meld },
             ..
-        } => Some(tokens::target_index(view, *meld)),
+        } => Some(tokens::target_index_in(pool, *meld)),
         _ => None,
     };
     w.one_hot(33, token);
@@ -88,8 +95,12 @@ fn encode_action(view: &PlayerView, action: &Action, w: &mut Writer) {
     let points = involved_points(view, action);
     w.therm(points, &[5, 10, 15, 20, 25, 30, 35, 40, 45, 50]);
 
+    let meld_bearing = matches!(
+        action,
+        Action::LayMeld { .. } | Action::AddToMeld { .. } | Action::TakeDiscardPile { .. }
+    );
     let my_table = &view.tables[view.seat.team().index()];
-    let opening = !my_table.opened && view.laid_value < view.opening_minimum;
+    let opening = meld_bearing && !my_table.opened && view.laid_value < view.opening_minimum;
     w.bit(opening && view.laid_value + points >= view.opening_minimum);
     w.bit(opening && view.laid_value + points >= view.opening_minimum + 25);
     w.bit(opening && view.laid_value + points >= view.opening_minimum + 50);

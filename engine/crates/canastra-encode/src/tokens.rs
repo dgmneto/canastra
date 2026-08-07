@@ -67,9 +67,17 @@ fn sort_key(meld: &Meld) -> (u8, u8, u8, u8) {
 }
 
 /// The pool position of a meld addressed the engine's way — per-partnership
-/// index on the acting team's table.
+/// index on the acting team's table. Test-only: the hot path uses
+/// [`target_index_in`] over a pool built once per ply.
+#[cfg(test)]
 pub(crate) fn target_index(view: &PlayerView, meld: usize) -> usize {
-    sorted_tokens(view)
+    target_index_in(&sorted_tokens(view), meld)
+}
+
+/// As `target_index`, but over a pool the caller already built — the hot
+/// path builds it once per ply, not once per targeted action.
+pub(crate) fn target_index_in(tokens: &[(&Meld, TokenSource)], meld: usize) -> usize {
+    tokens
         .iter()
         .position(|(_, source)| source.mine && source.meld == meld)
         .expect("every meld on the acting team's table is pooled")
