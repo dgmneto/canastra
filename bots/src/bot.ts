@@ -15,7 +15,7 @@
  * restarts it), so a well-behaved bot returns every legal move, ranked.
  */
 
-import type { Action, PlayerView } from "./types";
+import type { Action, EncodedState, PlayerView } from "./types";
 import type { Rng } from "./rng";
 
 export interface BotContext {
@@ -29,6 +29,12 @@ export interface BotContext {
    * exactly, so a bot that ignores this will loop forever.
    */
   safeMode: boolean;
+  /**
+   * The engine's encoding of this position, for neural bots. Lazy — called
+   * only if a bot actually needs it, so toy policies never pay for it.
+   * Callers wire it to `Match.encodeState` for the acting seat.
+   */
+  encode?: () => EncodedState;
 }
 
 export interface Bot {
