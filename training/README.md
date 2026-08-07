@@ -11,7 +11,7 @@ workspace — the engine's build and test gates stay Python-free and fast.
 ## Layout
 
 - `src/lib.rs` — the PyO3 extension (`canastra_py`). `Pool` owns one engine per seed and
-  drives whole batches with **one FFI crossing per ply**: Rust fills numpy buffers for
+  drives whole batches with **two batched crossings per ply (encode, apply)** — Rust fills numpy buffers for
   observations, per-action features, and a legal-action mask, and consumes the picks back.
   Safe-mode menus mirror the `canastra-harness` driver — a dead-ended turn is backed out
   and retried with melding/pile-taking withheld.
@@ -47,9 +47,9 @@ this number is the one to watch when touching the pool or the encoder:
 ```
 
 Measured on this machine on a **release build** (a random legal policy over a 64-game pool):
-**79,280 plies in 220.20s ≈ 360 plies/s.** Here "plies" counts batch rounds — one `encode`
-+ `apply` across every live game — not individual game-steps. The pool sustains roughly an
-order of magnitude more real game-steps per second (~9k actions/s at full depth); the rounds
+**104,998 plies in 219.16s ≈ 479 plies/s.** Here "plies" counts batch rounds — one `encode`
++ `apply` across every live game — not individual game-steps. The pool sustains
+an order of magnitude more real game-steps per second at full depth; the rounds
 figure is dominated by the tail, where a few long matches straggle with little parallelism.
 This is expected for uniform-random play, and the action cap (`Pool(seeds, max_actions_per_game)`)
 is what keeps a non-converging match from hanging a generation.

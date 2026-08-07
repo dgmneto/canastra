@@ -98,10 +98,10 @@ Python commands run from `training/` (a separate maturin project; the engine wor
 stay Python-free). The training gates:
 
 ```bash
-cd training && .venv/bin/maturin develop && .venv/bin/pytest && .venv/bin/ruff check . && .venv/bin/mypy python/canastra_train tests
+cd training && .venv/bin/maturin develop --release && .venv/bin/pytest && .venv/bin/ruff check . && .venv/bin/mypy python/canastra_train tests
 ```
 
-# `maturin develop` must be re-run after any change to `training/src/lib.rs`, or pytest and mypy
+# `maturin develop --release` must be re-run after any change to `training/src/lib.rs`, or pytest and mypy
 # see a stale compiled extension.
 
 ## Architecture
@@ -142,7 +142,7 @@ because both sides bind the same Rust crate.
 
 `training/` is a separate maturin project (`canastra_py`), deliberately outside the engine Cargo
 workspace so the engine's gates stay Python-free and fast. Its `Pool` owns one engine per seed and
-drives batches with **one FFI crossing per ply** — Rust fills numpy buffers for observations,
+drives batches with **two batched crossings per ply (encode, apply)** — Rust fills numpy buffers for observations,
 per-action features, and a legal mask, and consumes the picks back. Its safe-mode menus mirror the
 `canastra-harness` driver: a dead-ended turn is backed out to the turn's start and retried with
 melding and pile-taking withheld. See [training/README.md](training/README.md).
