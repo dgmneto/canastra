@@ -1,4 +1,4 @@
-"""The pool drives whole batches of games with one FFI crossing per ply."""
+"""The pool drives whole batches of games, two batched crossings per ply."""
 
 import numpy as np
 from canastra_py import ACT_DIM, OBS_DIM, Pool
@@ -40,3 +40,31 @@ def test_pool_caps_runaway_matches() -> None:
     _seed, _scores, winner, _hands, unfinished = results[0]
     assert unfinished is True
     assert winner is None
+
+
+# A meld-greedy policy: lay a new meld if one is on the menu, else extend an
+# existing one, else discard, else whatever is offered. Under the pooled bug,
+# greedy play on seed 0 dead-ends its first turn and loops — safe mode was
+# cleared on the retry's own draw, so the full meld menu came straight back.
+_GREEDY = ("LayMeld", "AddToMeld", "Discard")
+
+
+def _greedy_pick(kinds: list[str]) -> int:
+    for want in _GREEDY:
+        if want in kinds:
+            return kinds.index(want)
+    return 0
+
+
+def test_safe_mode_terminates_dead_ended_turns() -> None:
+    pool = Pool([0], max_actions_per_game=100_000)
+    plies = 0
+    while pool.has_live():
+        _, _, _mask = pool.encode()
+        pool.apply([_greedy_pick(kinds) for kinds in pool.menu_kinds()])
+        plies += 1
+        assert plies < 50_000, "safe mode should terminate the dead-ended turn"
+    results = pool.results()
+    assert len(results) == 1
+    _seed, _scores, _winner, _hands, unfinished = results[0]
+    assert not unfinished

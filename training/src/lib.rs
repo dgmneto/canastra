@@ -2,7 +2,7 @@
 //!
 //! The pool owns one engine per seed and answers three questions: which
 //! seats are waiting on a decision, what those decisions look like as tensors
-//! (one FFI crossing per ply, buffers filled in Rust), and what happened when
+//! (two batched crossings per ply, buffers filled in Rust), and what happened when
 //! a match ended. The engine remains the only referee — nothing here knows a
 //! rule.
 
@@ -16,6 +16,22 @@ use rayon::prelude::*;
 /// A match that ended: either reached §14, or was cut short by the action cap
 /// and left `unfinished`.
 type MatchResult = (u64, [i32; 2], Option<u8>, u32, bool);
+
+/// A short, stable label for an action's kind — the menu columns a greedy
+/// policy keys on (they never carry seat or card data, so they are safe to
+/// expose over the Python boundary).
+fn action_kind(action: &Action) -> &'static str {
+    match action {
+        Action::Draw => "Draw",
+        Action::KeepDrawnCard => "KeepDrawnCard",
+        Action::RefuseDrawnCard => "RefuseDrawnCard",
+        Action::TakeDiscardPile { .. } => "TakeDiscardPile",
+        Action::LayMeld { .. } => "LayMeld",
+        Action::AddToMeld { .. } => "AddToMeld",
+        Action::Discard { .. } => "Discard",
+        Action::EndTurnWithoutDiscard => "EndTurnWithoutDiscard",
+    }
+}
 
 struct Game {
     state: GameState,
@@ -201,11 +217,26 @@ impl Pool {
                 .get(pick)
                 .ok_or_else(|| PyValueError::new_err("menu index out of range"))?
                 .clone();
+            // Refresh the turn checkpoint on entry to a fresh turn. Note the
+            // deliberate divergence from the harness driver here: we also
+            // re-capture on `AwaitingRefusalChoice`, so a red-3 replacement
+            // turn replays from the post-draw position with the red 3 already
+            // on the table, rather than replaying the draw. Safe-clearing is
+            // independent of this and happens on turn end below.
             if matches!(
                 game.state.phase,
                 Phase::AwaitingDraw | Phase::AwaitingRefusalChoice
             ) {
                 game.turn_start = game.state.clone();
+            }
+            // The safe flag lasts the whole retried turn — the harness driver
+            // clears safeMode the same way, on the turn-ending action.
+            // Clearing it earlier (e.g. on the retry's own Draw) would hand
+            // the full meld menu straight back and reproduce the dead-end.
+            if matches!(
+                action,
+                Action::Discard { .. } | Action::EndTurnWithoutDiscard
+            ) {
                 game.safe = false;
             }
             game.state = apply(&game.state, game.state.turn, &action)
@@ -243,6 +274,16 @@ impl Pool {
     /// The matches that ended: `(seed, scores, winner, hands, unfinished)`.
     fn results(&self) -> Vec<MatchResult> {
         self.games.iter().filter_map(|game| game.result).collect()
+    }
+
+    /// The action kinds of the current `encode` menu, one list per pending row,
+    /// so a policy can tell what a mask column means. Aligns with the last
+    /// `encode()` call (and with `apply`'s picks for the same rows).
+    fn menu_kinds(&self) -> Vec<Vec<String>> {
+        self.menus
+            .iter()
+            .map(|menu| menu.iter().map(action_kind).map(str::to_owned).collect())
+            .collect()
     }
 }
 
