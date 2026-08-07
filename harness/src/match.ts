@@ -66,6 +66,11 @@ export class Match {
     ];
   }
 
+  /** F7: every action `seat` may legally take right now, straight from the engine. */
+  legalActions(seat: Seat): Action[] {
+    return this.game.legalActions(seat) as Action[];
+  }
+
   /**
    * §13: what the hand in progress would bank for each partnership, itemised.
    *

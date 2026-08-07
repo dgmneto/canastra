@@ -32,17 +32,19 @@ export function step(match: Match, view: PlayerView, bot: Bot, context: BotConte
   }
 
   const seat = view.turn;
+  const legal = match.legalActions(seat);
   const refusals: string[] = [];
 
-  for (const action of bot.candidates(view, context)) {
+  for (const action of bot.candidates(view, legal, context)) {
     const refused = match.apply(seat, action);
     if (!refused) return { action, refusals };
     refusals.push(describe(action, refused.error));
   }
 
-  // The bot ran out of ideas. §6's eager check makes this rare but not
-  // impossible — that check is optimistic on purpose, so a turn can still
-  // dead-end — and a bot may simply have proposed nothing legal.
+  // The bot ran out of ideas, or returned moves outside the legal list. With
+  // the legal list handed to the bot, refusals are now a rare diagnostic — a
+  // bot returning moves the engine refuses — rather than the normal path, where
+  // a bot simply had no way to guess legality. Either way, restart the turn.
   match.restartTurn(seat);
   return { action: "restartTurn", refusals };
 }
