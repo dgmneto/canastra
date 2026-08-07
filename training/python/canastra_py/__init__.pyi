@@ -1,0 +1,16 @@
+from typing import Any
+
+OBS_DIM: int
+ACT_DIM: int
+
+
+class Pool:
+    def __init__(self, seeds: list[int]) -> None: ...
+
+    def has_live(self) -> bool: ...
+
+    def encode(self) -> tuple[Any, Any, Any]: ...
+
+    def apply(self, picks: list[int]) -> None: ...
+
+    def results(self) -> list[tuple[int, list[int], int | None, int]]: ...

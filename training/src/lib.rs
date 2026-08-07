@@ -1,0 +1,235 @@
+//! Python bindings for driving batches of Canastra games.
+//!
+//! The pool owns one engine per seed and answers three questions: which
+//! seats are waiting on a decision, what those decisions look like as tensors
+//! (one FFI crossing per ply, buffers filled in Rust), and what happened when
+//! a match ended. The engine remains the only referee — nothing here knows a
+//! rule.
+
+use canastra_encode::{encode_actions, encode_observation, ACT_DIM, OBS_DIM};
+use canastra_engine::{apply, enumerate, new_game, observe, settle_hand, Action, GameState, Phase};
+use numpy::{PyArray2, PyArray3, PyArrayMethods};
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
+use rayon::prelude::*;
+
+/// A match that ran to §14.
+type MatchResult = (u64, [i32; 2], Option<u8>, u32);
+
+struct Game {
+    state: GameState,
+    turn_start: GameState,
+    /// The previous attempt at this turn dead-ended; menus are restricted to
+    /// draw/refuse/discard until the turn ends (the driver's safeMode).
+    safe: bool,
+    seed: u64,
+    hands: u32,
+    result: Option<MatchResult>,
+}
+
+impl Game {
+    fn new(seed: u64) -> Game {
+        let state = new_game(seed);
+        Game {
+            turn_start: state.clone(),
+            state,
+            safe: false,
+            seed,
+            hands: 1,
+            result: None,
+        }
+    }
+
+    fn live(&self) -> bool {
+        self.result.is_none()
+    }
+
+    /// The moves the policy may pick from this ply. In a safe turn, melding
+    /// and pile-taking are withheld — they are exactly what dead-ends.
+    fn menu(&self) -> Vec<Action> {
+        let legal = enumerate(&self.state, self.state.turn);
+        if !self.safe {
+            return legal;
+        }
+        legal
+            .into_iter()
+            .filter(|action| {
+                matches!(
+                    action,
+                    Action::Draw
+                        | Action::KeepDrawnCard
+                        | Action::RefuseDrawnCard
+                        | Action::Discard { .. }
+                        | Action::EndTurnWithoutDiscard
+                )
+            })
+            .collect()
+    }
+}
+
+/// One engine per seed, driven a ply at a time across the whole batch.
+#[pyclass]
+struct Pool {
+    games: Vec<Game>,
+    /// The rows `encode` last handed out: which game, and its menu.
+    pending: Vec<usize>,
+    menus: Vec<Vec<Action>>,
+}
+
+#[pymethods]
+impl Pool {
+    #[new]
+    fn new(seeds: Vec<u64>) -> Pool {
+        Pool {
+            games: seeds.into_iter().map(Game::new).collect(),
+            pending: Vec::new(),
+            menus: Vec::new(),
+        }
+    }
+
+    /// Any match still in progress?
+    fn has_live(&self) -> bool {
+        self.games.iter().any(Game::live)
+    }
+
+    /// `(obs, acts, mask)` for every seat awaiting a decision: obs is
+    /// `[N, OBS_DIM] f32`, acts `[N, M, ACT_DIM] f32` zero-padded, mask
+    /// `[N, M] bool` marking the real columns. Menus are never truncated —
+    /// padding, never dropping, is how a turn-ending action can't get lost.
+    #[allow(clippy::type_complexity)]
+    fn encode<'py>(
+        &mut self,
+        py: Python<'py>,
+    ) -> PyResult<(
+        Bound<'py, PyArray2<f32>>,
+        Bound<'py, PyArray3<f32>>,
+        Bound<'py, PyArray2<bool>>,
+    )> {
+        self.pending = (0..self.games.len())
+            .filter(|&i| {
+                self.games[i].live()
+                    && matches!(
+                        self.games[i].state.phase,
+                        Phase::AwaitingDraw | Phase::AwaitingRefusalChoice | Phase::Melding
+                    )
+            })
+            .collect();
+
+        // Menus first (enumerate is the expensive part — parallel). A game
+        // whose menu comes back empty has dead-ended its turn: back out to
+        // the turn's start and retry safe, exactly the harness driver's path.
+        let mut menus: Vec<Vec<Action>> = self
+            .pending
+            .par_iter()
+            .map(|&i| self.games[i].menu())
+            .collect();
+        for (row, &game) in self.pending.iter().enumerate() {
+            if menus[row].is_empty() {
+                let game = &mut self.games[game];
+                game.state = game.turn_start.clone();
+                game.safe = true;
+                menus[row] = game.menu();
+                debug_assert!(!menus[row].is_empty(), "even the safe retry dead-ended");
+            }
+        }
+        self.menus = menus;
+
+        let rows = self.pending.len();
+        let width = self.menus.iter().map(Vec::len).max().unwrap_or(1).max(1);
+        let obs = PyArray2::<f32>::zeros(py, [rows, OBS_DIM], false);
+        let acts = PyArray3::<f32>::zeros(py, [rows, width, ACT_DIM], false);
+        let mask = PyArray2::<bool>::zeros(py, [rows, width], false);
+
+        // Encode (views + features) in parallel into per-row scratch, then
+        // copy into the numpy buffers — enumerate/apply dominate; the copy is
+        // memcpy-cheap and keeps the numpy API single-threaded.
+        let encoded: Vec<(Vec<f32>, Vec<f32>)> = self
+            .pending
+            .par_iter()
+            .zip(self.menus.par_iter())
+            .map(|(&i, menu)| {
+                let view = observe(&self.games[i].state, self.games[i].state.turn);
+                let mut obs_row = vec![0.0; OBS_DIM];
+                encode_observation(&view, &mut obs_row);
+                let mut act_rows = vec![0.0; menu.len() * ACT_DIM];
+                encode_actions(&view, menu, &mut act_rows);
+                (obs_row, act_rows)
+            })
+            .collect();
+
+        {
+            let mut obs_view = unsafe { obs.as_array_mut() };
+            let mut acts_view = unsafe { acts.as_array_mut() };
+            let mut mask_view = unsafe { mask.as_array_mut() };
+            for (row, (obs_row, act_rows)) in encoded.iter().enumerate() {
+                obs_view
+                    .row_mut(row)
+                    .assign(&ndarray::ArrayView1::from(obs_row));
+                for (col, chunk) in act_rows.chunks(ACT_DIM).enumerate() {
+                    let mut acts_row = acts_view.index_axis_mut(ndarray::Axis(0), row);
+                    acts_row
+                        .index_axis_mut(ndarray::Axis(0), col)
+                        .assign(&ndarray::ArrayView1::from(chunk));
+                    mask_view[[row, col]] = true;
+                }
+            }
+        }
+
+        Ok((obs, acts, mask))
+    }
+
+    /// Play the picked menu index on every pending row.
+    fn apply(&mut self, picks: Vec<usize>) -> PyResult<()> {
+        if picks.len() != self.pending.len() {
+            return Err(PyValueError::new_err(format!(
+                "expected {} picks, got {}",
+                self.pending.len(),
+                picks.len()
+            )));
+        }
+        for (row, pick) in picks.into_iter().enumerate() {
+            let game = &mut self.games[self.pending[row]];
+            let action = self.menus[row]
+                .get(pick)
+                .ok_or_else(|| PyValueError::new_err("menu index out of range"))?
+                .clone();
+            if matches!(
+                game.state.phase,
+                Phase::AwaitingDraw | Phase::AwaitingRefusalChoice
+            ) {
+                game.turn_start = game.state.clone();
+                game.safe = false;
+            }
+            game.state = apply(&game.state, game.state.turn, &action)
+                .map_err(|violation| PyValueError::new_err(violation.to_string()))?;
+            if game.state.phase == Phase::HandOver {
+                game.state = settle_hand(&game.state)
+                    .map_err(|violation| PyValueError::new_err(violation.to_string()))?;
+                if game.state.phase == Phase::MatchOver {
+                    game.result = Some((
+                        game.seed,
+                        game.state.scores,
+                        game.state.winner().map(|team| team.index() as u8),
+                        game.hands,
+                    ));
+                } else {
+                    game.hands += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The finished matches: `(seed, scores, winner, hands)` each.
+    fn results(&self) -> Vec<MatchResult> {
+        self.games.iter().filter_map(|game| game.result).collect()
+    }
+}
+
+#[pymodule]
+fn canastra_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_class::<Pool>()?;
+    module.add("OBS_DIM", OBS_DIM)?;
+    module.add("ACT_DIM", ACT_DIM)?;
+    Ok(())
+}
