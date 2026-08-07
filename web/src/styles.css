@@ -311,3 +311,9 @@ h2 {
 .table-grid { grid-template-columns: 1fr 300px; }
 .refusal-banner { background: #5c2e2e; color: #fdd; padding: 0.4rem 1rem; }
 .spectate { display: flex; gap: 0.5rem; padding: 1rem; }
+
+.controls { padding: 0.75rem 1rem; display: grid; gap: 0.5rem; }
+.controls .actions { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+.card-button { background: none; border: 2px solid transparent; border-radius: 6px; padding: 2px; cursor: pointer; }
+.card-button.selected { border-color: #7c7; }
+.meld-picker { display: flex; gap: 0.5rem; }
