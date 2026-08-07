@@ -4,6 +4,12 @@ A single page that deals a match, drives all four seats with bots, and shows eve
 It exists to exercise the engine and to watch bot behaviour, **not** to play against other people —
 there is no server, no accounts, and no networking.
 
+## Two pages
+
+- `/` — the multiplayer game client. Thin: no engine, no wasm; it renders what `@canastra/server`
+  sends and sends actions back. It never sees another seat's hand.
+- `/sandbox.html` — the engine sandbox described below, unchanged.
+
 ## Running it
 
 The JS projects are an npm workspace rooted at the repo root, so install once there:

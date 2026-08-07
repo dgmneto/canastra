@@ -12,10 +12,13 @@ Three planned components:
    behind a `Bot` interface with a per-seat picker so they can play each other, plus the engine
    wire types and seeded `rng`, and it is registered in the `BOTS` registry. Useful for eyeballing
    behaviour; it is not a training harness and does not presume the shape the real project will take.
-3. **Web app** — lets people play Canastra against each other or against a bot. **Not started.**
-   `web/` currently holds a single-page *engine sandbox*: no server, no networking, all four seats
-   driven by bots and every hand face up. Real multiplayer is a different program that happens to
-   share a directory name.
+3. **Web app** — lets people play Canastra against each other or against a bot. **Built (MVP).**
+   `server/` holds the real engine and the one global table; `web/` is two pages: the game client
+   at `/` (thin — no wasm, no rules, renders what the server sends) and the engine sandbox at
+   `/sandbox.html` (unchanged). `protocol/` is their shared wire language. Bots fill empty seats and
+   cover disconnected players (reclaim via a localStorage token). Well-intentioned players only: no
+   auth, no rate limiting; the one boundary kept is information — a browser never receives another
+   seat's cards (F6 discharged by construction: `action` messages carry no seat).
 
 Update this file's "Commands" and "Architecture" sections as each component is scaffolded.
 
@@ -92,12 +95,26 @@ Lines on stdout:
 npx canastra-harness --seed 7 random random-plus random random-plus
 ```
 
+Multiplayer dev (server on :3001, Vite on :5173 proxying `/ws`):
+
+```bash
+npm run dev
+```
+
+Production (`vite build`, then the Node server serves everything on :3001) and the server's
+end-to-end check:
+
+```bash
+npm start
+npm run smoke
+```
+
 ## Architecture
 
 `engine/` is a self-contained Cargo workspace. `crates/canastra-engine` is the rules core and has no
 binding dependencies; `crates/canastra-wasm` holds the JavaScript glue.
 
-The JavaScript side is an npm workspace rooted at the repo root, with three packages:
+The JavaScript side is an npm workspace rooted at the repo root, with five packages:
 
 - **`bots/`** (`@canastra/bots`) — the bot policies plus the engine wire types (`PlayerView`,
   `Action`, …), seeded `rng`, and the `BOTS` registry. It is the leaf everything else depends on:
@@ -106,9 +123,18 @@ The JavaScript side is an npm workspace rooted at the repo root, with three pack
 - **`harness/`** (`@canastra/harness`) — the thing that actually *plays* a game: the `Match` wasm
   wrapper, the `step` driver, and `runMatch`/`series`. Its `canastra-harness` bin (see Commands) is
   the executable that runs a match from a seed + bot names to JSONL. Web and the CLI share this code.
-- **`web/`** (`canastra-web`) — the Vite + React sandbox. It imports the bot registry and the harness
-  driver rather than owning copies. It also owns the generated wasm glue (`web/src/engine/`), which
-  both the browser and the Node harness load.
+- **`protocol/`** (`@canastra/protocol`) — the client↔server wire messages (`ClientMessage`,
+  `ServerMessage`, `TableState`), shared by `server/` and `web/`. No game logic and no runtime
+  dependencies; the engine wire types come from `@canastra/bots`. One design rule: nothing here may
+  be able to carry a `GameState`, a snapshot, or another seat's hand.
+- **`server/`** (`@canastra/server`) — the multiplayer server: one global table, a seat bound to
+  each connection (F6 discharged by construction — `action` messages carry no seat), bots driven
+  through the harness `step`, token reclaim, and snapshot persistence under `server/data/`.
+- **`web/`** (`canastra-web`) — the Vite + React front end, two pages. `/sandbox.html` is the engine
+  sandbox described below (unchanged); it imports the bot registry and the harness driver rather than
+  owning copies. The game client at `/` is thin — no wasm, no rules — rendering what the server sends
+  via `@canastra/protocol`. `web/` owns the generated wasm glue (`web/src/engine/`), which the sandbox,
+  the server and the Node harness all load.
 
 The committed wasm lives in `web/src/engine/` (gitignored, rebuilt by `build:engine`). The harness
 CLI drives it in Node by compiling the bytes into a `WebAssembly.Module`; the browser loads it by
