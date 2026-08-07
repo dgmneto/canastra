@@ -43,12 +43,16 @@ def main() -> None:
     vec_b = genome.random_genome(ARCH, seed=202)
     seeds = list(range(args.first_seed, args.first_seed + args.pairs))
 
+    # Self-null is a single-run check, so a healthy evaluator would fade it at
+    # the 95% CI (1.96σ) roughly 5% of the time. Widen to 3σ to keep the gate
+    # meaningful without crying wolf on a legitimate run.
     self_report = evaluate.evaluate_pair(vec_a, vec_a, ARCH, seeds)
+    self_3sig = 3.0 * self_report.ci95 / 1.96
     print(
         f"self-null: {self_report.pairs} pairs, mean diff {self_report.mean_diff:+.1f} "
-        f"(95% CI ±{self_report.ci95:.1f})"
+        f"(95% CI ±{self_report.ci95:.1f}, 3σ ±{self_3sig:.1f})"
     )
-    if abs(self_report.mean_diff) > self_report.ci95:
+    if abs(self_report.mean_diff) > self_3sig:
         raise SystemExit("FAIL: self-vs-self nonzero — routing or pairing bias")
 
     ab = evaluate.evaluate_pair(vec_a, vec_b, ARCH, seeds)
@@ -57,6 +61,8 @@ def main() -> None:
         f"A vs B: mean diff {ab.mean_diff:+.1f} (±{ab.ci95:.1f}); "
         f"B vs A: {ba.mean_diff:+.1f} (±{ba.ci95:.1f})"
     )
+    # Antisymmetry compares two independent runs, so the summed CIs already
+    # absorb one error each; leave it at 1.96σ+1.96σ rather than widening.
     if abs(ab.mean_diff + ba.mean_diff) > ab.ci95 + ba.ci95:
         raise SystemExit("FAIL: differential does not flip with the slots — slot bias")
 

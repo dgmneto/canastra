@@ -36,6 +36,8 @@ def evaluate_pair(
     cap: int = 200_000,
 ) -> PairReport:
     """A vs B over `seeds`, each seed played in both seatings."""
+    if len(set(seeds)) != len(seeds):
+        raise ValueError("seeds must be unique — the pairing groups by seed")
     count = len(seeds)
     pool_seeds = seeds + seeds  # first half: A in seats 0/2; second half: swapped
     pool = Pool(pool_seeds, max_actions_per_game=cap)
