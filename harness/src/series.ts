@@ -40,7 +40,11 @@ export function runMatch(seed: bigint, botIds: string[], maxActions = 200_000): 
     }
 
     const acting = view.turn;
-    const result = step(match, match.views()[acting], botById(botIds[acting]), { rng, safeMode });
+    const result = step(match, match.views()[acting], botById(botIds[acting]), {
+      rng,
+      safeMode,
+      encode: () => match.encodeState(acting),
+    });
     if (!result) break;
 
     if (result.action === "restartTurn") {
