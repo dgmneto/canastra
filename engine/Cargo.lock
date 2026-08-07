@@ -29,7 +29,9 @@ dependencies = [
 name = "canastra-wasm"
 version = "0.1.0"
 dependencies = [
+ "canastra-encode",
  "canastra-engine",
+ "serde",
  "serde-wasm-bindgen",
  "serde_json",
  "wasm-bindgen",
