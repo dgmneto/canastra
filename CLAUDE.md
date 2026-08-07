@@ -75,7 +75,7 @@ cargo build -p canastra-wasm --target wasm32-unknown-unknown
 ```
 
 The JS projects form an npm workspace rooted at the repo root, so install once there. TypeScript for
-all three projects (bots, harness, web) is checked with one command:
+all five projects (bots, protocol, harness, server, web) is checked with one command:
 
 ```bash
 npm install && npm run typecheck
@@ -140,12 +140,14 @@ The committed wasm lives in `web/src/engine/` (gitignored, rebuilt by `build:eng
 CLI drives it in Node by compiling the bytes into a `WebAssembly.Module`; the browser loads it by
 `fetch`. In both cases the same `Game` class runs the real engine — no reimplementation.
 
-`web/` is a Vite + React page that loads `canastra-wasm` directly in the browser and drives all four
-seats with bots. It is a **sandbox for watching the engine**, not the multiplayer app: it holds the
-whole `GameState` client-side and renders every hand face up. That is safe only because there is no
-opponent to hide anything from, and it is precisely what a networked client must not do — F6 in
-[ADVERSARIAL-REVIEW.md](ADVERSARIAL-REVIEW.md) states the obligations that reappear the moment a
-second person is involved. See [web/README.md](web/README.md).
+`web/` is two pages. The game client at `/` is thin by construction: it loads no wasm and holds no
+rules, rendering what `@canastra/server` sends and sending actions back — a browser never receives
+another seat's cards. `/sandbox.html` is the engine sandbox: it loads `canastra-wasm` in the browser
+and drives all four seats with bots, holding the whole `GameState` client-side and rendering every hand
+face up. That omniscience is safe only because it is local and single-player — there is no opponent to
+hide anything from, and it is precisely what a networked client must not do. F6 in
+[ADVERSARIAL-REVIEW.md](ADVERSARIAL-REVIEW.md) states the obligations the server discharges by
+construction for the game client. See [web/README.md](web/README.md).
 
 **The engine is a pure function.** `apply(&GameState, Seat, &Action) -> Result<GameState, RuleViolation>`
 never mutates its input. This is load-bearing, not stylistic: §6 requires a partnership's opening melds
