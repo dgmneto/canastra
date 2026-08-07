@@ -18,6 +18,11 @@
     "typecheck:web": "npm run typecheck --prefix web",
     "typecheck": "npm run typecheck:bots && npm run typecheck:protocol && npm run typecheck:harness && npm run typecheck:server && npm run typecheck:web",
     "harness": "tsx harness/src/cli.ts",
-    "smoke": "npm run smoke --prefix server"
+    "smoke": "npm run smoke --prefix server",
+    "dev": "concurrently -n server,web -c blue,green \"npm run dev --prefix server\" \"npm run dev --prefix web\"",
+    "start": "npm run build --prefix web && npm run start --prefix server"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.0"
   }
 }
