@@ -116,10 +116,12 @@ impl Pool {
         self.games.iter().any(Game::live)
     }
 
-    /// `(obs, acts, mask)` for every seat awaiting a decision: obs is
+    /// `(obs, acts, mask, rows)` for every seat awaiting a decision: obs is
     /// `[N, OBS_DIM] f32`, acts `[N, M, ACT_DIM] f32` zero-padded, mask
-    /// `[N, M] bool` marking the real columns. Menus are never truncated —
-    /// padding, never dropping, is how a turn-ending action can't get lost.
+    /// `[N, M] bool` marking the real columns, and rows `[N, 2] i64` carries
+    /// per-row `(game index, seat)` so callers can route picks to per-seat
+    /// policies. Menus are never truncated — padding, never dropping, is how
+    /// a turn-ending action can't get lost.
     #[allow(clippy::type_complexity)]
     fn encode<'py>(
         &mut self,
@@ -128,6 +130,7 @@ impl Pool {
         Bound<'py, PyArray2<f32>>,
         Bound<'py, PyArray3<f32>>,
         Bound<'py, PyArray2<bool>>,
+        Bound<'py, PyArray2<i64>>,
     )> {
         self.pending = (0..self.games.len())
             .filter(|&i| {
@@ -163,6 +166,7 @@ impl Pool {
         let obs = PyArray2::<f32>::zeros(py, [rows, OBS_DIM], false);
         let acts = PyArray3::<f32>::zeros(py, [rows, width, ACT_DIM], false);
         let mask = PyArray2::<bool>::zeros(py, [rows, width], false);
+        let grid = PyArray2::<i64>::zeros(py, [rows, 2], false);
 
         // Encode (views + features) in parallel into per-row scratch, then
         // copy into the numpy buffers — enumerate/apply dominate; the copy is
@@ -185,7 +189,11 @@ impl Pool {
             let mut obs_view = unsafe { obs.as_array_mut() };
             let mut acts_view = unsafe { acts.as_array_mut() };
             let mut mask_view = unsafe { mask.as_array_mut() };
+            let mut rows_view = unsafe { grid.as_array_mut() };
             for (row, (obs_row, act_rows)) in encoded.iter().enumerate() {
+                let game = self.pending[row];
+                rows_view[[row, 0]] = game as i64;
+                rows_view[[row, 1]] = self.games[game].state.turn.index() as i64;
                 obs_view
                     .row_mut(row)
                     .assign(&ndarray::ArrayView1::from(obs_row));
@@ -199,7 +207,7 @@ impl Pool {
             }
         }
 
-        Ok((obs, acts, mask))
+        Ok((obs, acts, mask, grid))
     }
 
     /// Play the picked menu index on every pending row.

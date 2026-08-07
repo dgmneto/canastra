@@ -17,7 +17,7 @@ def main() -> None:
     plies = 0
     start = time.perf_counter()
     while pool.has_live():
-        _, _, mask = pool.encode()
+        _, _, mask, _rows = pool.encode()
         pool.apply([int(rng.integers(0, int(menu.sum()))) for menu in mask])
         plies += 1
     elapsed = time.perf_counter() - start

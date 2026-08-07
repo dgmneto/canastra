@@ -9,11 +9,19 @@ def test_pool_plays_full_matches_to_completion() -> None:
     rng = np.random.default_rng(0)
     plies = 0
     while pool.has_live():
-        obs, acts, mask = pool.encode()
+        obs, acts, mask, rows = pool.encode()
         assert obs.shape == (mask.shape[0], OBS_DIM)
         assert acts.shape == (mask.shape[0], mask.shape[1], ACT_DIM)
         assert obs.dtype == np.float32
         assert mask.dtype == bool
+        assert rows.shape == (mask.shape[0], 2)
+        assert rows.dtype == np.int64
+        game_ids = set(rows[:, 0].tolist())
+        seat_ids = set(rows[:, 1].tolist())
+        assert game_ids <= set(range(4))
+        assert seat_ids <= set(range(4))
+        pairs = [tuple(row) for row in rows.tolist()]
+        assert len(set(pairs)) == len(pairs), "no (game, seat) pair repeats"
         picks = [int(rng.integers(0, int(menu.sum()))) for menu in mask]
         pool.apply(picks)
         plies += 1
@@ -31,7 +39,8 @@ def test_pool_caps_runaway_matches() -> None:
     rng = np.random.default_rng(1)
     plies = 0
     while pool.has_live():
-        _, _, mask = pool.encode()
+        _, _, mask, rows = pool.encode()
+        assert rows.shape[1] == 2
         pool.apply([int(rng.integers(0, int(menu.sum()))) for menu in mask])
         plies += 1
         assert plies < 1000, "the action cap should stop the match on its own"
@@ -60,7 +69,7 @@ def test_safe_mode_terminates_dead_ended_turns() -> None:
     pool = Pool([0], max_actions_per_game=100_000)
     plies = 0
     while pool.has_live():
-        _, _, _mask = pool.encode()
+        _, _, _mask, _rows = pool.encode()
         pool.apply([_greedy_pick(kinds) for kinds in pool.menu_kinds()])
         plies += 1
         assert plies < 50_000, "safe mode should terminate the dead-ended turn"
