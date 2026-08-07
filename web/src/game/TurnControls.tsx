@@ -114,7 +114,14 @@ export function TurnControls({
                 end without discarding
               </button>
             )}
-            <button onClick={() => { client.send({ type: "restartTurn" }); setSelected([]); }}>
+            <button
+              onClick={() => {
+                client.send({ type: "restartTurn" });
+                setSelected([]);
+                setPileMode(false);
+                setAddingToMeld(false);
+              }}
+            >
               restart turn
             </button>
           </>
