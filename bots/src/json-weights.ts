@@ -8,10 +8,10 @@
 
 import type { Action, PlayerView } from "./types";
 import type { Bot, BotContext } from "./bot";
-import { embed, scoreAction, validateWeights, type WeightsJson } from "./forward";
+import { compileWeights, embed, scoreAction, type WeightsJson } from "./forward";
 
 export function makeJsonWeightsBot(weights: WeightsJson, id: string): Bot {
-  validateWeights(weights);
+  const compiled = compileWeights(weights);
   return {
     id,
     name: `NN ${id}`,
@@ -25,13 +25,13 @@ export function makeJsonWeightsBot(weights: WeightsJson, id: string): Bot {
       if (encoded.actions.length !== legal.length) {
         throw new Error(`${id}: encoded rows (${encoded.actions.length}) != legal moves (${legal.length})`);
       }
-      if (encoded.obs.length !== weights.arch.obs) {
-        throw new Error(`${id}: observation width ${encoded.obs.length} != ${weights.arch.obs}`);
+      if (encoded.obs.length !== compiled.arch.obs) {
+        throw new Error(`${id}: observation width ${encoded.obs.length} != ${compiled.arch.obs}`);
       }
-      const emb = embed(weights, encoded.obs);
+      const emb = embed(compiled, encoded.obs);
       const scored = legal.map((action, index) => ({
         action,
-        score: scoreAction(weights, emb, encoded.actions[index]),
+        score: scoreAction(compiled, emb, encoded.actions[index]),
       }));
       scored.sort((a, b) => b.score - a.score);
       return scored.map((entry) => entry.action);

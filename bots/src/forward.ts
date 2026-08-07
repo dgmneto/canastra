@@ -18,7 +18,7 @@ export interface WeightsArch {
   act: number;
   trunk: number[];
   head: number[];
-  activation: "tanh";
+  activation: string;
 }
 
 export interface WeightsJson {
@@ -29,11 +29,22 @@ export interface WeightsJson {
 
 export const WEIGHTS_FORMAT = "canastra-weights@1";
 
-interface Layer {
+export interface Layer {
   weight: number[]; // row-major, shape [out][in]
   bias: number[];
   out: number;
   inn: number;
+}
+
+/**
+ * A weights file compiled once into its layer arrays, so the per-call shape
+ * validation in `validateWeights` runs a single time instead of on every
+ * action scored (~41 calls per ply per bot).
+ */
+export interface CompiledWeights {
+  arch: WeightsArch;
+  trunk: Layer[];
+  head: Layer[];
 }
 
 export function validateWeights(weights: WeightsJson): void {
@@ -43,8 +54,7 @@ export function validateWeights(weights: WeightsJson): void {
   if (weights.arch.activation !== "tanh") {
     throw new Error("only tanh weights are supported");
   }
-  const names = layerNames(weights.arch);
-  for (const name of names) {
+  for (const name of layerNames(weights.arch)) {
     for (const part of ["weight", "bias"]) {
       const key = `${name}.${part}`;
       if (!(key in weights.params)) throw new Error(`missing params: ${key}`);
@@ -72,6 +82,26 @@ function layer(weights: WeightsJson, name: string, expectedIn: number): Layer {
   return { weight: weight.data, bias: bias.data, out, inn };
 }
 
+/** Validate and precompile a weights file. Call once, then reuse the result. */
+export function compileWeights(weights: WeightsJson): CompiledWeights {
+  validateWeights(weights);
+  const { arch } = weights;
+  const trunk: Layer[] = [];
+  let inn = arch.obs;
+  for (const name of layerNames(arch).filter((n) => n.startsWith("trunk."))) {
+    trunk.push(layer(weights, name, inn));
+    inn = trunk[trunk.length - 1].out;
+  }
+  const head: Layer[] = [];
+  inn = trunk[trunk.length - 1].out + arch.act;
+  const headNames = layerNames(arch).filter((n) => n.startsWith("head."));
+  for (let i = 0; i < headNames.length; i += 1) {
+    head.push(layer(weights, headNames[i], inn));
+    inn = head[head.length - 1].out;
+  }
+  return { arch, trunk, head };
+}
+
 function apply(layer: Layer, input: number[]): number[] {
   const out = new Array<number>(layer.out);
   for (let o = 0; o < layer.out; o += 1) {
@@ -86,32 +116,21 @@ function apply(layer: Layer, input: number[]): number[] {
 const tanh = (xs: number[]) => xs.map(Math.tanh);
 
 /** The observation embedding (trunk, all-tanh). */
-export function embed(weights: WeightsJson, obs: number[]): number[] {
-  if (obs.length !== weights.arch.obs) {
-    throw new Error(`observation is ${obs.length} wide, weights expect ${weights.arch.obs}`);
+export function embed(cw: CompiledWeights, obs: number[]): number[] {
+  if (obs.length !== cw.arch.obs) {
+    throw new Error(`observation is ${obs.length} wide, weights expect ${cw.arch.obs}`);
   }
   let x = obs;
-  let inn = weights.arch.obs;
-  for (let i = 0; i < weights.arch.trunk.length; i += 1) {
-    const l = layer(weights, `trunk.${i}`, inn);
-    x = tanh(apply(l, x));
-    inn = l.out;
-  }
+  for (const l of cw.trunk) x = tanh(apply(l, x));
   return x;
 }
 
 /** One action's score: head over [embedding; features], final layer linear. */
-export function scoreAction(weights: WeightsJson, emb: number[], feats: number[]): number {
-  if (feats.length !== weights.arch.act) {
-    throw new Error(`action row is ${feats.length} wide, weights expect ${weights.arch.act}`);
+export function scoreAction(cw: CompiledWeights, emb: number[], feats: number[]): number {
+  if (feats.length !== cw.arch.act) {
+    throw new Error(`action row is ${feats.length} wide, weights expect ${cw.arch.act}`);
   }
   let x = [...emb, ...feats];
-  let inn = emb.length + weights.arch.act;
-  for (let i = 0; i < weights.arch.head.length; i += 1) {
-    const l = layer(weights, `head.${i}`, inn);
-    x = tanh(apply(l, x));
-    inn = l.out;
-  }
-  const out = layer(weights, "head.out", inn);
-  return apply(out, x)[0];
+  for (let i = 0; i < cw.head.length - 1; i += 1) x = tanh(apply(cw.head[i], x));
+  return apply(cw.head[cw.head.length - 1], x)[0];
 }
