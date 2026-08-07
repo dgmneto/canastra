@@ -6,8 +6,8 @@
 //! malformed one comes back as an error rather than undefined behaviour.
 
 use canastra_engine::{
-    Action, GameState, Phase, RuleViolation, Seat, Team, apply, new_game, observe, score_hand,
-    settle_hand,
+    Action, GameState, Phase, RuleViolation, Seat, Team, apply, enumerate, new_game, observe,
+    score_hand, settle_hand,
 };
 use wasm_bindgen::prelude::*;
 
@@ -58,6 +58,16 @@ impl Game {
     pub fn view(&self, seat: u8) -> Result<JsValue, JsValue> {
         let seat = Seat::new(seat).ok_or_else(|| message("seat must be 0, 1, 2 or 3"))?;
         serde_wasm_bindgen::to_value(&observe(&self.state, seat))
+            .map_err(|error| message(&error.to_string()))
+    }
+
+    /// F7: every action `seat` may legally take right now, one ply, in
+    /// deterministic order. Serializes as the same `{type: ...}` objects the
+    /// TS `Action` union already describes.
+    #[wasm_bindgen(js_name = legalActions)]
+    pub fn legal_actions(&self, seat: u8) -> Result<JsValue, JsValue> {
+        let seat = Seat::new(seat).ok_or_else(|| message("seat must be 0, 1, 2 or 3"))?;
+        serde_wasm_bindgen::to_value(&enumerate(&self.state, seat))
             .map_err(|error| message(&error.to_string()))
     }
 
