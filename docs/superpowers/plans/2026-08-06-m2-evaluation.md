@@ -40,15 +40,7 @@ Type the stub properly while touching it (final-M1-review note): `encode() -> tu
 
 - [ ] **Step 3: Update the tests**
 
-In `test_pool.py`, unpack 4-tuples everywhere. Add to the full-match test:
-
-```python
-        game_index, seat = rows[0]
-        assert 0 <= game_index < 4
-        assert 0 <= seat <= 4 % 4 or True  # placeholder — see below
-```
-
-Real assertions (write these, not the placeholder): every `rows[k]` has `0 <= game_index < 4` and `0 <= seat_index <= 3`; and across one encode call, no `(game_index, seat_index)` pair repeats. In the cap test, just unpack the 4-tuple.
+In `test_pool.py`, unpack 4-tuples everywhere. Add to the full-match test: for every row in `rows`, assert `0 <= game_index < 4` and `0 <= seat_index <= 3`; and across one encode call, assert no `(game_index, seat_index)` pair repeats. In the cap test, just unpack the 4-tuple.
 
 - [ ] **Step 4: Build + gates + commit**
 
@@ -333,6 +325,10 @@ Commit: "training: genomes, JSON weights format, and batched policy scoring".
 ### Task 3: The committed random-init fixture
 
 **Files:** `training/scripts/make_fixture.py`, `bots/src/fixtures/random-init.json` (generated), `bots/tsconfig.json`
+
+Note: the spec's layout sketch placed the fixture at `training/fixtures/`; it lives in `bots/src/fixtures/` instead because the TS registry must import it directly (Vite and tsx both resolve JSON imports from `bots/`). Deliberate deviation, same artifact.
+
+Layout note: the spec's Section A sketch put the fixture under `training/fixtures/`; it lives in `bots/src/fixtures/` instead, deliberately — the TS registry must `import` it (Vite and tsx both bundle JSON imports), and `bots/` is the package the harness and sandbox consume. The generator script still lives in `training/`.
 
 - [ ] **Step 1: The generator**
 
@@ -952,7 +948,7 @@ cargo fmt --check                                             # from engine/
 cargo build -p canastra-wasm --target wasm32-unknown-unknown  # from engine/
 npm run typecheck                                             # from worktree root
 npx canastra-harness --seed 7 random random-plus random random-plus | head -1
-cd training && .venv/bin/pytest -q && .venv/bin/ruff check . && .venv/bin/mypy python/canastra_train tests
+cd training && .venv/bin/maturin develop --release && .venv/bin/pytest -q && .venv/bin/ruff check . && .venv/bin/mypy python/canastra_train tests
 ```
 
 All green.
