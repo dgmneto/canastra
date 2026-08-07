@@ -45,11 +45,11 @@ export function Lobby({ client, state }: { client: GameClient; state: ClientStat
               <OccupantLabel occupant={occupant} />
               {seat === at ? (
                 <button onClick={() => client.send({ type: "stand" })}>stand</button>
-              ) : (
-                occupant.kind !== "human" && (
-                  <button onClick={() => client.send({ type: "sit", seat: at })}>sit</button>
-                )
-              )}
+              ) : occupant.kind !== "human" || !occupant.connected ? (
+                <button onClick={() => client.send({ type: "sit", seat: at })}>
+                  {occupant.kind === "human" ? "take over" : "sit"}
+                </button>
+              ) : null}
             </div>
           ))}
         </div>

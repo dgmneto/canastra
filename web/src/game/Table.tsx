@@ -106,9 +106,10 @@ export function Table({ client, state }: { client: GameClient; state: ClientStat
         {seat === null ? (
           <div className="spectate">
             {table.seats.map((occupant, at) =>
-              occupant.kind === "human" ? null : (
+              occupant.kind === "human" && occupant.connected ? null : (
                 <button key={at} onClick={() => client.send({ type: "sit", seat: at })}>
-                  take {SEAT_NAMES[at]}'s seat ({occupant.kind})
+                  take {SEAT_NAMES[at]}'s seat (
+                  {occupant.kind === "human" ? "away" : occupant.kind})
                 </button>
               ),
             )}

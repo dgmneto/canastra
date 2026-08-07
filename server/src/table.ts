@@ -211,6 +211,7 @@ export class Table {
       table: this.tableState(),
     });
     if (client.seat !== null) this.sendView(client.seat);
+    this.sendHandOverIfPaused(client.ws);
     this.broadcastTable();
   }
 
@@ -235,6 +236,7 @@ export class Table {
       table: this.tableState(),
     });
     if (this.match) this.sendView(seat);
+    this.sendHandOverIfPaused(client.ws);
     this.afterChange();
   }
 
@@ -291,7 +293,8 @@ export class Table {
     this.match = new Match(seed, lineup);
     this.rng = makeRng(Number(seed % 2147483647n) || 1);
     this.safeMode = false;
-    this.broadcast({ type: "event", text: `match started (seed ${seed})` });
+    console.log(`match started (seed ${seed})`);
+    this.broadcast({ type: "event", text: "match started" });
     this.afterChange();
   }
 
@@ -301,6 +304,11 @@ export class Table {
     }
     const refused = this.match.apply(client.seat, action);
     if (refused) return this.refuse(client, refused.error, JSON.stringify(refused));
+    // The same safeMode rule as the harness CLI: a completed turn clears it,
+    // so a bot's safe mode cannot leak across a human's completed turn.
+    if (action.type === "Discard" || action.type === "EndTurnWithoutDiscard") {
+      this.safeMode = false;
+    }
     this.broadcast({
       type: "event",
       text: label(action, client.seat, this.name(client.seat)),
@@ -438,6 +446,16 @@ export class Table {
     const occupant = this.seats[seat];
     if (!this.match || occupant.kind !== "human") return;
     this.send(occupant.ws, { type: "view", view: this.match.views()[seat] });
+  }
+
+  /**
+   * A handOver is broadcast once, when the hand ends. A player who reclaims or
+   * sits during the HandOver pause arrives with no panel — send it again.
+   */
+  private sendHandOverIfPaused(ws: WebSocket): void {
+    if (!this.match) return;
+    if (this.match.views()[0].phase !== "HandOver") return;
+    this.send(ws, { type: "handOver", scores: this.match.handScores() });
   }
 
   private occupantOf(seat: SeatState): SeatOccupant {
