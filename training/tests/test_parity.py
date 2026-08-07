@@ -5,10 +5,11 @@ bots/src/forward.ts) implement the same arch: trunk layers all tanh, head hidden
 layers all tanh, the final `head.out` layer linear. Parity has been verified by
 hand but never pinned; this test locks it so a drift on either side fails loudly.
 
-It builds ONE small deterministic weights file, then scores the same observation
-and action row through both implementations and asserts they agree. A constant
-obs/feat row avoids any rng dependence in the inputs; the weights themselves are
-the only random element, and their JSON is the same bytes fed to both sides.
+It builds ONE small deterministic weights file, writes it to JSON, and loads that
+SAME rounded file back into both implementations — the TS side reads it directly
+and the Python side reloads it via `genome.load_json` — then scores the same
+observation and action row through each and asserts they agree. A constant
+obs/feat row avoids any rng dependence in the inputs.
 """
 
 from __future__ import annotations
@@ -28,14 +29,15 @@ OBS_DIM: int = 2002
 ACT_DIM: int = 101
 
 _TS_SCRIPT = """\
-import {{ embed, scoreAction }} from {forward_import};
+import {{ compileWeights, embed, scoreAction }} from {forward_import};
 import {{ readFileSync }} from "node:fs";
 
 const weights = JSON.parse(readFileSync(process.argv[2], "utf8"));
+const cw = compileWeights(weights);
 const obs = new Array({obs}).fill({obs_val});
 const feats = new Array({act}).fill({act_val});
-const emb = embed(weights, obs);
-const score = scoreAction(weights, emb, feats);
+const emb = embed(cw, obs);
+const score = scoreAction(cw, emb, feats);
 console.log(score.toFixed(10));
 """
 
@@ -81,7 +83,10 @@ def test_python_ts_forward_pass_parity(tmp_path: Path) -> None:
     weights_path = tmp_path / "weights.json"
     genome.save_json(str(weights_path), ARCH, vec)
 
-    py_score = _py_score(vec)
+    # Both sides must consume the SAME rounded JSON bytes: reload the file
+    # here so the Python vector matches exactly what TypeScript reads.
+    _, loaded = genome.load_json(str(weights_path))
+    py_score = _py_score(loaded)
     ts_score = _ts_score(weights_path, tmp_path)
 
     print(f"\npy score = {py_score:.10f}")
