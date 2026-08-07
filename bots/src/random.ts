@@ -50,7 +50,9 @@ export const randomBot: Bot = {
           // What is already down counts. A partnership that is not open yet but
           // has melds on the table laid them earlier in *this* turn — that is
           // the only way to be in that position — so their value is this turn's
-          // progress, and `PlayerView` carries no `laid_value` to read instead.
+          // progress; `PlayerView` has carried `laid_value` since M1, but the
+          // estimate via the table predates the field and stays as the safe
+          // upper bound, so behaviour is deliberately unchanged.
           const playable = view.hand.filter((card) => !view.frozen.includes(card));
           const inHand = findMelds(playable).reduce((sum, meld) => sum + meldValue(meld), 0);
           const alreadyLaid = table.opened

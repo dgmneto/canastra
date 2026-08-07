@@ -42,6 +42,12 @@ pub struct PlayerView {
     /// §6: what this player's partnership needs to open, already resolved
     /// against their score so clients do not each re-derive it.
     pub opening_minimum: u32,
+    /// How much the current turn has laid so far, toward §6's minimum.
+    pub laid_value: u32,
+    /// §5: whether the current turn began by capturing the discard pile.
+    pub took_pile: bool,
+    /// §3: whether the current turn's player still holds the first-turn refusal.
+    pub refusal_available: bool,
     /// §3: the card the lead player has been shown and not yet kept or refused.
     /// Only ever populated for the player making that choice.
     pub pending_refusal: Option<Card>,
@@ -72,6 +78,12 @@ pub fn observe(state: &GameState, seat: Seat) -> PlayerView {
         hand_number: state.hand_number,
         went_out: state.went_out,
         opening_minimum: state.opening_minimum_for(seat.team()),
+        // Unlike the frozen set and the pending card, these describe the turn
+        // in progress, which is public at a real table: everyone watches the
+        // acting player lay melds and take the pile. Populated for every seat.
+        laid_value: state.turn_context.laid_value,
+        took_pile: state.turn_context.took_pile,
+        refusal_available: state.turn_context.refusal_available,
         pending_refusal: if is_current {
             state.turn_context.pending_refusal
         } else {
@@ -169,6 +181,23 @@ mod tests {
         let state = Rig::new().scores(0, 2500).build();
         assert_eq!(observe(&state, seat(0)).opening_minimum, 75);
         assert_eq!(observe(&state, seat(1)).opening_minimum, 120);
+    }
+
+    /// The current turn's progress is public at a real table — everyone
+    /// watches the acting player lay melds and take the pile — so the view
+    /// publishes it to every seat, not just the one taking the turn.
+    #[test]
+    fn the_view_carries_the_current_turns_public_progress() {
+        let state = Rig::new()
+            .hand(1, "6H 7H 8H 9H")
+            .frozen("9H")
+            .laid_value(45)
+            .refusal_available()
+            .build();
+        let view = observe(&state, seat(2));
+        assert_eq!(view.laid_value, 45);
+        assert!(view.took_pile);
+        assert!(view.refusal_available);
     }
 
     #[test]

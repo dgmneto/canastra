@@ -64,6 +64,9 @@ export interface PlayerView {
   hand_number: number;
   went_out: Seat | null;
   opening_minimum: number;
+  laid_value: number;
+  took_pile: boolean;
+  refusal_available: boolean;
   pending_refusal: Card | null;
 }
 

@@ -109,6 +109,12 @@ impl Rig {
         self
     }
 
+    /// §6: value already laid this turn (for opening-minimum positions).
+    pub fn laid_value(mut self, value: u32) -> Rig {
+        self.state.turn_context.laid_value = value;
+        self
+    }
+
     /// §3: the card the lead player is currently deciding whether to keep.
     pub fn pending_refusal(mut self, spec: &str) -> Rig {
         self.state.turn_context.pending_refusal = Some(card(spec));
