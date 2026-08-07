@@ -63,7 +63,7 @@ export function Table({ client, state }: { client: GameClient; state: ClientStat
         </div>
       )}
 
-      <main>
+      <main className="table-grid">
         <div className="middle">
           <div className="pile">
             <h2>discard ({view?.discard.length ?? 0})</h2>

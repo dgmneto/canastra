@@ -308,5 +308,6 @@ h2 {
 .dim { opacity: 0.55; }
 
 .panel { border: 1px solid #557; border-radius: 8px; padding: 0.75rem 1rem; margin: 0.5rem 1rem; }
+.table-grid { grid-template-columns: 1fr 300px; }
 .refusal-banner { background: #5c2e2e; color: #fdd; padding: 0.4rem 1rem; }
 .spectate { display: flex; gap: 0.5rem; padding: 1rem; }
