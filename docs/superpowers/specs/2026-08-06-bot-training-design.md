@@ -326,10 +326,23 @@ can use it without a training run. Harness CLI changes: none.
 
 Sanity gates that must pass before M3 starts:
 
-- random genome vs random genome over 1k paired seeds: differential ≈ 0
-  within CI.
+- **Self-null**: `evaluate_pair(vec, vec, ...)` reads ≈ 0 (|mean| ≤ 95% CI).
+  Duplicate deals cancel the shuffle; identical policies cancel everything
+  else. Any nonzero reading is routing/pairing bias.
+- **Antisymmetry**: `evaluate_pair(a, b)` and `evaluate_pair(b, a)` flip sign
+  (|d_ab + d_ba| ≤ ci_ab + ci_ba). Any same-sign reading is slot bias.
 - `nn-random` plays full legal matches through the harness with zero
   restarts beyond the residual-strand fallback.
+
+Note on why the gate changed: the original premise ("random genome vs random
+genome over 1k paired seeds ⇒ differential ≈ 0") was FALSE — random init does
+not imply equal strength, because argmax over a random-init network is a
+specific deterministic policy and two such policies can genuinely differ in
+strength. M2 measured it: seeds 101 vs 202 read +1828 ± 287 head-to-head,
+flipped to −1938 ± 291 under swap, and collapsed to +48 ± 150 self-vs-self.
+The evaluator was fair; the sanity gate's premise was wrong. The gate now
+tests the evaluator's structural properties instead of asserting genome
+symmetry.
 
 ## Section I — milestones and gates
 
