@@ -190,7 +190,7 @@ mod tests {
     fn the_view_carries_the_current_turns_public_progress() {
         let state = Rig::new()
             .hand(1, "6H 7H 8H 9H")
-            .frozen("9H")
+            .took_pile()
             .laid_value(45)
             .refusal_available()
             .build();

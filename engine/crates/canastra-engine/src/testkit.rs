@@ -60,6 +60,12 @@ impl Rig {
         self
     }
 
+    /// §5: mark the turn as having begun with a pile capture.
+    pub fn took_pile(mut self) -> Rig {
+        self.state.turn_context.took_pile = true;
+        self
+    }
+
     /// §11.1: record that this seat went out.
     pub fn went_out(mut self, seat: usize) -> Rig {
         self.state.went_out = Some(Seat::new(seat as u8).expect("valid seat"));
