@@ -32,6 +32,7 @@
 import type { Action, Card, Meld, PlayerView } from "./types";
 import { cardValue } from "./types";
 import type { Bot, BotContext } from "./bot";
+import { ofType } from "./bot";
 import { findMelds, meldCards, meldValue } from "./melds";
 
 const SEQUENCE_RANKS = "456789TJQKA";
@@ -50,45 +51,43 @@ export const randomPlusBot: Bot = {
   name: "Random Plus",
   blurb: "Hoards 2s for clean canastras, deepens melds, discards dead cards.",
 
-  candidates(view, context: BotContext): Action[] {
+  candidates(view, legal, context: BotContext): Action[] {
     switch (view.phase) {
       case "AwaitingRefusalChoice": {
         // §3: one refusal per hand. Spend it on a card with no future.
         const card = view.pending_refusal;
         const dead = card !== null && !isWild(card) && usefulness(card, view) < 0;
-        return dead
-          ? [{ type: "RefuseDrawnCard" }, { type: "KeepDrawnCard" }]
-          : [{ type: "KeepDrawnCard" }];
+        const refuse = ofType(legal, "RefuseDrawnCard");
+        const keep = ofType(legal, "KeepDrawnCard");
+        return dead ? [...refuse, ...keep] : [...keep, ...refuse];
       }
 
       case "AwaitingDraw":
-        return [{ type: "Draw" }];
+        return [...ofType(legal, "Draw"), ...legal.filter((a) => a.type !== "Draw")];
 
       case "Melding": {
         const moves: Action[] = [];
         const table = view.tables[view.seat % 2];
-        const playable = view.hand.filter((card) => !view.frozen.includes(card));
 
         if (!context.safeMode) {
           if (table.opened) {
-            moves.push(...layOffs(playable, table.melds));
+            moves.push(...rankLayOffs(view, legal));
             // Clean melds only once open: there is no deadline any more, so a
             // 2 spent here buys nothing that waiting would not.
-            for (const cards of findMelds(playable.filter((card) => !isTwo(card)))) {
-              moves.push({ type: "LayMeld", cards });
-            }
+            moves.push(...ofType(legal, "LayMeld").filter((a) => !a.cards.some(isTwo)));
           } else {
-            moves.push(...opening(view, playable));
+            moves.push(...opening(view, legal));
           }
         }
 
-        moves.push(...discards(view, context));
-        moves.push({ type: "EndTurnWithoutDiscard" });
+        moves.push(...rankDiscards(view, legal, context));
+        moves.push(...ofType(legal, "EndTurnWithoutDiscard"));
+        for (const action of legal) if (!moves.includes(action)) moves.push(action);
         return moves;
       }
 
       default:
-        return [];
+        return [...legal];
     }
   },
 };
@@ -100,29 +99,30 @@ export const randomPlusBot: Bot = {
  * strictly better. Only when it is not does it spend them, because a
  * partnership that never opens scores nothing, and that dwarfs the tier.
  *
- * The reachability test mirrors Random's: the engine's eager check is
- * optimistic (it counts every remaining card at face value), so a bot that
- * trusts it can lay 45 toward 75 and then be unable to discard.
+ * The reachability test is unchanged: the engine's eager check is optimistic
+ * (it counts every remaining card at face value), so a bot that trusts it can
+ * lay 45 toward 75 and then be unable to discard.
  */
-function opening(view: PlayerView, playable: Card[]): Action[] {
+function opening(view: PlayerView, legal: Action[]): Action[] {
   const minimum = view.opening_minimum;
   // Melds already down while `opened` is false were laid earlier in this same
   // turn — the only way to be in that position — so they are progress.
   const table = view.tables[view.seat % 2];
+  const playable = view.hand.filter((card) => !view.frozen.includes(card));
   const laid = table.melds.reduce((sum, meld) => sum + meldValue(meldCards(meld)), 0);
 
-  const clean = findMelds(playable.filter((card) => !isTwo(card)));
-  if (laid + total(clean) >= minimum) {
-    return [...layOffs(playable, table.melds), ...clean.map(toLay)];
-  }
+  const lays = ofType(legal, "LayMeld");
+  const clean = lays.filter((a) => !a.cards.some(isTwo));
+  const cleanReachable =
+    laid + findMelds(playable.filter((card) => !isTwo(card))).reduce((s, m) => s + meldValue(m), 0) >=
+    minimum;
+  if (cleanReachable) return [...rankLayOffs(view, legal), ...clean];
 
-  const withTwos = findMelds(playable);
-  if (laid + total(withTwos) >= minimum) {
-    return [...layOffs(playable, table.melds), ...withTwos.map(toLay)];
-  }
+  const anyReachable = laid + findMelds(playable).reduce((s, m) => s + meldValue(m), 0) >= minimum;
+  if (anyReachable) return [...rankLayOffs(view, legal), ...lays];
 
   // Out of reach this turn either way. Laying anything now would only strand
-  // the turn, so hold everything and discard.
+  // the turn, so rank nothing and let the discard close it.
   return [];
 }
 
@@ -131,50 +131,39 @@ function opening(view: PlayerView, playable: Card[]): Action[] {
  *
  * Longest first is the whole point — the seventh card is worth 200 or 500, and
  * every card after that is worth its face value on a meld that already paid.
- * Cards that provably extend a meld are proposed before speculative ones, but
- * the speculative ones stay in the list because the engine is the real judge.
+ * A 2 is only ever added to a meld §10 has already spoiled.
  */
-function layOffs(playable: Card[], melds: Meld[]): Action[] {
-  const order = melds
-    .map((meld, index) => ({ meld, index }))
-    .sort((a, b) => meldCards(b.meld).length - meldCards(a.meld).length);
-
-  const moves: Action[] = [];
-  for (const { meld, index } of order) {
-    const dirty = meldCards(meld).some(isTwo);
-    // A 2 is only ever added to a meld §10 has already spoiled.
-    const usable = playable.filter((card) => !isTwo(card) || dirty);
-    const fits = usable.filter((card) => extendsMeld(card, meld));
-    const rest = usable.filter((card) => !extendsMeld(card, meld));
-    for (const card of [...fits, ...rest]) moves.push({ type: "AddToMeld", meld: index, cards: [card] });
-  }
-  return moves;
+function rankLayOffs(view: PlayerView, legal: Action[]): Action[] {
+  const table = view.tables[view.seat % 2];
+  return ofType(legal, "AddToMeld")
+    .filter((a) => !isTwo(a.cards[0]) || meldCards(table.melds[a.meld]).some(isTwo))
+    .sort(
+      (a, b) =>
+        meldCards(table.melds[b.meld]).length - meldCards(table.melds[a.meld]).length,
+    );
 }
 
 /**
  * §4.3: the compulsory discard, least useful card first.
- *
- * Every card is listed — the engine can refuse a discard (§11.1 stranding),
- * so the tail of this list is what keeps the turn finishable.
  */
-function discards(view: PlayerView, context: BotContext): Action[] {
+function rankDiscards(view: PlayerView, legal: Action[], context: BotContext): Action[] {
   const blocking = view.discard.length >= PILE_WORTH_BLOCKING;
 
-  const ranked = [...view.hand].sort((a, b) => {
+  const ranked = ofType(legal, "Discard").sort((a, b) => {
     // §5: a black 3 on top freezes the pile. Free to hold, so it is thrown
     // when there is something worth denying and kept when there is not.
-    const scoreA = isBlackThree(a) ? (blocking ? -100 : 40) : usefulness(a, view);
-    const scoreB = isBlackThree(b) ? (blocking ? -100 : 40) : usefulness(b, view);
+    const scoreA = isBlackThree(a.card) ? (blocking ? -100 : 40) : usefulness(a.card, view);
+    const scoreB = isBlackThree(b.card) ? (blocking ? -100 : 40) : usefulness(b.card, view);
     if (scoreA !== scoreB) return scoreA - scoreB;
     // §13.2 charges for whatever is still in hand, so dump the dearer card.
-    return cardValue(b) - cardValue(a);
+    return cardValue(b.card) - cardValue(a.card);
   });
 
   // A little noise so two Random Plus seats do not play in lockstep.
   if (ranked.length > 2 && context.rng() < 0.15) {
     [ranked[0], ranked[1]] = [ranked[1], ranked[0]];
   }
-  return ranked.map((card) => ({ type: "Discard", card }) as Action);
+  return ranked;
 }
 
 /**
@@ -217,14 +206,6 @@ function extendsMeld(card: Card, meld: Meld): boolean {
   const high = Math.max(...effective);
   const rank = SEQUENCE_RANKS.indexOf(card[0]);
   return rank === low - 1 || rank === high + 1;
-}
-
-function toLay(cards: Card[]): Action {
-  return { type: "LayMeld", cards };
-}
-
-function total(melds: Card[][]): number {
-  return melds.reduce((sum, meld) => sum + meldValue(meld), 0);
 }
 
 function isTwo(card: Card): boolean {
