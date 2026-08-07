@@ -325,6 +325,7 @@ export class Table {
       return this.refuse(client, "NotYourTurn", "only the seat playing can restart its turn");
     }
     this.match.restartTurn(client.seat);
+    this.safeMode = true;
     this.broadcast({
       type: "event",
       text: label("restartTurn", client.seat, this.name(client.seat)),
