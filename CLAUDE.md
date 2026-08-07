@@ -7,11 +7,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Three planned components:
 
 1. **Rust engine/state machine** — implements Canastra game rules and turn logic. **Built**, in `engine/`.
-2. **Bot project** — trains/designs AI bots to play against. **Not started** as a training
-   harness, but `bots/` (`@canastra/bots`) is now its own npm package: it holds the toy policies
-   behind a `Bot` interface with a per-seat picker so they can play each other, plus the engine
-   wire types and seeded `rng`, and it is registered in the `BOTS` registry. Useful for eyeballing
-   behaviour; it is not a training harness and does not presume the shape the real project will take.
+2. **Bot project** — trains/designs AI bots to play against. **In progress.** `bots/`
+   (`@canastra/bots`) still holds the toy policies — now ranking the engine's legal list
+   (`candidates(view, legal, context)`, F7 closed) — behind a `Bot` interface with a per-seat
+   picker so they can play each other, plus the engine wire types and seeded `rng`, registered in
+   the `BOTS` registry. `training/` is the new training-harness scaffold: a PyO3 pool over the
+   engine (see Architecture). The encoder is single-sourced in
+   `engine/crates/canastra-encode`, which both the wasm bindings and the Python harness bind.
 3. **Web app** — lets people play Canastra against each other or against a bot. **Not started.**
    `web/` currently holds a single-page *engine sandbox*: no server, no networking, all four seats
    driven by bots and every hand face up. Real multiplayer is a different program that happens to
@@ -92,6 +94,16 @@ Lines on stdout:
 npx canastra-harness --seed 7 random random-plus random random-plus
 ```
 
+Python commands run from `training/` (a separate maturin project; the engine workspace gates above
+stay Python-free). The training gates:
+
+```bash
+cd training && .venv/bin/maturin develop && .venv/bin/pytest && .venv/bin/ruff check . && .venv/bin/mypy python/canastra_train tests
+```
+
+# `maturin develop` must be re-run after any change to `training/src/lib.rs`, or pytest and mypy
+# see a stale compiled extension.
+
 ## Architecture
 
 `engine/` is a self-contained Cargo workspace. `crates/canastra-engine` is the rules core and has no
@@ -102,7 +114,8 @@ The JavaScript side is an npm workspace rooted at the repo root, with three pack
 - **`bots/`** (`@canastra/bots`) — the bot policies plus the engine wire types (`PlayerView`,
   `Action`, …), seeded `rng`, and the `BOTS` registry. It is the leaf everything else depends on:
   it has no engine, no wasm, only opinions. Add a bot by writing `src/<name>.ts` and registering it
-  in `src/index.ts`.
+  in `src/index.ts`. Bots now rank the engine's legal list (`candidates(view, legal, context)`)
+  rather than guessing legality.
 - **`harness/`** (`@canastra/harness`) — the thing that actually *plays* a game: the `Match` wasm
   wrapper, the `step` driver, and `runMatch`/`series`. Its `canastra-harness` bin (see Commands) is
   the executable that runs a match from a seed + bot names to JSONL. Web and the CLI share this code.
@@ -120,6 +133,19 @@ whole `GameState` client-side and renders every hand face up. That is safe only 
 opponent to hide anything from, and it is precisely what a networked client must not do — F6 in
 [ADVERSARIAL-REVIEW.md](ADVERSARIAL-REVIEW.md) states the obligations that reappear the moment a
 second person is involved. See [web/README.md](web/README.md).
+
+`engine/crates/canastra-encode` is the **single source of truth for observation and action
+encodings**. `OBS_DIM` and `ACT_DIM` are pinned there, and `encode_observation` /
+`encode_actions` produce the fixed-length vectors both the wasm bindings (`canastra-wasm`) and the
+Python harness (`canastra_py`) consume. The layout can never drift between training and deployment
+because both sides bind the same Rust crate.
+
+`training/` is a separate maturin project (`canastra_py`), deliberately outside the engine Cargo
+workspace so the engine's gates stay Python-free and fast. Its `Pool` owns one engine per seed and
+drives batches with **one FFI crossing per ply** — Rust fills numpy buffers for observations,
+per-action features, and a legal mask, and consumes the picks back. Its safe-mode menus mirror the
+`canastra-harness` driver: a dead-ended turn is backed out to the turn's start and retried with
+melding and pile-taking withheld. See [training/README.md](training/README.md).
 
 **The engine is a pure function.** `apply(&GameState, Seat, &Action) -> Result<GameState, RuleViolation>`
 never mutates its input. This is load-bearing, not stylistic: §6 requires a partnership's opening melds
