@@ -26,15 +26,16 @@ From this directory, with a virtualenv:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install -e ".[dev]"        # installs numpy + maturin, pytest, ruff, mypy
-.venv/bin/maturin develop                # rebuild the Rust extension into the venv
-.venv/bin/pytest                         # run the tests
-.venv/bin/ruff check .                   # lint
-.venv/bin/mypy python/canastra_train tests   # type check
+.venv/bin/pip install -e ".[dev]"          # installs numpy + maturin, pytest, ruff, mypy
+.venv/bin/maturin develop --release        # rebuild the Rust extension into the venv
+.venv/bin/pytest                           # run the tests
+.venv/bin/ruff check .                     # lint
+.venv/bin/mypy python/canastra_train tests # type check
 ```
 
-Re-run `maturin develop` after any change to `src/lib.rs`; the Python gates only see the
-rebuilt extension.
+Use a **release build** (`maturin develop --release`, ~10–50× faster). A debug build is only
+good for hunting a Rust panic; the benchmark and the test suite are meaningless on it. Re-run
+`maturin develop --release` after any change to `src/lib.rs`.
 
 ## Benchmark
 
@@ -45,8 +46,13 @@ this number is the one to watch when touching the pool or the encoder:
 .venv/bin/python -m canastra_train.bench
 ```
 
-Measured on this machine (a random legal policy over a 64-game pool):
-**79,280 plies in 794.18s ≈ 100 plies/s.**
+Measured on this machine on a **release build** (a random legal policy over a 64-game pool):
+**79,280 plies in 220.20s ≈ 360 plies/s.** Here "plies" counts batch rounds — one `encode`
++ `apply` across every live game — not individual game-steps. The pool sustains roughly an
+order of magnitude more real game-steps per second (~9k actions/s at full depth); the rounds
+figure is dominated by the tail, where a few long matches straggle with little parallelism.
+This is expected for uniform-random play, and the action cap (`Pool(seeds, max_actions_per_game)`)
+is what keeps a non-converging match from hanging a generation.
 
 ## Coming later
 

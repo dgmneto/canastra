@@ -13,8 +13,9 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
 
-/// A match that ran to §14.
-type MatchResult = (u64, [i32; 2], Option<u8>, u32);
+/// A match that ended: either reached §14, or was cut short by the action cap
+/// and left `unfinished`.
+type MatchResult = (u64, [i32; 2], Option<u8>, u32, bool);
 
 struct Game {
     state: GameState,
@@ -24,6 +25,8 @@ struct Game {
     safe: bool,
     seed: u64,
     hands: u32,
+    /// How many actions this match has played (one per `Pool::apply` row).
+    actions_played: u64,
     result: Option<MatchResult>,
 }
 
@@ -36,6 +39,7 @@ impl Game {
             safe: false,
             seed,
             hands: 1,
+            actions_played: 0,
             result: None,
         }
     }
@@ -74,16 +78,20 @@ struct Pool {
     /// The rows `encode` last handed out: which game, and its menu.
     pending: Vec<usize>,
     menus: Vec<Vec<Action>>,
+    /// Per-game action ceiling; a live match that reaches it ends unfinished.
+    max_actions_per_game: Option<u64>,
 }
 
 #[pymethods]
 impl Pool {
     #[new]
-    fn new(seeds: Vec<u64>) -> Pool {
+    #[pyo3(signature = (seeds, max_actions_per_game=None))]
+    fn new(seeds: Vec<u64>, max_actions_per_game: Option<u64>) -> Pool {
         Pool {
             games: seeds.into_iter().map(Game::new).collect(),
             pending: Vec::new(),
             menus: Vec::new(),
+            max_actions_per_game,
         }
     }
 
@@ -211,16 +219,28 @@ impl Pool {
                         game.state.scores,
                         game.state.winner().map(|team| team.index() as u8),
                         game.hands,
+                        false,
                     ));
                 } else {
                     game.hands += 1;
+                }
+            }
+            game.actions_played += 1;
+            // A live game that blows past its action ceiling is ended as
+            // unfinished rather than left to straggle — one pathological
+            // genome pair must not hang a generation.
+            if game.result.is_none() {
+                if let Some(cap) = self.max_actions_per_game {
+                    if game.actions_played >= cap {
+                        game.result = Some((game.seed, game.state.scores, None, game.hands, true));
+                    }
                 }
             }
         }
         Ok(())
     }
 
-    /// The finished matches: `(seed, scores, winner, hands)` each.
+    /// The matches that ended: `(seed, scores, winner, hands, unfinished)`.
     fn results(&self) -> Vec<MatchResult> {
         self.games.iter().filter_map(|game| game.result).collect()
     }
