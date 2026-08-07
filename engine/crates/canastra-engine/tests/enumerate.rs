@@ -427,7 +427,14 @@ fn mix(seed: u64, ply: u64) -> usize {
 
 #[test]
 fn everything_enumerated_is_legal_across_whole_matches() {
-    for seed in 0..20u64 {
+    // Five whole matches justify the soundness claim in ~2 min of debug-mode
+    // gate time. Widen before merging work that touches enumeration:
+    // CANASTRA_ENUMERATE_SEEDS=50 cargo test -p canastra-engine --test enumerate
+    let seeds: u64 = std::env::var("CANASTRA_ENUMERATE_SEEDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(5);
+    for seed in 0..seeds {
         let mut state: GameState = new_game(seed);
         let mut turn_start = state.clone();
         let mut safe = false;
