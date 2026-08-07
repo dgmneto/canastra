@@ -101,7 +101,11 @@ async function main(): Promise<void> {
     if (view.phase === "MatchOver") break;
 
     const acting = view.turn as Seat;
-    const result = step(match, match.views()[acting], botById(lineup[acting]), { rng, safeMode });
+    const result = step(match, match.views()[acting], botById(lineup[acting]), {
+      rng,
+      safeMode,
+      encode: () => match.encodeState(acting),
+    });
     if (!result) break;
 
     if (result.action === "restartTurn") {

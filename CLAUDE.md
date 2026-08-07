@@ -7,13 +7,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Three planned components:
 
 1. **Rust engine/state machine** — implements Canastra game rules and turn logic. **Built**, in `engine/`.
-2. **Bot project** — trains/designs AI bots to play against. **In progress.** `bots/`
-   (`@canastra/bots`) still holds the toy policies — now ranking the engine's legal list
+2. **Bot project** — trains/designs AI bots to play against. **In progress.** M2 landed: the
+   weights-JSON format is pinned (`canastra-weights@1`), `JSONWeightsBot` plays trained weights in
+   the harness/sandbox via a lazy `BotContext.encode` hook, and duplicate-deal evaluation exists on
+   both sides (`training/python/canastra_train/sanity.py`, `harness/src/eval-nn.ts`). `bots/`
+   (`@canastra/bots`) also holds the toy policies — ranking the engine's legal list
    (`candidates(view, legal, context)`, F7 closed) — behind a `Bot` interface with a per-seat
    picker so they can play each other, plus the engine wire types and seeded `rng`, registered in
-   the `BOTS` registry. `training/` is the new training-harness scaffold: a PyO3 pool over the
-   engine (see Architecture). The encoder is single-sourced in
-   `engine/crates/canastra-encode`, which both the wasm bindings and the Python harness bind.
+   the `BOTS` registry. `training/` is the training harness: a PyO3 pool over the engine (see
+   Architecture). The encoder is single-sourced in `engine/crates/canastra-encode`, which both the
+   wasm bindings and the Python harness bind.
 3. **Web app** — lets people play Canastra against each other or against a bot. **Not started.**
    `web/` currently holds a single-page *engine sandbox*: no server, no networking, all four seats
    driven by bots and every hand face up. Real multiplayer is a different program that happens to
@@ -94,6 +97,12 @@ Lines on stdout:
 npx canastra-harness --seed 7 random random-plus random random-plus
 ```
 
+Play a weights file against any registered heuristic bot (both seatings) on the TS side:
+
+```bash
+npx tsx harness/src/eval-nn.ts bots/src/fixtures/random-init.json random-plus 1
+```
+
 Python commands run from `training/` (a separate maturin project; the engine workspace gates above
 stay Python-free). The training gates:
 
@@ -115,7 +124,10 @@ The JavaScript side is an npm workspace rooted at the repo root, with three pack
   `Action`, …), seeded `rng`, and the `BOTS` registry. It is the leaf everything else depends on:
   it has no engine, no wasm, only opinions. Add a bot by writing `src/<name>.ts` and registering it
   in `src/index.ts`. Bots now rank the engine's legal list (`candidates(view, legal, context)`)
-  rather than guessing legality.
+  rather than guessing legality. The serialized weights (`WeightsJson`, format `canastra-weights@1`)
+  are plain JSON — a flat `obs`→`act` MLP with an `embed`/`scoreAction` split — compiled into a bot
+  by `makeJsonWeightsBot` through a lazy encode hook, so both the Node harness and the sandbox can
+  play a trained file without recompiling the engine.
 - **`harness/`** (`@canastra/harness`) — the thing that actually *plays* a game: the `Match` wasm
   wrapper, the `step` driver, and `runMatch`/`series`. Its `canastra-harness` bin (see Commands) is
   the executable that runs a match from a seed + bot names to JSONL. Web and the CLI share this code.
