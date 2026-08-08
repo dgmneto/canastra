@@ -67,15 +67,25 @@ canastra/  (worktree on branch `bot-training`)
 │   ├── README.md
 │   ├── python/canastra_train/
 │   │   ├── genome.py        flat parameter vector ↔ torch modules; JSON I/O
-│   │   ├── policy.py        torch module: trunk + scoring head, masked softmax
-│   │   ├── pool.py          wrapper over the PyO3 game pool
+│   │   ├── policy.py        batched masked scoring (torch)
 │   │   ├── evaluate.py      duplicate-deal eval runner
+│   │   ├── sanity.py        evaluator sanity gates (self-null, antisymmetry)
+│   │   ├── seedstream.py    deterministic per-generation seeds
 │   │   ├── ga.py            population, selection, mutation, checkpointing
-│   │   └── train.py         CLI entry point
-│   ├── tests/               pytest
-│   └── fixtures/            random-init weights JSON for smoke tests
-└── bots/src/json-weights.ts  NEW: JSONWeightsBot + TS forward pass (M2)
+│   │   ├── league.py        batched self-play driver for one generation
+│   │   ├── train.py         CLI entry point
+│   │   └── bench.py         plies-per-second benchmark
+│   ├── scripts/make_fixture.py  regenerates the random-init weights
+│   └── tests/               pytest
+├── bots/src/
+│   ├── forward.ts           NEW: generic weights-JSON forward pass (M2)
+│   ├── json-weights.ts      NEW: JSONWeightsBot (M2)
+│   └── fixtures/random-init.json  committed seeded-random weights
+└── harness/src/eval-nn.ts   NEW: weights file vs registered bot (M2)
 ```
+
+Note: the random-init fixture lives in `bots/src/fixtures/` (not `training/`)
+because the TS registry imports it directly to register the `nn-random` bot.
 
 `canastra-encode` joins the engine Cargo workspace (pure Rust, no heavy deps,
 covered by the workspace gates). `training/` is a **separate** maturin project
