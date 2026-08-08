@@ -603,7 +603,10 @@ def run(
     cap: int = 200_000,
     run_seed: int = 7,
     sigma: float = 0.02,
+    sigma_decay: float = 0.995,
+    sigma_floor: float = 0.002,
     hof_interval: int = 5,
+    crossover: bool = False,
     device: str = "cpu",
     resume: bool = False,
 ) -> None:
@@ -612,7 +615,10 @@ def run(
         elites=elites,
         tournament=tournament,
         sigma=sigma,
+        sigma_decay=sigma_decay,
+        sigma_floor=sigma_floor,
         hof_interval=hof_interval,
+        crossover=crossover,
     )
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -690,7 +696,10 @@ def main() -> None:
     parser.add_argument("--cap", type=int, default=200_000)
     parser.add_argument("--run-seed", type=int, default=7)
     parser.add_argument("--sigma", type=float, default=0.02)
+    parser.add_argument("--sigma-decay", type=float, default=0.995)
+    parser.add_argument("--sigma-floor", type=float, default=0.002)
     parser.add_argument("--hof-interval", type=int, default=5)
+    parser.add_argument("--crossover", action="store_true", help="flag exists per spec; unused until crossover lands")
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda", "mps"])
     args = parser.parse_args()
 
@@ -707,7 +716,10 @@ def main() -> None:
         cap=args.cap,
         run_seed=args.run_seed,
         sigma=args.sigma,
+        sigma_decay=args.sigma_decay,
+        sigma_floor=args.sigma_floor,
         hof_interval=args.hof_interval,
+        crossover=args.crossover,
         device=args.device,
         resume=args.resume,
     )
