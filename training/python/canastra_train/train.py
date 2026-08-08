@@ -61,6 +61,15 @@ def run(
     )
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
+    if not resume and (
+        (run_dir / "generations.jsonl").exists()
+        or list(run_dir.glob("gen-*.npz"))
+    ):
+        raise RuntimeError(
+            f"{run_dir} already contains training artifacts (generations.jsonl or gen-*.npz); "
+            "refusing a fresh start that would append duplicate records. "
+            "Use --resume to continue the run, or pick a new --run-dir (or delete it)."
+        )
     (run_dir / "config.json").write_text(
         json.dumps({"arch": arch, "ga": asdict(cfg), "run_seed": run_seed,
                     "seeds": seeds, "cap": cap, "device": device}, indent=2)
@@ -70,7 +79,10 @@ def run(
         state = ga.load_checkpoint(run_dir)
         pop, hof = state["pop"], state["hof"]
         start = state["generation"] + 1
-        best_ever = float(state["fitness"].max())
+        best_ever = max(
+            float(state["fitness"].max()),
+            max(hof.fitnesses) if len(hof) else float(state["fitness"].max()),
+        )
     else:
         pop = ga.initial_population(arch, cfg, run_seed)
         hof = ga.HallOfFame()
@@ -113,10 +125,13 @@ def run(
             )
         if generation % cfg.hof_interval == 0:
             hof.archive(pop[champion], fitness=float(fitness[champion]), generation=generation)
-        if generation % 5 == 0 or generation == generations - 1 or improved:
-            ga.save_checkpoint(run_dir, generation, pop, fitness, hof, gen_seeds)
 
         pop = ga.next_generation(pop, fitness, cfg, generation, gen_rng)
+        # Checkpoint the EVOLVED population (what generation+1 evaluates) so a
+        # resumed run starts from the exact hand-off — bit identical. The saved
+        # fitness pairs with the population that was evaluated this generation.
+        if generation % 5 == 0 or generation == generations - 1 or improved:
+            ga.save_checkpoint(run_dir, generation, pop, fitness, hof, gen_seeds)
         print(
             f"gen {generation}: best {fitness[champion]:+.1f} "
             f"mean {fitness.mean():+.1f} sigma {record['sigma']:.4f} "

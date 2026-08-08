@@ -56,3 +56,40 @@ def test_resume_continues_from_the_checkpoint(tmp_path: Path) -> None:
     run_once(2, resume=True)
     lines = (tmp_path / "generations.jsonl").read_text().strip().splitlines()
     assert [json.loads(line)["generation"] for line in lines] == [0, 1]
+
+
+def test_resume_is_bit_identical_to_an_uninterrupted_run(tmp_path: Path) -> None:
+    def run_into(directory: Path, generations: int, resume: bool = False) -> None:
+        train.run(
+            arch=ARCH,
+            run_dir=directory,
+            generations=generations,
+            population=4,
+            elites=1,
+            tournament=2,
+            opponents=1,
+            seeds=1,
+            cap=6000,
+            run_seed=9,
+            hof_interval=1,
+            resume=resume,
+        )
+
+    continuous = tmp_path / "continuous"
+    resumed = tmp_path / "resumed"
+    run_into(continuous, generations=2)
+    run_into(resumed, generations=1)
+    run_into(resumed, generations=2, resume=True)
+
+    def record(directory: Path, generation: int) -> dict[str, object]:
+        for line in (directory / "generations.jsonl").read_text().strip().splitlines():
+            entry: dict[str, object] = json.loads(line)
+            if entry["generation"] == generation:
+                return entry
+        raise AssertionError(f"no generation {generation} record in {directory}")
+
+    keys = ("fitness_mean", "fitness_best", "champion", "seeds")
+    cont = record(continuous, 1)
+    res = record(resumed, 1)
+    for key in keys:
+        assert cont[key] == res[key], f"resumed generation-1 {key} diverges: {cont[key]} != {res[key]}"

@@ -34,7 +34,10 @@ def schedule_pairings(
         others = [i for i in range(pop_size) if i != me]
         chosen = list(rng.choice(others, size=min(opponents, len(others)), replace=False))
         if len(hof) and opponents >= 1:
-            chosen[-1] = pop_size + int(rng.integers(0, len(hof)))
+            if not chosen:
+                chosen.append(pop_size + int(rng.integers(0, len(hof))))
+            else:
+                chosen[-1] = pop_size + int(rng.integers(0, len(hof)))
         pairings.extend((me, int(opp)) for opp in chosen)
     return pairings
 
