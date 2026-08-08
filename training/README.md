@@ -98,6 +98,78 @@ Two behaviours worth holding in mind until training lands:
   typically runs to the action cap and reports `unfinished:true`. That is expected before
   training pulls the policies away from uniform-random play, not a bug.
 
+## Training
+
+The real GA trainer is a pure-Python loop that ships an evolution over the
+`canastra_py` pool; the forward pass and the search live in CPython/torch, only
+the game itself lives in Rust. Run it from this directory:
+
+```bash
+.venv/bin/python -m canastra_train.train --generations N --run-dir runs/<run>
+```
+
+Flags:
+
+- `--generations` (required) — how many generations to run (or, with
+  `--resume`, how many total to have run).
+- `--population` (default 96), `--elites` (8), `--tournament` (4) — the GA shape.
+- `--opponents` (4) — how many opponents each genome faces per generation.
+- `--seeds` (8) — deals per opponent pairing in the self-play league.
+- `--cap` (200_000) — actions per game; a non-converging match hangs a
+  generation otherwise.
+- `--run-seed` (7) — derives every seed stream and every mutation draw, so a
+  run is reproducible.
+- `--sigma` (0.02), `--sigma-decay` (0.995), `--sigma-floor` (0.002) — Gaussian
+  mutation scale and its decay across generations.
+- `--hof-interval` (5) — how often the current champion is archived to the hall
+  of fame and exported.
+- `--crossover` — accepted but unused (the flag exists per spec; nothing
+  implements crossover yet).
+- `--device` (`cpu`|`cuda`|`mps`) — where the torch forward pass runs.
+- `--run-dir` — output directory (default `runs/<timestamp>`).
+- `--resume` — continue from the latest checkpoint in `--run-dir`.
+
+One generation does three things:
+
+1. **Batched self-play league.** The population is paired against itself (and a
+   sample of hall-of-fame champions, so an evolved policy cannot cycle against a
+   single fixed target) and played out on the `Pool` with this generation's
+   deterministic deal seeds.
+2. **Duplicate-deal differentials.** Each pairing is scored by the paired
+   evaluator — both seatings on the same deal, so the deal cancels and what
+   remains is policy (`evaluate_pair`).
+3. **Elitism + tournaments + Gaussian mutation.** The `--elites` fittest survive
+   unchanged; the rest of the next population is tournament-selected parents
+   perturbed by `--sigma` noise.
+
+Checkpoints (`gen-*.npz` under `--run-dir`) store the population, fitness, hall
+of fame and the generation's deal seeds. Every source of randomness derives from
+`--run-seed` and the generation number (seed streams, mutation draws), so
+`--resume` replays a run **bit-identically** from its latest checkpoint — no RNG
+state is stored, because none needs to be. Champion weights export as plain JSON
+(`champion-gen*.json`, `champion-final.json`) in the `canastra-weights@1` format,
+playable directly through the TS evaluator:
+
+```bash
+npx tsx harness/src/eval-nn.ts runs/<run>/champion-final.json random 1   # from repo root
+```
+
+### Success gate
+
+The training-machine gate for M3, measured *after* the run with the M2 tools:
+
+```bash
+.venv/bin/python -m canastra_train.train --generations 200          # or as needed
+npx tsx harness/src/eval-nn.ts runs/<run>/champion-final.json random 1000
+npx tsx harness/src/eval-nn.ts runs/<run>/champion-final.json random-plus 1000
+```
+
+The champion must beat `random` decisively; against `random-plus`, the mean
+differential must be ≥ 0 within CI (~10k hands ≈ 1000 matches). Note honestly:
+on an ordinary laptop this smoke run only proves the loop end to end — the gate
+belongs to the training machine, where a handful of shallow generations is
+nowhere near enough to pull a policy off uniform-random play.
+
 ## Coming later
 
 CUDA support is a configuration flag for a later milestone — `torch` arrives in M2, and

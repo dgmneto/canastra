@@ -53,12 +53,12 @@ def next_generation(
     order = np.argsort(fitness)[::-1]
     elites = pop[order[: cfg.elites]]
     sigma = sigma_for(cfg, generation)
-    children = []
+    children = np.empty((0, pop.shape[1]), dtype=np.float32)
     for _ in range(cfg.population - cfg.elites):
         parent = pop[_tournament(fitness, cfg.tournament, rng)]
         child = parent + rng.normal(0.0, sigma, size=parent.shape).astype(np.float32)
-        children.append(child)
-    return np.vstack([elites, np.asarray(children)])
+        children = np.vstack([children, child[None, :]])
+    return np.vstack([elites, children])
 
 
 class HallOfFame:
