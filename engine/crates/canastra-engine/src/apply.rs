@@ -931,6 +931,27 @@ mod tests {
         );
     }
 
+    /// §6.1: a partnership that failed one opening faces the raised bar — the
+    /// 85 that would open for anyone else no longer does.
+    #[test]
+    fn a_penalized_partnership_opens_against_the_raised_bar() {
+        let state = Rig::new()
+            .hand(1, "JOKER QS KS AS 4D 8C 2D")
+            .stock("9C 2C")
+            .penalized(1)
+            .phase(Phase::Melding)
+            .turn(1)
+            .build();
+        let laid = apply(&state, seat(1), &lay("JOKER QS KS AS")).unwrap();
+        assert_eq!(
+            apply(&laid, seat(1), &Action::Discard { card: card("4D") }),
+            Err(RuleViolation::OpeningMinimumNotMet {
+                laid: 85,
+                required: 120
+            })
+        );
+    }
+
     /// §6: "Depois de aberta, a dupla pode baixar livremente."
     #[test]
     fn an_open_partnership_may_lay_anything() {

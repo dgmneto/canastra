@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Match, loadEngine, logToText } from "../match";
-import { label, step } from "../driver";
+import { label, penaltyLabel, step } from "../driver";
 import { makeRng, type Rng } from "../rng";
 import { BOTS, DEFAULT_BOT, botById } from "@canastra/bots";
 import type { HandScore, PlayerView } from "../types";
@@ -108,7 +108,9 @@ export function App() {
     setEvents((previous) =>
       [
         {
-          text: label(result.action, acting, `${SEAT_NAMES[acting]} (${bot.name})`),
+          text:
+            label(result.action, acting, `${SEAT_NAMES[acting]} (${bot.name})`) +
+            (result.penalized ? penaltyLabel(after[acting]) : ""),
           refusals: result.refusals,
         },
         ...previous,

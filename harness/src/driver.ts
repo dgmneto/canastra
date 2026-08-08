@@ -15,6 +15,8 @@ export interface StepResult {
   action: Action | "restartTurn" | "settleHand";
   /** The rules that refused the candidates tried first, in order. */
   refusals: string[];
+  /** §6.1: set when a restartTurn was a failed opening and moved the bar. */
+  penalized?: boolean;
 }
 
 /**
@@ -43,8 +45,8 @@ export function step(match: Match, view: PlayerView, bot: Bot, context: BotConte
   // The bot ran out of ideas. §6's eager check makes this rare but not
   // impossible — that check is optimistic on purpose, so a turn can still
   // dead-end — and a bot may simply have proposed nothing legal.
-  match.restartTurn(seat);
-  return { action: "restartTurn", refusals };
+  const penalized = match.restartTurn(seat);
+  return { action: "restartTurn", refusals, penalized };
 }
 
 function describe(action: Action, error: string): string {
@@ -60,20 +62,43 @@ function describe(action: Action, error: string): string {
   }
 }
 
-/** A short human label for the move that was actually played. */
+/** A card the way it appears at the table: `"TS"` reads as `10♠`. */
+function fmt(card: string): string {
+  if (card === "JOKER") return "Coringa";
+  const suit: Record<string, string> = { C: "♣", D: "♦", H: "♥", S: "♠" };
+  const rank = card[0] === "T" ? "10" : card[0];
+  return `${rank}${suit[card[1]] ?? card[1]}`;
+}
+
+function fmtAll(cards: string[]): string {
+  return cards.map(fmt).join(" ");
+}
+
+/** §6.1: the feed note for a failed opening, naming the partnership's new bar. */
+export function penaltyLabel(view: PlayerView): string {
+  return ` — abertura mal-sucedida: o mínimo da dupla sobe para ${view.opening_minimum}`;
+}
+
+/** Um rótulo curto, em português, para a jogada que de fato aconteceu. */
 export function label(action: Action | "restartTurn" | "settleHand", seat: Seat, who: string): string {
-  if (action === "restartTurn") return `${who} (seat ${seat}) restarted the turn`;
-  if (action === "settleHand") return "hand settled";
+  if (action === "restartTurn") return `${who} (lugar ${seat}) recomeçou o turno`;
+  if (action === "settleHand") return "mão encerrada";
   switch (action.type) {
     case "LayMeld":
-      return `${who} laid ${action.cards.join(" ")}`;
+      return `${who} baixou ${fmtAll(action.cards)}`;
     case "AddToMeld":
-      return `${who} added ${action.cards.join(" ")} to meld #${action.meld}`;
+      return `${who} adicionou ${fmtAll(action.cards)} ao jogo #${action.meld}`;
     case "Discard":
-      return `${who} discarded ${action.card}`;
+      return `${who} descartou ${fmt(action.card)}`;
     case "TakeDiscardPile":
-      return `${who} took the pile with ${action.core.join(" ")}`;
-    default:
-      return `${who}: ${action.type}`;
+      return `${who} pegou o lixo com ${fmtAll(action.core)}`;
+    case "Draw":
+      return `${who} comprou do monte`;
+    case "KeepDrawnCard":
+      return `${who} ficou com a carta oferecida`;
+    case "RefuseDrawnCard":
+      return `${who} recusou a carta oferecida`;
+    case "EndTurnWithoutDiscard":
+      return `${who} encerrou sem descartar`;
   }
 }

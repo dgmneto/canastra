@@ -316,4 +316,45 @@ h2 {
 .controls .actions { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
 .card-button { background: none; border: 2px solid transparent; border-radius: 6px; padding: 2px; cursor: pointer; }
 .card-button.selected { border-color: #7c7; }
-.meld-picker { display: flex; gap: 0.5rem; }
+/* the card that just came off the stock */
+.card-button.new { border-color: #6fb8d3; }
+
+/* stock and discard cells (the top row of the table) */
+.top-row { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; }
+.cell {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.7rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+  font: inherit;
+  color: inherit;
+}
+.cell:hover:not(:disabled) { border-color: var(--accent); }
+.cell.armed { border-color: var(--accent); outline: 1px solid var(--accent); }
+.cell-title {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+.stock-card {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 34px;
+  min-height: 44px;
+  padding: 2px 4px;
+  background: #274354;
+  border: 1px solid #3b5b72;
+  border-radius: 4px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+/* a meld armed as a lay-off target */
+button.meld { font: inherit; color: inherit; text-align: left; width: 100%; border: none; cursor: pointer; }
+.meld.pickable:hover { outline: 2px solid var(--accent); }

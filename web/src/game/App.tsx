@@ -10,7 +10,7 @@ export function App() {
   const state = useSyncExternalStore(client.subscribe, client.getState);
 
   if (!state.connected || !state.table) {
-    return <div className="loading">connecting…</div>;
+    return <div className="loading">conectando…</div>;
   }
   if (state.table.phase === "lobby") {
     return <Lobby client={client} state={state} />;

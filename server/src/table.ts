@@ -12,7 +12,7 @@
 
 import { randomUUID } from "node:crypto";
 import type { WebSocket } from "ws";
-import { Match, label, step } from "@canastra/harness";
+import { Match, label, penaltyLabel, step } from "@canastra/harness";
 import type { LogLine } from "@canastra/harness";
 import { makeRng, botById } from "@canastra/bots";
 import type { Action, Rng, Seat } from "@canastra/bots";
@@ -223,7 +223,7 @@ export class Table {
     if (!client.name) client.name = "Jogador";
     const target = this.seats[seat];
     if (target.kind === "human") {
-      return this.refuse(client, "SeatTaken", `seat ${seat} is taken`);
+      return this.refuse(client, "SeatTaken", `o lugar ${seat} está ocupado`);
     }
     if (client.seat !== null) this.vacate(client); // stand from wherever we were
     this.seats[seat] = { kind: "human", name: client.name, token: client.token, ws: client.ws };
@@ -267,9 +267,9 @@ export class Table {
   // --- match ---
 
   private start(client: Client): void {
-    if (client.seat === null) return this.refuse(client, "NotSeated", "sit first");
+    if (client.seat === null) return this.refuse(client, "NotSeated", "sente-se primeiro");
     if (this.match && this.match.views()[0].phase !== "MatchOver") {
-      return this.refuse(client, "MatchRunning", "a match is already in progress");
+      return this.refuse(client, "MatchRunning", "já há uma partida em andamento");
     }
     if (this.settleTimer) {
       clearTimeout(this.settleTimer);
@@ -294,13 +294,13 @@ export class Table {
     this.rng = makeRng(Number(seed % 2147483647n) || 1);
     this.safeMode = false;
     console.log(`match started (seed ${seed})`);
-    this.broadcast({ type: "event", text: "match started" });
+    this.broadcast({ type: "event", text: "partida iniciada" });
     this.afterChange();
   }
 
   private act(client: Client, action: Action): void {
     if (client.seat === null || !this.match) {
-      return this.refuse(client, "NotSeated", "you are not at the table");
+      return this.refuse(client, "NotSeated", "você não está à mesa");
     }
     const refused = this.match.apply(client.seat, action);
     if (refused) return this.refuse(client, refused.error, JSON.stringify(refused));
@@ -318,23 +318,25 @@ export class Table {
 
   private restart(client: Client): void {
     if (client.seat === null || !this.match) {
-      return this.refuse(client, "NotSeated", "you are not at the table");
+      return this.refuse(client, "NotSeated", "você não está à mesa");
     }
     const view = this.match.views()[0];
     if (view.turn !== client.seat) {
-      return this.refuse(client, "NotYourTurn", "only the seat playing can restart its turn");
+      return this.refuse(client, "NotYourTurn", "só quem está jogando pode recomeçar o turno");
     }
-    this.match.restartTurn(client.seat);
+    const penalized = this.match.restartTurn(client.seat);
     this.safeMode = true;
+    // §6.1: a failed opening steps the partnership's bar up one tier.
+    const penalty = penalized ? penaltyLabel(this.match.views()[client.seat]) : "";
     this.broadcast({
       type: "event",
-      text: label("restartTurn", client.seat, this.name(client.seat)),
+      text: label("restartTurn", client.seat, this.name(client.seat)) + penalty,
     });
     this.afterChange();
   }
 
   private settleMessage(client: Client): void {
-    if (client.seat === null) return this.refuse(client, "NotSeated", "spectators cannot settle");
+    if (client.seat === null) return this.refuse(client, "NotSeated", "espectadores não encerram a mão");
     this.settleNow();
   }
 
@@ -347,7 +349,7 @@ export class Table {
     }
     const refused = this.match.settleHand();
     if (refused) return;
-    this.broadcast({ type: "event", text: "hand settled" });
+    this.broadcast({ type: "event", text: "mão encerrada" });
     this.afterChange();
   }
 
@@ -387,7 +389,9 @@ export class Table {
         this.safeMode = false;
       this.broadcast({
         type: "event",
-        text: label(result.action, acting, this.name(acting)),
+        text:
+          label(result.action, acting, this.name(acting)) +
+          (result.penalized ? penaltyLabel(this.match.views()[acting]) : ""),
       });
       this.afterChange();
     }, this.options.botDelayMs ?? 500);
@@ -409,7 +413,7 @@ export class Table {
     if (this.matchEnded) return;
     this.matchEnded = true;
     const scores = this.match!.views()[0].scores;
-    this.broadcast({ type: "event", text: `match over — ${scores[0]} vs ${scores[1]}` });
+    this.broadcast({ type: "event", text: `fim de partida — ${scores[0]} a ${scores[1]}` });
     // The finished match stays on the table until someone presses start again.
   }
 

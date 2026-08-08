@@ -8,7 +8,7 @@
 
 export { Match, logToText } from "./match.js";
 export type { LogLine } from "./match.js";
-export { step, label } from "./driver.js";
+export { step, label, penaltyLabel } from "./driver.js";
 export type { StepResult } from "./driver.js";
 export { runMatch, series, headToHead } from "./series.js";
 export type { MatchResult, SeriesReport } from "./series.js";

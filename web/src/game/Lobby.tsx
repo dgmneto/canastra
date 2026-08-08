@@ -8,11 +8,11 @@ function OccupantLabel({ occupant }: { occupant: SeatOccupant }) {
     return (
       <span>
         {occupant.name}
-        {!occupant.connected && <em> (away — bot playing)</em>}
+        {!occupant.connected && <em> (ausente — bot jogando)</em>}
       </span>
     );
   if (occupant.kind === "bot") return <span>bot ({occupant.botId})</span>;
-  return <span className="dim">empty</span>;
+  return <span className="dim">vazio</span>;
 }
 
 export function Lobby({ client, state }: { client: GameClient; state: ClientState }) {
@@ -24,12 +24,12 @@ export function Lobby({ client, state }: { client: GameClient; state: ClientStat
     <div className="app">
       <header>
         <h1>Canastra</h1>
-        <span className="sub">mesa única — pick a seat, partnerships are 0+2 vs 1+3</span>
+        <span className="sub">mesa única — escolha um lugar; as duplas são 0+2 contra 1+3</span>
       </header>
 
       <section className="lobby">
         <label>
-          your name
+          seu nome
           <input
             defaultValue={client.name}
             size={12}
@@ -44,10 +44,10 @@ export function Lobby({ client, state }: { client: GameClient; state: ClientStat
               <span className="team">{at % 2 === 0 ? "nós (0+2)" : "eles (1+3)"}</span>
               <OccupantLabel occupant={occupant} />
               {seat === at ? (
-                <button onClick={() => client.send({ type: "stand" })}>stand</button>
+                <button onClick={() => client.send({ type: "stand" })}>levantar</button>
               ) : occupant.kind !== "human" || !occupant.connected ? (
                 <button onClick={() => client.send({ type: "sit", seat: at })}>
-                  {occupant.kind === "human" ? "take over" : "sit"}
+                  {occupant.kind === "human" ? "assumir" : "sentar"}
                 </button>
               ) : null}
             </div>
@@ -55,9 +55,9 @@ export function Lobby({ client, state }: { client: GameClient; state: ClientStat
         </div>
 
         <button disabled={!seated} onClick={() => client.send({ type: "start" })}>
-          start the match
+          começar a partida
         </button>
-        <p className="dim">Empty seats are played by bots. Anyone seated can start.</p>
+        <p className="dim">Lugares vazios são jogados por bots. Qualquer pessoa sentada pode começar.</p>
       </section>
     </div>
   );

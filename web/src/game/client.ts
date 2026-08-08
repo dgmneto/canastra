@@ -8,7 +8,7 @@
  */
 
 import type { ClientMessage, ServerMessage, TableState } from "@canastra/protocol";
-import type { HandScore, PlayerView, RuleViolation, Seat } from "@canastra/bots";
+import type { Card, HandScore, PlayerView, RuleViolation, Seat } from "@canastra/bots";
 
 const TOKEN_KEY = "canastra:token";
 const NAME_KEY = "canastra:name";
@@ -24,6 +24,8 @@ export interface ClientState {
   refusal: RuleViolation | null;
   /** §13 settlement, between HandOver and the settle. */
   handOver: [HandScore, HandScore] | null;
+  /** The card the last draw added to our hand, so the UI can highlight it. */
+  drawn: Card | null;
 }
 
 const INITIAL: ClientState = {
@@ -34,7 +36,20 @@ const INITIAL: ClientState = {
   events: [],
   refusal: null,
   handOver: null,
+  drawn: null,
 };
+
+/** The multiset `a − b`: what shows up in `a` beyond what `b` already held. */
+function multisetDiff(a: Card[], b: Card[]): Card[] {
+  const rest = [...b];
+  const extra: Card[] = [];
+  for (const card of a) {
+    const at = rest.indexOf(card);
+    if (at >= 0) rest.splice(at, 1);
+    else extra.push(card);
+  }
+  return extra;
+}
 
 export class GameClient {
   private state: ClientState = INITIAL;
@@ -98,7 +113,7 @@ export class GameClient {
         // session's private state must not linger.
         this.emit(
           message.seat === null
-            ? { connected: true, seat: null, table: message.table, view: null, handOver: null, refusal: null }
+            ? { connected: true, seat: null, table: message.table, view: null, handOver: null, refusal: null, drawn: null }
             : { connected: true, seat: message.seat, table: message.table }
         );
         break;
@@ -109,9 +124,23 @@ export class GameClient {
           handOver: message.table.phase === "HandOver" ? this.state.handOver : null,
         });
         break;
-      case "view":
-        this.emit({ view: message.view, refusal: null });
+      case "view": {
+        // Spot the card a draw just added, so the hand can highlight it. Only
+        // a draw adds exactly one card and removes none — a pile take adds many,
+        // a meld or a discard removes — so anything else clears the highlight.
+        const previous = this.state.view;
+        let drawn = this.state.drawn;
+        if (!previous || previous.seat !== message.view.seat) {
+          drawn = null;
+        } else {
+          const added = multisetDiff(message.view.hand, previous.hand);
+          const removed = multisetDiff(previous.hand, message.view.hand);
+          if (added.length === 1 && removed.length === 0) drawn = added[0];
+          else if (added.length + removed.length > 0) drawn = null;
+        }
+        this.emit({ view: message.view, refusal: null, drawn });
         break;
+      }
       case "event":
         this.emit({ events: [message.text, ...this.state.events].slice(0, 200) });
         break;

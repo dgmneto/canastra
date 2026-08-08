@@ -20,6 +20,9 @@ pub const OPENING_MINIMUM_LOW: u32 = 75;
 /// §6: opening minimum at or above [`OPENING_THRESHOLD`].
 pub const OPENING_MINIMUM_HIGH: u32 = 120;
 
+/// §6.1: the bar for a penalized partnership already on [`OPENING_MINIMUM_HIGH`].
+pub const OPENING_MINIMUM_PENALIZED: u32 = 240;
+
 /// §13.1: bonus for going out.
 pub const GOING_OUT_BONUS: i32 = 100;
 
@@ -188,6 +191,11 @@ pub struct GameState {
     /// §11.1: who went out, if anyone. `None` after a hand that ended because
     /// the stock ran dry (§11.2), where nobody collects the bonus.
     pub went_out: Option<Seat>,
+    /// §6.1: whether each partnership has already paid the failed-opening
+    /// penalty this hand. A latch, not a counter — a second failed opening in
+    /// the same hand changes nothing, and a fresh deal clears it.
+    #[serde(default)]
+    pub opening_penalty: [bool; 2],
     /// The match seed. Every hand's shuffle is derived from it, so a whole
     /// match replays from this one number plus its action log.
     pub seed: u64,
@@ -208,7 +216,32 @@ impl GameState {
 
     /// §6: what this partnership must lay in one turn to open.
     pub fn opening_minimum_for(&self, team: Team) -> u32 {
-        opening_minimum(self.score(team))
+        let base = opening_minimum(self.score(team));
+        if !self.opening_penalty[team.index()] {
+            return base;
+        }
+        // §6.1: a failed opening steps the bar up one tier — 75 becomes 120,
+        // and 120 becomes 240.
+        if base >= OPENING_MINIMUM_HIGH {
+            OPENING_MINIMUM_PENALIZED
+        } else {
+            OPENING_MINIMUM_HIGH
+        }
+    }
+
+    /// §6.1: abandoning the turn in progress right now counts as a failed
+    /// opening — the partnership has not opened and has already laid cards it
+    /// would be taking back.
+    pub fn restart_penalizes_opening(&self, seat: Seat) -> bool {
+        !self.table(seat.team()).opened && self.turn_context.laid_anything
+    }
+
+    /// §6.1: latch the one-time penalty. Returns whether the bar actually
+    /// moved — `false` when the partnership had already been penalized.
+    pub fn penalize_opening(&mut self, team: Team) -> bool {
+        let already = self.opening_penalty[team.index()];
+        self.opening_penalty[team.index()] = true;
+        !already
     }
 
     /// §14: the partnership that won, once the match is over.
@@ -353,6 +386,7 @@ impl GameState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::Rig;
 
     fn seat(index: u8) -> Seat {
         Seat::new(index).expect("valid seat")
@@ -407,5 +441,38 @@ mod tests {
     #[test]
     fn a_negative_score_keeps_the_lower_opening_minimum() {
         assert_eq!(opening_minimum(-300), 75);
+    }
+
+    /// §6.1: a failed opening steps the bar up one tier — 75 to 120, 120 to
+    /// 240 — and the latch means a second failure changes nothing.
+    #[test]
+    fn a_failed_opening_raises_the_bar_one_tier_only_once() {
+        let mut state = Rig::new().build();
+        let team = Team::ALL[0];
+
+        assert!(state.penalize_opening(team));
+        assert_eq!(state.opening_minimum_for(team), 120);
+        // The latch is already down: a second mistake is free.
+        assert!(!state.penalize_opening(team));
+        assert_eq!(state.opening_minimum_for(team), 120);
+
+        state.scores = [2500, 0];
+        assert_eq!(state.opening_minimum_for(team), 240);
+    }
+
+    /// §6.1: the penalty is for taking back cards an unopened partnership had
+    /// already laid — not for any restart, and not after opening.
+    #[test]
+    fn only_a_restart_with_cards_laid_before_opening_penalizes() {
+        let seat = seat(1);
+        let mut state = Rig::new().turn(1).build();
+        // Nothing laid yet: backing out of a turn costs nothing.
+        assert!(!state.restart_penalizes_opening(seat));
+
+        state.turn_context.laid_anything = true;
+        assert!(state.restart_penalizes_opening(seat));
+
+        state.tables[seat.team().index()].opened = true;
+        assert!(!state.restart_penalizes_opening(seat));
     }
 }

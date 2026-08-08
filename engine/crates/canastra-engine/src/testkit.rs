@@ -48,6 +48,7 @@ impl Rig {
                 turn_context: TurnContext::default(),
                 hand_number: 1,
                 went_out: None,
+                opening_penalty: [false, false],
                 seed: 0,
             },
         }
@@ -112,6 +113,12 @@ impl Rig {
     /// §6: mark the partnership as having already met its opening minimum.
     pub fn opened(mut self, team: usize) -> Rig {
         self.state.tables[team].opened = true;
+        self
+    }
+
+    /// §6.1: the partnership has already paid the failed-opening penalty.
+    pub fn penalized(mut self, team: usize) -> Rig {
+        self.state.opening_penalty[team] = true;
         self
     }
 

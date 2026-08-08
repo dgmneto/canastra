@@ -77,6 +77,7 @@ pub fn deal_hand(match_seed: u64, dealer: Seat, scores: [i32; 2], hand_number: u
         },
         hand_number,
         went_out: None,
+        opening_penalty: [false, false],
         seed: match_seed,
     };
 

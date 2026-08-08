@@ -110,6 +110,8 @@ Depois de aberta, a dupla pode baixar livremente.
 
 **O mínimo tem que sair em um único turno.** Não se acumula ao longo de vários — caso contrário o limite não teria função nenhuma.
 
+**Abertura mal-sucedida sobe o mínimo (§6.1).** Se a dupla baixar cartas tentando abrir e desistir do turno, recolhendo o que baixou, o mínimo da dupla sobe um degrau: **75 vira 120**, e **120 vira 240**. A penalidade pega uma única vez por mão — uma segunda abertura mal-sucedida na mesma mão não sobe de novo, e a mão seguinte recomeça sem penalidade.
+
 **O 3 vermelho não conta.** Ele ocupa uma posição própria na mesa, fora de qualquer jogo — não abre a dupla nem soma para o mínimo.
 
 ---
@@ -310,7 +312,7 @@ Essa dupla leva apenas **−300 pontos, fixos**, seja qual for o conteúdo da m�
 
 **Pegar o lixo:** descem sempre 3 cartas — topo do lixo + 2 naturais da mão (sem curinga), em jogo novo ou encaixando num existente. O resto do lixo vai à mão e só se usa no turno seguinte. **3 preto ou 2 no topo bloqueia.**
 
-**Abertura:** 75 pts (dupla abaixo de 2.500) · 120 pts (2.500 ou mais) · curingas contam valor de face
+**Abertura:** 75 pts (dupla abaixo de 2.500) · 120 pts (2.500 ou mais) · curingas contam valor de face · abertura mal-sucedida sobe um degrau (75→120, 120→240), uma vez por mão
 
 **Sequências:** 4 a A, mesmo naipe, máx. 11 cartas. 2 e 3 nunca entram.
 

@@ -126,6 +126,19 @@ fn a_whole_game_state_survives_a_round_trip() {
     assert_eq!(serde_json::from_str::<GameState>(&json).unwrap(), state);
 }
 
+/// §6.1's penalty flag predates some persisted games. A snapshot saved before
+/// it existed must still load, unpenalized — the server keeps real matches on
+/// disk across deploys.
+#[test]
+fn a_snapshot_from_before_the_opening_penalty_still_loads() {
+    let state = new_game(31);
+    let mut raw: serde_json::Value = serde_json::to_value(&state).unwrap();
+    raw.as_object_mut().unwrap().remove("opening_penalty");
+    let restored: GameState = serde_json::from_value(raw).unwrap();
+    assert_eq!(restored.opening_penalty, [false, false]);
+    assert_eq!(restored, state);
+}
+
 /// A state in the first-turn refusal phase holds the card on offer only inside
 /// `pending_refusal`, so a round trip must not read short a card. This is the
 /// exact position a driver persists one move into a fresh match.

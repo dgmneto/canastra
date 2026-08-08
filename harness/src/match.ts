@@ -111,12 +111,22 @@ export class Match {
    * §6's opening minimum is now checked eagerly, so this is a backstop rather
    * than an everyday escape: the eager check is deliberately optimistic and a
    * player can still, rarely, reach a turn they cannot finish.
+   *
+   * §6.1: backing out after laying cards, before the partnership has opened,
+   * is a failed opening — the partnership's bar steps up one tier, once per
+   * hand. Returns whether this restart moved the bar, so the driver can say
+   * so in the log.
    */
-  restartTurn(seat: Seat): void {
+  restartTurn(seat: Seat): boolean {
+    // The penalty has to be judged before the restore: afterwards the laid
+    // cards that make it a failed opening are gone.
+    const failed = this.game.failedOpening(seat);
     const restored = Game.restore(this.turnStart);
     this.game.free();
     this.game = restored;
+    const penalized = failed ? this.game.penalizeOpening(seat) : false;
     this.log.push({ seat, restartTurn: true });
+    return penalized;
   }
 
   /**

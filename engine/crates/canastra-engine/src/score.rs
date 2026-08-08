@@ -126,7 +126,8 @@ pub fn settle_hand(state: &GameState) -> Result<GameState, RuleViolation> {
         return Ok(over);
     }
 
-    // §2: the deal passes to the right for the next hand.
+    // §2: the deal passes to the right for the next hand. The §6.1 penalty
+    // latches once per hand, so the fresh deal starts it unpenalized.
     Ok(deal_hand(
         state.seed,
         state.dealer.next(),
@@ -287,6 +288,20 @@ mod tests {
         let next = settle_hand(&state).unwrap();
         assert_eq!(next.dealer, Seat::new(1).unwrap());
         assert_eq!(next.turn, Seat::new(2).unwrap());
+    }
+
+    /// §6.1: the failed-opening penalty latches once per hand — the next deal
+    /// starts the partnership unpenalized again.
+    #[test]
+    fn the_opening_penalty_resets_with_the_next_hand() {
+        let state = Rig::new()
+            .penalized(0)
+            .meld(1, CLEAN)
+            .phase(Phase::HandOver)
+            .build();
+        let next = settle_hand(&state).unwrap();
+        assert_eq!(next.opening_penalty, [false, false]);
+        assert_eq!(next.opening_minimum_for(team(0)), 75);
     }
 
     #[test]

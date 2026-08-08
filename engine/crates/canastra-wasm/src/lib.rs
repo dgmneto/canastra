@@ -67,6 +67,25 @@ impl Game {
         self.state = self.turn_start.clone();
     }
 
+    /// §6.1: would abandoning the turn in progress count as a failed opening?
+    ///
+    /// The restart itself is the caller's snapshot restore, so the penalty
+    /// decision has to be inspectable *before* that restore happens — after it,
+    /// the laid cards that make it a failed opening are gone.
+    #[wasm_bindgen(js_name = failedOpening)]
+    pub fn failed_opening(&self, seat: u8) -> Result<bool, JsValue> {
+        let seat = Seat::new(seat).ok_or_else(|| message("seat must be 0, 1, 2 or 3"))?;
+        Ok(self.state.restart_penalizes_opening(seat))
+    }
+
+    /// §6.1: latch the failed-opening penalty for this seat's partnership.
+    /// Returns whether the bar actually moved — `false` on a second offence.
+    #[wasm_bindgen(js_name = penalizeOpening)]
+    pub fn penalize_opening(&mut self, seat: u8) -> Result<bool, JsValue> {
+        let seat = Seat::new(seat).ok_or_else(|| message("seat must be 0, 1, 2 or 3"))?;
+        Ok(self.state.penalize_opening(seat.team()))
+    }
+
     /// §13: what this hand would bank for one partnership right now, itemised.
     ///
     /// Mid-hand this is a running total, not a result — `going_out_bonus` is
