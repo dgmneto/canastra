@@ -12,6 +12,7 @@
 import type { Action } from "./types";
 import { cardValue } from "./types";
 import type { Bot, BotContext } from "./bot";
+import { ofType } from "./bot";
 import { findMelds, meldCards, meldValue } from "./melds";
 
 export const randomBot: Bot = {
@@ -19,62 +20,62 @@ export const randomBot: Bot = {
   name: "Random",
   blurb: "Lays what it finds, discards its cheapest card. The floor.",
 
-  candidates(view, context: BotContext): Action[] {
+  candidates(view, legal, context: BotContext): Action[] {
     switch (view.phase) {
-      case "AwaitingRefusalChoice":
+      case "AwaitingRefusalChoice": {
         // §3: the once-per-hand refusal. Cheap cards are worth throwing back.
+        const refuse = ofType(legal, "RefuseDrawnCard");
+        const keep = ofType(legal, "KeepDrawnCard");
         return view.pending_refusal && cardValue(view.pending_refusal) <= 5 && context.rng() < 0.5
-          ? [{ type: "RefuseDrawnCard" }, { type: "KeepDrawnCard" }]
-          : [{ type: "KeepDrawnCard" }];
+          ? [...refuse, ...keep]
+          : [...keep, ...refuse];
+      }
 
       case "AwaitingDraw":
-        return [{ type: "Draw" }];
+        // Never reaches for the pile, but the tail stays ranked so the list
+        // is always complete.
+        return [...ofType(legal, "Draw"), ...legal.filter((a) => a.type !== "Draw")];
 
       case "Melding": {
         const moves: Action[] = [];
-        const playable = view.hand.filter((card) => !view.frozen.includes(card));
+        const table = view.tables[view.seat % 2];
 
         if (!context.safeMode) {
           // §6: the opening minimum has to be met inside one turn. The engine's
           // eager check is optimistic — it counts every remaining card at face
           // value — so it will happily allow a 45-point lay that this hand can
           // never grow to 75, leaving a turn that cannot be discarded out of.
-          // Only lay at all if hand plus table actually clears the bar.
+          // Only rank lays at all if hand plus table actually clears the bar.
           //
           // What is already down counts. A partnership that is not open yet but
           // has melds on the table laid them earlier in *this* turn — that is
           // the only way to be in that position — so their value is this turn's
-          // progress, and `PlayerView` carries no `laid_value` to read instead.
-          const table = view.tables[view.seat % 2];
-          const found = findMelds(playable);
-          const inHand = found.reduce((sum, meld) => sum + meldValue(meld), 0);
+          // progress; `PlayerView` has carried `laid_value` since M1, but the
+          // estimate via the table predates the field and stays as the safe
+          // upper bound, so behaviour is deliberately unchanged.
+          const playable = view.hand.filter((card) => !view.frozen.includes(card));
+          const inHand = findMelds(playable).reduce((sum, meld) => sum + meldValue(meld), 0);
           const alreadyLaid = table.opened
             ? 0
             : table.melds.reduce((sum, meld) => sum + meldValue(meldCards(meld)), 0);
-          const layable = table.opened || alreadyLaid + inHand >= view.opening_minimum ? found : [];
+          const layable = table.opened || alreadyLaid + inHand >= view.opening_minimum;
 
-          if (context.rng() < 0.85) {
-            for (const cards of layable) moves.push({ type: "LayMeld", cards });
-          }
-          // §4.2: lay-offs, one card at a time. Which cards fit is exactly the
-          // combinatorial question the engine does not answer yet, so ask it.
-          if (context.rng() < 0.7) {
-            for (let meld = 0; meld < table.melds.length; meld += 1) {
-              for (const card of playable) moves.push({ type: "AddToMeld", meld, cards: [card] });
-            }
-          }
+          if (layable && context.rng() < 0.85) moves.push(...ofType(legal, "LayMeld"));
+          if (context.rng() < 0.7) moves.push(...ofType(legal, "AddToMeld"));
         }
 
         // §4.3: the turn ends with a discard. Cheapest first, so it keeps the
-        // cards worth points, and every card is tried before giving up.
-        const discards = [...view.hand].sort((a, b) => cardValue(a) - cardValue(b));
-        for (const card of discards) moves.push({ type: "Discard", card });
-        moves.push({ type: "EndTurnWithoutDiscard" });
+        // cards worth points.
+        moves.push(...ofType(legal, "Discard").sort((a, b) => cardValue(a.card) - cardValue(b.card)));
+        moves.push(...ofType(legal, "EndTurnWithoutDiscard"));
+
+        // Ranking is complete: anything not yet listed trails the discards.
+        for (const action of legal) if (!moves.includes(action)) moves.push(action);
         return moves;
       }
 
       default:
-        return [];
+        return [...legal];
     }
   },
 };

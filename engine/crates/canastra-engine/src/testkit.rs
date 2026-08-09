@@ -61,6 +61,12 @@ impl Rig {
         self
     }
 
+    /// §5: mark the turn as having begun with a pile capture.
+    pub fn took_pile(mut self) -> Rig {
+        self.state.turn_context.took_pile = true;
+        self
+    }
+
     /// §11.1: record that this seat went out.
     pub fn went_out(mut self, seat: usize) -> Rig {
         self.state.went_out = Some(Seat::new(seat as u8).expect("valid seat"));
@@ -107,6 +113,18 @@ impl Rig {
     /// §3: hand the player to move the lead player's one-time refusal.
     pub fn refusal_available(mut self) -> Rig {
         self.state.turn_context.refusal_available = true;
+        self
+    }
+
+    /// §6: value already laid this turn (for opening-minimum positions).
+    pub fn laid_value(mut self, value: u32) -> Rig {
+        self.state.turn_context.laid_value = value;
+        self
+    }
+
+    /// §3: the card the lead player is currently deciding whether to keep.
+    pub fn pending_refusal(mut self, spec: &str) -> Rig {
+        self.state.turn_context.pending_refusal = Some(card(spec));
         self
     }
 

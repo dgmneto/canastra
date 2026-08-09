@@ -7,11 +7,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Three planned components:
 
 1. **Rust engine/state machine** — implements Canastra game rules and turn logic. **Built**, in `engine/`.
-2. **Bot project** — trains/designs AI bots to play against. **Not started** as a training
-   harness, but `bots/` (`@canastra/bots`) is now its own npm package: it holds the toy policies
-   behind a `Bot` interface with a per-seat picker so they can play each other, plus the engine
-   wire types and seeded `rng`, and it is registered in the `BOTS` registry. Useful for eyeballing
-   behaviour; it is not a training harness and does not presume the shape the real project will take.
+2. **Bot project** — trains/designs AI bots to play against. **In progress.** M2 landed the
+   weights-JSON format (`canastra-weights@1`), `JSONWeightsBot` in the harness/sandbox via a lazy
+   `BotContext.encode` hook, and duplicate-deal evaluation on both sides
+   (`training/python/canastra_train/sanity.py`, `harness/src/eval-nn.ts`). **M3 landed the GA
+   trainer** (`canastra_train.train`): batched self-play league fitness
+   (`canastra_train.league`), elitism + tournaments + Gaussian mutation, a hall of fame, and
+   bit-identical checkpoints/resume (`canastra_train.ga`). The bot project is now **code-complete
+   pending real training runs on the training machine** — this laptop's smoke run only proves the
+   loop, the success gate is measured there. `bots/` (`@canastra/bots`) also holds the toy policies
+   — ranking the engine's legal list (`candidates(view, legal, context)`, F7 closed) — behind a
+   `Bot` interface with a per-seat picker so they can play each other, plus the engine wire types
+   and seeded `rng`, registered in the `BOTS` registry. `training/` is the training harness: a PyO3
+   pool over the engine (see Architecture). The encoder is single-sourced in
+   `engine/crates/canastra-encode`, which both the wasm bindings and the Python harness bind.
 3. **Web app** — lets people play Canastra against each other or against a bot. **Built (MVP).**
    `server/` holds the real engine and the one global table; `web/` is two pages: the game client
    at `/` (thin — no wasm, no rules, renders what the server sends) and the engine sandbox at
@@ -110,6 +119,29 @@ npm start
 npm run smoke
 ```
 
+Play a weights file against any registered heuristic bot (both seatings) on the TS side:
+
+```bash
+npx tsx harness/src/eval-nn.ts bots/src/fixtures/random-init.json random-plus 1
+```
+
+Python commands run from `training/` (a separate maturin project; the engine workspace gates above
+stay Python-free). The training gates:
+
+```bash
+cd training && .venv/bin/maturin develop --release && .venv/bin/pytest && .venv/bin/ruff check . && .venv/bin/mypy python/canastra_train tests
+```
+
+Run the GA trainer (all flags in [training/README.md](training/README.md); a smoke run is
+`--generations 2 --population 8 --opponents 2 --seeds 2 --cap 30000`):
+
+```bash
+cd training && .venv/bin/python -m canastra_train.train --generations N --run-dir runs/<run>
+```
+
+# `maturin develop --release` must be re-run after any change to `training/src/lib.rs`, or pytest and mypy
+# see a stale compiled extension.
+
 ## Architecture
 
 `engine/` is a self-contained Cargo workspace. `crates/canastra-engine` is the rules core and has no
@@ -120,7 +152,11 @@ The JavaScript side is an npm workspace rooted at the repo root, with five packa
 - **`bots/`** (`@canastra/bots`) — the bot policies plus the engine wire types (`PlayerView`,
   `Action`, …), seeded `rng`, and the `BOTS` registry. It is the leaf everything else depends on:
   it has no engine, no wasm, only opinions. Add a bot by writing `src/<name>.ts` and registering it
-  in `src/index.ts`.
+  in `src/index.ts`. Bots now rank the engine's legal list (`candidates(view, legal, context)`)
+  rather than guessing legality. The serialized weights (`WeightsJson`, format `canastra-weights@1`)
+  are plain JSON — a flat `obs`→`act` MLP with an `embed`/`scoreAction` split — compiled into a bot
+  by `makeJsonWeightsBot` through a lazy encode hook, so both the Node harness and the sandbox can
+  play a trained file without recompiling the engine.
 - **`harness/`** (`@canastra/harness`) — the thing that actually *plays* a game: the `Match` wasm
   wrapper, the `step` driver, and `runMatch`/`series`. Its `canastra-harness` bin (see Commands) is
   the executable that runs a match from a seed + bot names to JSONL. Web and the CLI share this code.
@@ -149,6 +185,22 @@ face up. That omniscience is safe only because it is local and single-player —
 hide anything from, and it is precisely what a networked client must not do. F6 in
 [ADVERSARIAL-REVIEW.md](ADVERSARIAL-REVIEW.md) states the obligations the server discharges by
 construction for the game client. See [web/README.md](web/README.md).
+
+`engine/crates/canastra-encode` is the **single source of truth for observation and action
+encodings**. `OBS_DIM` and `ACT_DIM` are pinned there, and `encode_observation` /
+`encode_actions` produce the fixed-length vectors both the wasm bindings (`canastra-wasm`) and the
+Python harness (`canastra_py`) consume. The layout can never drift between training and deployment
+because both sides bind the same Rust crate.
+
+`training/` is a separate maturin project (`canastra_py`), deliberately outside the engine Cargo
+workspace so the engine's gates stay Python-free and fast. Its `Pool` owns one engine per seed and
+drives batches with **two batched crossings per ply (encode, apply)** — Rust fills numpy buffers for observations,
+per-action features, and a legal mask, and consumes the picks back. Its safe-mode menus mirror the
+`canastra-harness` driver: a dead-ended turn is backed out to the turn's start and retried with
+melding and pile-taking withheld. On top sit the GA (`ga.py`: elitism, tournaments, Gaussian
+mutation, hall of fame, bit-identical checkpoints), the self-play league (`league.py`: batched
+pairings over duplicate-deal differentials), and the `train.py` CLI that drives one run of
+generations — see [training/README.md](training/README.md).
 
 **The engine is a pure function.** `apply(&GameState, Seat, &Action) -> Result<GameState, RuleViolation>`
 never mutates its input. This is load-bearing, not stylistic: §6 requires a partnership's opening melds

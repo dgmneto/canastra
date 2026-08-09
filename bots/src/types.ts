@@ -49,6 +49,18 @@ export interface TeamTable {
 /** Seats cross the wire as plain numbers 0–3. */
 export type Seat = number;
 
+/**
+ * The engine's encoding of one seat's position (wasm `encodeState`).
+ *
+ * `obs` is the observation feeding the policy's trunk, `actions[i]` is the
+ * feature row of `legal[i]` — parallel arrays, same length, same order.
+ */
+export interface EncodedState {
+  obs: number[];
+  actions: number[][];
+  legal: Action[];
+}
+
 export interface PlayerView {
   seat: Seat;
   hand: Card[];
@@ -64,6 +76,9 @@ export interface PlayerView {
   hand_number: number;
   went_out: Seat | null;
   opening_minimum: number;
+  laid_value: number;
+  took_pile: boolean;
+  refusal_available: boolean;
   pending_refusal: Card | null;
 }
 

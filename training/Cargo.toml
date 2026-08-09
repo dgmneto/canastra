@@ -1,0 +1,22 @@
+[package]
+name = "canastra-py"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Python bindings for driving batches of Canastra games"
+
+[lib]
+name = "canastra_py"
+crate-type = ["cdylib"]
+
+# Own workspace: maturin has its own build flow, and the engine workspace's
+# gates stay Python-free and fast.
+[workspace]
+
+[dependencies]
+canastra-engine = { path = "../engine/crates/canastra-engine" }
+canastra-encode = { path = "../engine/crates/canastra-encode" }
+pyo3 = "0.23"
+numpy = "0.23"
+rayon = "1"
+ndarray = "0.16"

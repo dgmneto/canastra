@@ -37,7 +37,7 @@ export function findMelds(hand: Card[]): Card[][] {
 }
 
 /** Every meld shape worth trying, overlaps included. */
-export function enumerateMelds(hand: Card[]): Card[][] {
+function enumerateMelds(hand: Card[]): Card[][] {
   const melds: Card[][] = [];
 
   // §7.2: three or more aces collect rather than run.

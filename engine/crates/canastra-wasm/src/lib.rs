@@ -5,10 +5,12 @@
 //! builds plain objects, serde converts and validates them on the way in, and a
 //! malformed one comes back as an error rather than undefined behaviour.
 
+use canastra_encode::{ACT_DIM, OBS_DIM, encode_actions, encode_observation};
 use canastra_engine::{
-    Action, GameState, Phase, RuleViolation, Seat, Team, apply, new_game, observe, score_hand,
-    settle_hand,
+    Action, GameState, Phase, RuleViolation, Seat, Team, apply, enumerate, new_game, observe,
+    score_hand, settle_hand,
 };
+use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
 /// A game living in Rust memory, driven from JavaScript.
@@ -59,6 +61,36 @@ impl Game {
         let seat = Seat::new(seat).ok_or_else(|| message("seat must be 0, 1, 2 or 3"))?;
         serde_wasm_bindgen::to_value(&observe(&self.state, seat))
             .map_err(|error| message(&error.to_string()))
+    }
+
+    /// F7: every action `seat` may legally take right now, one ply, in
+    /// deterministic order. Serializes as the same `{type: ...}` objects the
+    /// TS `Action` union already describes.
+    #[wasm_bindgen(js_name = legalActions)]
+    pub fn legal_actions(&self, seat: u8) -> Result<JsValue, JsValue> {
+        let seat = Seat::new(seat).ok_or_else(|| message("seat must be 0, 1, 2 or 3"))?;
+        serde_wasm_bindgen::to_value(&enumerate(&self.state, seat))
+            .map_err(|error| message(&error.to_string()))
+    }
+
+    /// The full policy view of a seat: observation vector, per-action feature
+    /// rows, and the legal actions they score. One call, so a client never
+    /// assembles this from pieces that could drift.
+    #[wasm_bindgen(js_name = encodeState)]
+    pub fn encode_state(&self, seat: u8) -> Result<JsValue, JsValue> {
+        let seat = Seat::new(seat).ok_or_else(|| message("seat must be 0, 1, 2 or 3"))?;
+        let view = observe(&self.state, seat);
+        let legal = enumerate(&self.state, seat);
+        let mut obs = vec![0.0; OBS_DIM];
+        encode_observation(&view, &mut obs);
+        let mut flat = vec![0.0; legal.len() * ACT_DIM];
+        encode_actions(&view, &legal, &mut flat);
+        let payload = EncodedState {
+            obs,
+            actions: flat.chunks(ACT_DIM).map(|row| row.to_vec()).collect(),
+            legal,
+        };
+        serde_wasm_bindgen::to_value(&payload).map_err(|error| message(&error.to_string()))
     }
 
     /// Abandon the turn in progress and restore the position it began from.
@@ -132,6 +164,16 @@ impl Game {
             state,
         })
     }
+}
+
+/// The `encodeState` payload: the observation, one feature row per legal
+/// action, and the legal actions themselves so the caller can map a chosen
+/// row back to a move.
+#[derive(Serialize)]
+struct EncodedState {
+    obs: Vec<f32>,
+    actions: Vec<Vec<f32>>,
+    legal: Vec<Action>,
 }
 
 /// Rejected moves reach JavaScript as structured objects — `{ error:

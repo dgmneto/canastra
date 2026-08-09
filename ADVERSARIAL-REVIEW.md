@@ -18,7 +18,7 @@ full: the reproduction is the useful part, and it documents what the regression 
 | F4 | Empty `AddToMeld` poisons the turn | medium | **fixed** |
 | F5 | Opening minimum only judged at the discard | medium | **fixed** (eager check) |
 | F6 | Trust boundary undefended by construction | medium | closed — server-only deployment |
-| F7 | No `legal_actions`; `validate` clones | low | open, deliberately |
+| F7 | No `legal_actions`; `validate` clones | low | **closed** — `enumerate` + `legalActions`; non-cloning `validate` deferred |
 | F8 | Meld JSON awkward for other languages | low | **fixed** |
 | F9 | One weak test | low | **fixed** |
 | F10 | proptest and ts-rs not delivered | low | closed, not relevant |
@@ -219,7 +219,7 @@ Left as-is for the MVP. The obligations above apply unchanged the first time a s
 
 ---
 
-## F7 — No `legal_actions`, and `validate` is expensive (low)
+## F7 — No `legal_actions`, and `validate` is expensive (low) — CLOSED
 
 Deferred deliberately to the bot milestone, but worth stating: bots currently have to guess an action
 and check the error. `validate` is implemented as `apply(...).map(|_| ())`, so every check clones the
@@ -227,6 +227,19 @@ whole state. Enumerating a move list is O(moves) full clones.
 
 **Suggested fix.** When the bot work starts, add a non-cloning `validate` and a `legal_actions` that
 enumerates. Meld enumeration is the combinatorially interesting part and deserves its own design pass.
+
+**Closed in the bot training milestone (F7 spec implemented as M0 of the bot-training design).** The
+engine now has `enumerate` in `canastra-engine`, which returns every action a seat may legally take one
+ply ahead — candidates generated and judged by `apply` (the engine's purity makes `apply` cheap to use
+as a judge on cloned positions, which is exactly what F7 asked for). `canastra-wasm`'s `Game` exposes it
+as `legalActions`. The bots no longer guess; the restructured `Bot` interface is
+`candidates(view, legal, context)`, and all three bots rank the legal list. Meld enumeration — the
+combinatorially interesting part the finding flagged — is covered by the module's 18 integration tests,
+including a whole-match soundness fuzz matching `enumerate`'s list against what happened to be legal.
+
+**What stays open.** The F7 spec explicitly deferred the orthogonal half of the finding: the
+non-cloning `validate` optimisation. It is not needed now that `enumerate` (and the bots driving it)
+clone positions through the pure `apply`, so it remains out of scope.
 
 ---
 

@@ -87,6 +87,7 @@ export function App() {
     const result = step(current, current.views()[acting], bot, {
       rng: rng.current,
       safeMode: safeMode.current,
+      encode: () => current.encodeState(acting),
     });
     if (!result) return false;
 

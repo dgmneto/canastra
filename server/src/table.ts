@@ -450,7 +450,11 @@ export class Table {
   private sendView(seat: Seat): void {
     const occupant = this.seats[seat];
     if (!this.match || occupant.kind !== "human") return;
-    this.send(occupant.ws, { type: "view", view: this.match.views()[seat] });
+    this.send(occupant.ws, {
+      type: "view",
+      view: this.match.views()[seat],
+      legal: this.match.legalActions(seat),
+    });
   }
 
   /**

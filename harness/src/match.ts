@@ -12,7 +12,7 @@
  */
 
 import { Game } from "../../web/src/engine/canastra.js";
-import type { Action, HandScore, PlayerView, RuleViolation, Seat } from "@canastra/bots";
+import type { Action, EncodedState, HandScore, PlayerView, RuleViolation, Seat } from "@canastra/bots";
 import { isRuleViolation } from "@canastra/bots";
 
 /**
@@ -64,6 +64,16 @@ export class Match {
       PlayerView,
       PlayerView,
     ];
+  }
+
+  /** F7: every action `seat` may legally take right now, straight from the engine. */
+  legalActions(seat: Seat): Action[] {
+    return this.game.legalActions(seat) as Action[];
+  }
+
+  /** F7/M1: the full policy encoding of a seat — observation, per-action rows, legal list. */
+  encodeState(seat: Seat): EncodedState {
+    return this.game.encodeState(seat) as EncodedState;
   }
 
   /**

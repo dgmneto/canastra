@@ -2,7 +2,7 @@
 
 Date: 2026-08-05
 
-Status: design for approval before implementation
+Status: approved; implemented as M0 of the bot-training milestone (see 2026-08-06-bot-training-design.md)
 
 ## Problem
 

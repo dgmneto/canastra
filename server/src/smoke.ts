@@ -49,6 +49,7 @@ async function waitFor(
 /** A scripted player: connects, and whenever its view says it must act, plays like the bot. */
 class Player {
   view: PlayerView | null = null;
+  legal: Action[] = [];
   table: TableState | null = null;
   seat: Seat | null = null;
   token: string | null = null;
@@ -111,6 +112,7 @@ class Player {
         break;
       case "view": {
         this.view = message.view;
+        this.legal = message.legal;
         this.pending?.(true);
         this.pending = null;
         void this.drive();
@@ -145,7 +147,10 @@ class Player {
           this.view.phase === "AwaitingRefusalChoice")
       ) {
         const bot = botById("random-plus");
-        const candidates = bot.candidates(this.view, { rng: this.rng, safeMode: this.safeMode });
+        const candidates = bot.candidates(this.view, this.legal, {
+          rng: this.rng,
+          safeMode: this.safeMode,
+        });
         let accepted: Action | null = null;
         for (const candidate of candidates) {
           if (await this.act(candidate)) {

@@ -73,8 +73,13 @@ export type ServerMessage =
    * Private, per seated player: the engine's `observe(state, seat)`. Pushed
    * whenever it may have changed — after every accepted action, on deal, on
    * `sit`/takeover, and on reclaim.
+   *
+   * `legal` is the same seat's engine `legal_actions`, so a scripted human can
+   * rank them the way the harness driver does. It names only the player's own
+   * cards and the public discard pile — no other seat's cards — so it holds to
+   * F6.
    */
-  | { type: "view"; view: PlayerView }
+  | { type: "view"; view: PlayerView; legal: Action[] }
   /** One move-log line, broadcast. */
   | { type: "event"; text: string }
   /** The rule that rejected your action (or why a lobby command was refused), to you only. */

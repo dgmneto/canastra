@@ -9,6 +9,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
+name = "canastra-encode"
+version = "0.1.0"
+dependencies = [
+ "canastra-engine",
+]
+
+[[package]]
 name = "canastra-engine"
 version = "0.1.0"
 dependencies = [
@@ -22,7 +29,9 @@ dependencies = [
 name = "canastra-wasm"
 version = "0.1.0"
 dependencies = [
+ "canastra-encode",
  "canastra-engine",
+ "serde",
  "serde-wasm-bindgen",
  "serde_json",
  "wasm-bindgen",
