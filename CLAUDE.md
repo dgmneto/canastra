@@ -197,7 +197,10 @@ workspace so the engine's gates stay Python-free and fast. Its `Pool` owns one e
 drives batches with **two batched crossings per ply (encode, apply)** — Rust fills numpy buffers for observations,
 per-action features, and a legal mask, and consumes the picks back. Its safe-mode menus mirror the
 `canastra-harness` driver: a dead-ended turn is backed out to the turn's start and retried with
-melding and pile-taking withheld. On top sit the GA (`ga.py`: elitism, tournaments, Gaussian
+melding and pile-taking withheld. The per-ply forward is one stacked pass over the whole genome
+roster (`policy.logits_stacked`, `einsum` over batch dim G with per-genome tiles) instead of a
+loop of tiny per-genome forwards, so a ply costs a handful of torch ops no matter the population
+size. On top sit the GA (`ga.py`: elitism, tournaments, Gaussian
 mutation, hall of fame, bit-identical checkpoints), the self-play league (`league.py`: batched
 pairings over duplicate-deal differentials), and the `train.py` CLI that drives one run of
 generations — see [training/README.md](training/README.md).

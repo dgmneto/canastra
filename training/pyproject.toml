@@ -7,7 +7,7 @@ name = "canastra-train"
 version = "0.1.0"
 description = "Training harness for Canastra policy networks"
 requires-python = ">=3.11"
-dependencies = ["numpy", "torch"]
+dependencies = ["numpy", "torch", "rich"]
 
 [project.optional-dependencies]
 dev = ["maturin", "pytest", "ruff", "mypy"]

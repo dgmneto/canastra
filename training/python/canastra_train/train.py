@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -26,6 +27,7 @@ import numpy as np
 
 from canastra_train import ga, league, seedstream
 from canastra_train import genome as genome_mod
+from canastra_train.tui import Dashboard
 
 TRAINING_ARCH = {"obs": 2002, "act": 101, "trunk": [512, 256], "head": [128], "activation": "tanh"}
 
@@ -48,6 +50,8 @@ def run(
     crossover: bool = False,
     device: str = "cpu",
     resume: bool = False,
+    no_tui: bool = False,
+    shards: int = 1,
 ) -> None:
     cfg = ga.GAConfig(
         population=population,
@@ -72,7 +76,8 @@ def run(
         )
     (run_dir / "config.json").write_text(
         json.dumps({"arch": arch, "ga": asdict(cfg), "run_seed": run_seed,
-                    "seeds": seeds, "cap": cap, "device": device}, indent=2)
+                    "seeds": seeds, "cap": cap, "device": device,
+                    "shards": shards}, indent=2)
     )
 
     if resume:
@@ -92,12 +97,29 @@ def run(
     log_path = run_dir / "generations.jsonl"
     last_pop = pop
     last_fitness: np.ndarray | None = None
+    dash = Dashboard(
+        run_dir,
+        generations,
+        start,
+        no_tui=no_tui or not sys.stdout.isatty(),
+        device=device,
+        sigma=sigma,
+        games_total=0,
+    )
+    dash.start()
+    if best_ever != float("-inf"):
+        dash.status.best_ever = float(best_ever)
     for generation in range(start, generations):
         began = time.perf_counter()
         gen_rng = np.random.default_rng(seedstream.splitmix64(run_seed + generation))
         gen_seeds = seedstream.generation_seeds(run_seed, generation, seeds)
         pairings = league.schedule_pairings(len(pop), opponents, hof, gen_rng)
-        fitness = league.evaluate_generation(pop, hof, pairings, arch, gen_seeds, cap, device)
+        dash.status.games_total = len(pairings) * 2 * len(gen_seeds)
+        dash.set_phase("evaluating")
+        fitness = league.evaluate_generation(
+            pop, hof, pairings, arch, gen_seeds, cap, device,
+            progress=dash.on_progress, shards=shards,
+        )
 
         last_pop = pop
         last_fitness = fitness
@@ -119,28 +141,39 @@ def run(
         improved = fitness[champion] > best_ever
         if improved:
             best_ever = float(fitness[champion])
+            dash.status.best_ever = float(best_ever)
+        dash.on_generation(record)
+        if improved:
+            dash.on_event(
+                "best", f"new best-ever {fitness[champion]:+.1f} (gen {generation})"
+            )
         if generation % cfg.hof_interval == 0 or improved:
             genome_mod.save_json(
                 str(run_dir / f"champion-gen{generation:05d}.json"), arch, pop[champion]
             )
+            dash.on_event(
+                "export",
+                f"champion-gen{generation:05d}.json ({fitness[champion]:+.1f})",
+            )
         if generation % cfg.hof_interval == 0:
             hof.archive(pop[champion], fitness=float(fitness[champion]), generation=generation)
+            dash.on_event(
+                "hof",
+                f"archived gen-{generation} champion ({fitness[champion]:+.1f})",
+            )
 
+        dash.set_phase("evolving")
         pop = ga.next_generation(pop, fitness, cfg, generation, gen_rng)
         # Checkpoint the EVOLVED population (what generation+1 evaluates) so a
         # resumed run starts from the exact hand-off — bit identical. The saved
         # fitness pairs with the population that was evaluated this generation.
         if generation % 5 == 0 or generation == generations - 1 or improved:
             ga.save_checkpoint(run_dir, generation, pop, fitness, hof, gen_seeds)
-        print(
-            f"gen {generation}: best {fitness[champion]:+.1f} "
-            f"mean {fitness.mean():+.1f} sigma {record['sigma']:.4f} "
-            f"({record['wall_seconds']}s)"
-        )
 
     assert last_fitness is not None, "no generation was evaluated"
     final = int(np.argmax(last_fitness))
     genome_mod.save_json(str(run_dir / "champion-final.json"), arch, last_pop[final])
+    dash.stop()
     print(f"done: {run_dir}")
 
 
@@ -162,6 +195,19 @@ def main() -> None:
     parser.add_argument("--hof-interval", type=int, default=5)
     parser.add_argument("--crossover", action="store_true", help="flag exists per spec; unused until crossover lands")
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda", "mps"])
+    parser.add_argument(
+        "--no-tui",
+        action="store_true",
+        help="disable the live dashboard and print one plain line per generation",
+    )
+    parser.add_argument(
+        "--shards",
+        type=int,
+        default=1,
+        help="split the generation's games across this many worker processes "
+        "(bit-identical results; the per-ply cost is GIL-serial glue, so this "
+        "scales with your cores). E.g. 8 on this machine.",
+    )
     args = parser.parse_args()
 
     run_dir = args.run_dir or Path("runs") / time.strftime("%Y%m%d-%H%M%S")
@@ -183,6 +229,8 @@ def main() -> None:
         crossover=args.crossover,
         device=args.device,
         resume=args.resume,
+        no_tui=args.no_tui,
+        shards=args.shards,
     )
 
 

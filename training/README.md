@@ -39,20 +39,36 @@ good for hunting a Rust panic; the benchmark and the test suite are meaningless 
 
 ## Benchmark
 
-Env stepping is the training loop's ceiling (the forward pass is batched elsewhere), so
-this number is the one to watch when touching the pool or the encoder:
+Env stepping is the training loop's ceiling (the forward pass is batched elsewhere),
+so this number is the one to watch when touching the pool or the encoder:
 
 ```bash
-.venv/bin/python -m canastra_train.bench
+.venv/bin/python -m canastra_train.bench                      # raw pool loop
+.venv/bin/python -m canastra_train.bench --shape league --device cpu   # the real generation loop
 ```
 
-Measured on this machine on a **release build** (a random legal policy over a 64-game pool):
-**104,998 plies in 219.16s ≈ 479 plies/s.** Here "plies" counts batch rounds — one `encode`
-+ `apply` across every live game — not individual game-steps. The pool sustains
-an order of magnitude more real game-steps per second at full depth; the rounds
-figure is dominated by the tail, where a few long matches straggle with little parallelism.
-This is expected for uniform-random play, and the action cap (`Pool(seeds, max_actions_per_game)`)
-is what keeps a non-converging match from hanging a generation.
+Measured on this machine on a **release build**:
+
+- **`--shape pool`** (a random legal policy over a 64-game pool): **104,998 plies in
+  219.16s ≈ 479 plies/s.** Here "plies" counts batch rounds — one `encode` + `apply`
+  across every live game — not individual game-steps. The pool sustains
+  an order of magnitude more real game-steps per second at full depth; the rounds
+  figure is dominated by the tail, where a few long matches straggle with little parallelism.
+  This is expected for uniform-random play, and the action cap (`Pool(seeds, max_actions_per_game)`)
+  is what keeps a non-converging match from hanging a generation.
+- **`--shape league`** (the real loop through `drive_pool`, 64 games, pop 8, cap 30k):
+  **332 plies/s on `cpu`** (forward 1.8 ms/ply, encode 1.1, apply 0.04) vs **378 plies/s on
+  `cuda`** (forward 1.6, encode 1.0, apply 0.04). At the full training shape (pop 96, one
+  pool of 768 games) the picker **buckets rows by real menu size** — real menus are tiny
+  (p50 ≈ 2 actions), so each bucket's acts tensor is trimmed to the bucket's max width
+  instead of the one rogue 600-action meld that pads every row to the ply's global max.
+  That cut the cuda forward from 57 ms/ply to **27 ms/ply** (encode 17, apply 1.4) and the
+  end-to-end pop-96 × 8-shard run from ~16 plies/s to ~33 plies/s. On `cpu` the same
+  trimming does not pay off (per-ply forward ~165 ms — the smaller per-bucket ops beat the
+  transfer saving), so keep `--device cpu` only on machines without a big GPU; the default
+  on this laptop's RTX stays `cpu`, but pass `--device cuda` for training runs. The gap
+  between the league figure and the pool figure is the torch effort per ply — the league
+  number is the one to watch when touching the policy or the picker.
 
 ## Evaluation
 
@@ -126,8 +142,29 @@ Flags:
 - `--crossover` — accepted but unused (the flag exists per spec; nothing
   implements crossover yet).
 - `--device` (`cpu`|`cuda`|`mps`) — where the torch forward pass runs.
+  **Default `cpu`** — on this machine the two devices are close (see Benchmark),
+  and CPU keeps a second process (the dashboard writer, checkpointing, and the
+  per-generation GA glue) off the PCIe bus. On the training machine, pass
+  `--device cuda`; the stacked whole-roster forward is one batched pass that
+  uses the GPU at full depth.
 - `--run-dir` — output directory (default `runs/<timestamp>`).
 - `--resume` — continue from the latest checkpoint in `--run-dir`.
+- `--no-tui` — disable the live dashboard; print one plain line per
+  generation instead (automatic when stdout is not a TTY, e.g. piped to a
+  file).
+
+### Live dashboard
+
+On a TTY the trainer renders a watch-only `rich` dashboard while it runs:
+generation count and phase, games finished / total with a progress bar,
+plies and plies/s, ETA for the current generation and the whole run, sigma,
+fitness best/mean with a sparkline, the last generations' table, and a live
+events feed for the promotion moments — new best-erves, champion exports and
+hall-of-fame archivals. It also writes a throttled, atomically-updated
+`status.json` into the run directory (same shape as the in-memory status) so
+a separate terminal or a future web view can tail a run without touching
+training itself. The dashboard is exit-free — stop a run with Ctrl+C as
+usual, and restart with `--resume`.
 
 One generation does three things:
 

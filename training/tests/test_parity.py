@@ -47,7 +47,7 @@ def _ts_score(weights_path: Path, tmp_path: Path) -> float:
     script = tmp_path / "parity.ts"
     script.write_text(
         _TS_SCRIPT.format(
-            forward_import=f'"{ROOT / "bots/src/forward.ts"}"',
+            forward_import=f'"{ROOT.as_posix()}/bots/src/forward.ts"',
             obs=OBS_DIM,
             act=ACT_DIM,
             obs_val=0.01,
