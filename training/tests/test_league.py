@@ -13,11 +13,23 @@ def test_a_generation_produces_one_fitness_per_genome() -> None:
     rng = np.random.default_rng(4)
     pairings = league.schedule_pairings(len(pop), opponents=1, hof=hof, rng=rng)
     assert len(pairings) == 4
+    metrics: list[league.DriveMetrics] = []
     fitness = league.evaluate_generation(
-        pop, hof, pairings, ARCH, seeds=[5], cap=6000, device="cpu"
+        pop,
+        hof,
+        pairings,
+        ARCH,
+        seeds=[5],
+        cap=6000,
+        device="cpu",
+        metrics_out=metrics,
     )
     assert fitness.shape == (4,)
     assert np.isfinite(fitness).all()
+    assert len(metrics) == 1
+    assert metrics[0].batch_rounds > 0
+    assert metrics[0].individual_actions >= metrics[0].batch_rounds
+    assert metrics[0].max_actions_per_game > 0
 
 
 def test_self_pairing_reads_near_zero() -> None:

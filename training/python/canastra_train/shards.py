@@ -16,7 +16,6 @@ serializes inside a single process.
 
 from __future__ import annotations
 
-import math
 import multiprocessing
 import queue as queue_mod
 import threading
@@ -43,24 +42,32 @@ def run_shards(
     device: str,
     shards: int,
     progress: _Progress | None,
+    metrics_out: list[Any] | None = None,
+    max_rounds: int | None = None,
 ) -> list[MatchRow]:
     """Evaluate `game_seeds` across `shards` worker processes.
 
-    The seed list is split into contiguous global-order slices (one per
-    worker, mirror slicing), so concatenating the returned results in shard
-    order reproduces the single-pool result order exactly.
+    Games are interleaved across workers to spread paired seatings, seeds, and
+    opponents across the critical path. Results carry their original indices
+    and are reassembled into the same order as the single-pool path.
     """
-    chunk = math.ceil(len(game_seeds) / shards)
-    slices = [
-        (game_seeds[start : start + chunk], meta[start : start + chunk])
-        for start in range(0, len(game_seeds), chunk)
-    ]
+    worker_count = min(shards, len(game_seeds))
+    slices = []
+    for shard_id in range(worker_count):
+        indices = list(range(shard_id, len(game_seeds), worker_count))
+        slices.append(
+            (
+                indices,
+                [game_seeds[index] for index in indices],
+                meta[indices],
+            )
+        )
     context = multiprocessing.get_context("spawn")
     results_queue: Any = context.Queue()
     progress_queue: Any = context.Queue()
 
     processes = []
-    for shard_id, (shard_seeds, shard_meta) in enumerate(slices):
+    for shard_id, (shard_indices, shard_seeds, shard_meta) in enumerate(slices):
         if not shard_seeds:
             break
         processes.append(
@@ -69,6 +76,7 @@ def run_shards(
                 args=(
                     roster,
                     arch,
+                    shard_indices,
                     shard_seeds,
                     shard_meta,
                     cap,
@@ -76,6 +84,7 @@ def run_shards(
                     results_queue,
                     progress_queue,
                     shard_id,
+                    max_rounds,
                 ),
             )
         )
@@ -116,20 +125,28 @@ def run_shards(
     for pump in pumps:
         pump.join(timeout=5.0)
 
-    for shard_id, shard_results, *rest in items:
-        if shard_results is None:  # worker failure carries (id, None, tb)
+    metrics_by_shard: dict[int, Any] = {}
+    results_by_index: list[Any | None] = [None] * len(game_seeds)
+    for shard_id, shard_indices, shard_results, *rest in items:
+        if shard_results is None:  # worker failure carries (id, indices, None, tb)
             trace = rest[0] if rest else "unknown"
             raise RuntimeError(f"shard worker {shard_id} failed:\n{trace}")
+        if rest:
+            metrics_by_shard[shard_id] = rest[0]
+        for index, result in zip(shard_indices, shard_results):
+            results_by_index[index] = result
     if len(items) < len(processes):
         raise RuntimeError(
             f"{len(processes) - len(items)} shard worker(s) produced no results"
         )
 
-    results: list[MatchRow] = []
-    for shard_id, shard_results in sorted(
-        (item[0], item[1]) for item in items if item[1] is not None
-    ):
-        results.extend(shard_results)
+    results = [result for result in results_by_index if result is not None]
+    if len(results) != len(game_seeds):
+        raise RuntimeError("shards lost games while reassembling global order")
+    if metrics_out is not None:
+        metrics_out.extend(
+            metrics_by_shard[shard_id] for shard_id in sorted(metrics_by_shard)
+        )
     assert len(results) == len(game_seeds), "shards lost games"
     return results
 
@@ -137,6 +154,7 @@ def run_shards(
 def _shard_worker(
     roster: list[np.ndarray],
     arch: genome_mod.Arch,
+    game_indices: list[int],
     game_seeds: list[int],
     meta: np.ndarray,
     cap: int,
@@ -144,6 +162,7 @@ def _shard_worker(
     results_queue: Any,
     progress_queue: Any,
     shard_id: int,
+    max_rounds: int | None,
 ) -> None:
     from canastra_train import league
 
@@ -152,6 +171,7 @@ def _shard_worker(
 
         torch.set_num_threads(1)
         stacked = league.build_stacked(roster, arch, device)
+        metrics = league.DriveMetrics()
 
         def _progress(plies: int, finished: int) -> None:
             try:
@@ -160,8 +180,15 @@ def _shard_worker(
                 pass
 
         results = league.drive_pool(
-            stacked, game_seeds, meta, cap, device, progress=_progress
+            stacked,
+            game_seeds,
+            meta,
+            cap,
+            device,
+            progress=_progress,
+            metrics=metrics,
+            max_rounds=max_rounds,
         )
-        results_queue.put((shard_id, results))
+        results_queue.put((shard_id, game_indices, results, metrics))
     except Exception:  # noqa: BLE001 - a worker must never exit silently
-        results_queue.put((shard_id, None, traceback.format_exc()))
+        results_queue.put((shard_id, game_indices, None, traceback.format_exc()))

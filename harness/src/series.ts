@@ -13,6 +13,8 @@ import { step } from "./driver";
 
 export interface MatchResult {
   seed: bigint;
+  /** Driver steps, including hand settlement steps, consumed by the match. */
+  actions: number;
   scores: [number, number];
   hands: number;
   /** Team index, or null if the cap was hit before anyone reached 5000. */
@@ -32,11 +34,12 @@ export function runMatch(seed: bigint, botIds: string[], maxActions = 200_000): 
   const rng = makeRng(Number(seed % 2147483647n) || 1);
   let safeMode = false;
   let restarts = 0;
+  let actions = 0;
 
-  for (let actions = 0; actions < maxActions; actions += 1) {
+  for (; actions < maxActions; actions += 1) {
     const view = match.views()[0] as PlayerView;
     if (view.phase === "MatchOver") {
-      return finish(seed, view, restarts, view.scores[0] > view.scores[1] ? 0 : 1);
+      return finish(seed, view, actions, restarts, view.scores[0] > view.scores[1] ? 0 : 1);
     }
 
     const acting = view.turn;
@@ -59,11 +62,17 @@ export function runMatch(seed: bigint, botIds: string[], maxActions = 200_000): 
   }
 
   const view = match.views()[0] as PlayerView;
-  return finish(seed, view, restarts, null);
+  return finish(seed, view, actions, restarts, null);
 }
 
-function finish(seed: bigint, view: PlayerView, restarts: number, winner: 0 | 1 | null): MatchResult {
-  return { seed, scores: view.scores, hands: view.hand_number, winner, restarts };
+function finish(
+  seed: bigint,
+  view: PlayerView,
+  actions: number,
+  restarts: number,
+  winner: 0 | 1 | null,
+): MatchResult {
+  return { seed, actions, scores: view.scores, hands: view.hand_number, winner, restarts };
 }
 
 export interface SeriesReport {
@@ -75,6 +84,10 @@ export interface SeriesReport {
   meanScoreNos: number;
   meanScoreEles: number;
   meanHands: number;
+  meanActions: number;
+  p95Actions: number;
+  p99Actions: number;
+  maxActions: number;
   restarts: number;
 }
 
@@ -90,6 +103,9 @@ export function series(botIds: string[], count = 100, firstSeed = 1n): SeriesRep
 
   const sum = (pick: (result: MatchResult) => number) =>
     results.reduce((total, result) => total + pick(result), 0);
+  const actionCounts = results.map((result) => result.actions).sort((a, b) => a - b);
+  const percentile = (fraction: number): number =>
+    actionCounts[Math.min(actionCounts.length - 1, Math.floor((actionCounts.length - 1) * fraction))];
 
   return {
     matches: results.length,
@@ -99,6 +115,10 @@ export function series(botIds: string[], count = 100, firstSeed = 1n): SeriesRep
     meanScoreNos: Math.round(sum((result) => result.scores[0]) / results.length),
     meanScoreEles: Math.round(sum((result) => result.scores[1]) / results.length),
     meanHands: Math.round(sum((result) => result.hands) / results.length),
+    meanActions: Math.round(sum((result) => result.actions) / results.length),
+    p95Actions: percentile(0.95),
+    p99Actions: percentile(0.99),
+    maxActions: actionCounts[actionCounts.length - 1],
     restarts: sum((result) => result.restarts),
   };
 }

@@ -65,10 +65,23 @@ Measured on this machine on a **release build**:
   That cut the cuda forward from 57 ms/ply to **27 ms/ply** (encode 17, apply 1.4) and the
   end-to-end pop-96 × 8-shard run from ~16 plies/s to ~33 plies/s. On `cpu` the same
   trimming does not pay off (per-ply forward ~165 ms — the smaller per-bucket ops beat the
-  transfer saving), so keep `--device cpu` only on machines without a big GPU; the default
-  on this laptop's RTX stays `cpu`, but pass `--device cuda` for training runs. The gap
-  between the league figure and the pool figure is the torch effort per ply — the league
-  number is the one to watch when touching the policy or the picker.
+   transfer saving), so keep `--device cpu` only on machines without a big GPU; the default
+   on this laptop's RTX stays `cpu`, but pass `--device cuda` for training runs. The gap
+   between the league figure and the pool figure is the torch effort per ply — the league
+   number is the one to watch when touching the policy or the picker.
+
+The benchmark reports both units now: **batch rounds/s** (the historical `plies/s` value) and
+individual game actions/s. It also reports mean/p95/p99/max actions per game and, for sharded
+runs, the slowest worker's critical-path rounds/s. Use `--max-rounds N` for a bounded calibration
+sample; it is intentionally limited to `--shards 1` so a sample cannot leave worker processes
+running after the parent stops.
+
+Calibrate the real shape without starting a full generation:
+
+```bash
+.venv/bin/python -m canastra_train.bench --shape league --device cuda \
+  --population 96 --opponents 4 --seeds 8 --cap 30000 --max-rounds 10
+```
 
 ## Evaluation
 
@@ -144,9 +157,13 @@ Flags:
 - `--device` (`cpu`|`cuda`|`mps`) — where the torch forward pass runs.
   **Default `cpu`** — on this machine the two devices are close (see Benchmark),
   and CPU keeps a second process (the dashboard writer, checkpointing, and the
-  per-generation GA glue) off the PCIe bus. On the training machine, pass
-  `--device cuda`; the stacked whole-roster forward is one batched pass that
-  uses the GPU at full depth.
+   per-generation GA glue) off the PCIe bus. On the training machine, pass
+   `--device cuda`; the stacked whole-roster forward is one batched pass that
+   uses the GPU at full depth.
+- `--shards` — number of worker processes used for a generation. Benchmark this at `1`, `2`,
+  `4`, and `8`; CPU and CUDA usually have different optima. Shards interleave games and restore
+  results to global order, so fitness remains bit-identical while long matches are less likely to
+  cluster in one worker.
 - `--run-dir` — output directory (default `runs/<timestamp>`).
 - `--resume` — continue from the latest checkpoint in `--run-dir`.
 - `--no-tui` — disable the live dashboard; print one plain line per
@@ -157,7 +174,7 @@ Flags:
 
 On a TTY the trainer renders a watch-only `rich` dashboard while it runs:
 generation count and phase, games finished / total with a progress bar,
-plies and plies/s, ETA for the current generation and the whole run, sigma,
+batch rounds and batch rounds/s, ETA for the current generation and the whole run, sigma,
 fitness best/mean with a sparkline, the last generations' table, and a live
 events feed for the promotion moments — new best-erves, champion exports and
 hall-of-fame archivals. It also writes a throttled, atomically-updated
@@ -196,7 +213,8 @@ npx tsx harness/src/eval-nn.ts runs/<run>/champion-final.json random 1   # from 
 The training-machine gate for M3, measured *after* the run with the M2 tools:
 
 ```bash
-.venv/bin/python -m canastra_train.train --generations 200          # or as needed
+.venv/bin/python -m canastra_train.train --generations 200 \
+  --device cuda --shards 8                                      # or as needed
 npx tsx harness/src/eval-nn.ts runs/<run>/champion-final.json random 1000
 npx tsx harness/src/eval-nn.ts runs/<run>/champion-final.json random-plus 1000
 ```
@@ -207,7 +225,14 @@ on an ordinary laptop this smoke run only proves the loop end to end — the gat
 belongs to the training machine, where a handful of shallow generations is
 nowhere near enough to pull a policy off uniform-random play.
 
-## Coming later
+Each generation record includes `individual_actions`, `mean_actions_per_game`,
+`p95_actions_per_game`, `p99_actions_per_game`, `max_actions_per_game`, `unfinished_games`,
+`individual_actions_per_second`, and `shard_critical_path_batch_rounds_per_second`. Use those
+fields, rather than the dashboard's historical batch-round count alone, to decide whether 200
+generations fit the available window.
 
-CUDA support is a configuration flag for a later milestone — `torch` arrives in M2, and
-`canastra_py` expects to hand tensors to it unchanged.
+## Performance note
+
+CUDA is supported by the current training loop. It is not automatically selected because the
+best device and shard count depend on the training machine; use the bounded benchmark above
+before committing to a long run.

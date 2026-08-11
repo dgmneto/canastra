@@ -116,13 +116,49 @@ def run(
         pairings = league.schedule_pairings(len(pop), opponents, hof, gen_rng)
         dash.status.games_total = len(pairings) * 2 * len(gen_seeds)
         dash.set_phase("evaluating")
+        drive_metrics: list[league.DriveMetrics] = []
+        evaluation_began = time.perf_counter()
         fitness = league.evaluate_generation(
             pop, hof, pairings, arch, gen_seeds, cap, device,
-            progress=dash.on_progress, shards=shards,
+            progress=dash.on_progress, shards=shards, metrics_out=drive_metrics,
         )
+        evaluation_seconds = time.perf_counter() - evaluation_began
 
         last_pop = pop
         last_fitness = fitness
+
+        action_counts = np.concatenate(
+            [np.asarray(item.action_counts, dtype=np.int64) for item in drive_metrics]
+        ) if drive_metrics else np.zeros(0, dtype=np.int64)
+        total_batch_rounds = sum(item.batch_rounds for item in drive_metrics)
+        total_individual_actions = sum(item.individual_actions for item in drive_metrics)
+        record_metrics = {
+            "batch_rounds": total_batch_rounds,
+            "individual_actions": total_individual_actions,
+            "aggregate_batch_rounds_per_second": (
+                total_batch_rounds / evaluation_seconds if evaluation_seconds else 0.0
+            ),
+            "individual_actions_per_second": (
+                total_individual_actions / evaluation_seconds if evaluation_seconds else 0.0
+            ),
+            "mean_actions_per_game": (
+                float(action_counts.mean()) if action_counts.size else 0.0
+            ),
+            "p95_actions_per_game": (
+                float(np.percentile(action_counts, 95)) if action_counts.size else 0.0
+            ),
+            "p99_actions_per_game": (
+                float(np.percentile(action_counts, 99)) if action_counts.size else 0.0
+            ),
+            "max_actions_per_game": int(action_counts.max()) if action_counts.size else 0,
+            "unfinished_games": sum(item.unfinished_games for item in drive_metrics),
+            "shard_critical_path_batch_rounds_per_second": (
+                max((item.batch_rounds for item in drive_metrics), default=0)
+                / evaluation_seconds
+                if evaluation_seconds
+                else 0.0
+            ),
+        }
 
         champion = int(np.argmax(fitness))
         record = {
@@ -134,6 +170,8 @@ def run(
             "sigma": ga.sigma_for(cfg, generation),
             "seeds": gen_seeds,
             "wall_seconds": round(time.perf_counter() - began, 2),
+            "evaluation_seconds": round(evaluation_seconds, 2),
+            **record_metrics,
         }
         with log_path.open("a") as handle:
             handle.write(json.dumps(record) + "\n")

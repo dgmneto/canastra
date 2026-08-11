@@ -51,14 +51,14 @@ def next_generation(
 ) -> np.ndarray:
     """Elites carried unchanged; the rest are mutated tournament winners."""
     order = np.argsort(fitness)[::-1]
-    elites = pop[order[: cfg.elites]]
     sigma = sigma_for(cfg, generation)
-    children = np.empty((0, pop.shape[1]), dtype=np.float32)
-    for _ in range(cfg.population - cfg.elites):
+    next_pop = np.empty_like(pop)
+    next_pop[: cfg.elites] = pop[order[: cfg.elites]]
+    for child_index in range(cfg.population - cfg.elites):
         parent = pop[_tournament(fitness, cfg.tournament, rng)]
         child = parent + rng.normal(0.0, sigma, size=parent.shape).astype(np.float32)
-        children = np.vstack([children, child[None, :]])
-    return np.vstack([elites, children])
+        next_pop[cfg.elites + child_index] = child
+    return next_pop
 
 
 class HallOfFame:

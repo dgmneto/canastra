@@ -27,17 +27,37 @@ from canastra_train import ga, league
 from canastra_train.train import TRAINING_ARCH
 
 
-def _pool_shape() -> None:
-    pool = Pool(list(range(64)))
+def _pool_shape(
+    max_rounds: int | None,
+    game_count: int,
+    pool_cap: int | None,
+) -> None:
+    pool = Pool(list(range(game_count)), max_actions_per_game=pool_cap)
     rng = np.random.default_rng(7)
     plies = 0
+    actions = 0
+    action_counts = np.zeros(game_count, dtype=np.int64)
     start = time.perf_counter()
     while pool.has_live():
-        _, _, mask, _rows = pool.encode()
+        if max_rounds is not None and plies >= max_rounds:
+            break
+        _, _, mask, rows = pool.encode()
         pool.apply([int(rng.integers(0, int(menu.sum()))) for menu in mask])
+        actions += len(rows)
+        for game in rows[:, 0]:
+            action_counts[int(game)] += 1
         plies += 1
     elapsed = time.perf_counter() - start
-    print(f"{plies} plies in {elapsed:.2f}s = {plies / elapsed:.0f} plies/s")
+    unfinished = sum(result[4] for result in pool.results())
+    print(
+        f"{plies} batch rounds in {elapsed:.2f}s = {plies / elapsed:.0f} rounds/s; "
+        f"{actions} individual actions = {actions / elapsed:.0f} actions/s; "
+        f"unfinished {unfinished}/{game_count}"
+    )
+    print(
+        f"  actions/game mean {action_counts.mean():.1f} p95 {np.percentile(action_counts, 95):.1f} "
+        f"p99 {np.percentile(action_counts, 99):.1f} max {action_counts.max()}"
+    )
 
 
 def _league_shape(
@@ -47,6 +67,7 @@ def _league_shape(
     seed_count: int,
     cap: int,
     shards: int,
+    max_rounds: int | None,
 ) -> None:
     pop = ga.initial_population(
         TRAINING_ARCH, ga.GAConfig(population=population), run_seed=7
@@ -56,44 +77,69 @@ def _league_shape(
     pairings = league.schedule_pairings(len(pop), opponents=opponents, hof=hof, rng=rng)
     seeds = list(range(11, 11 + seed_count))
 
-    plies = 0
-    phases = {"encode": 0.0, "forward": 0.0, "apply": 0.0, "glue": 0.0}
+    drive_metrics: list[league.DriveMetrics] = []
 
-    def on_ply(encode_s: float, forward_s: float, apply_s: float) -> None:
-        nonlocal plies
-        plies += 1
-        phases["encode"] += encode_s
-        phases["forward"] += forward_s
-        phases["apply"] += apply_s
-
-    def progress_count(p: int, _finished: int) -> None:
-        nonlocal plies
-        plies = max(plies, p)
+    def progress_count(_p: int, _finished: int) -> None:
+        return
 
     began = time.perf_counter()
+    limited = False
     if shards > 1:
         league.evaluate_generation(
             pop, hof, pairings, TRAINING_ARCH, seeds, cap, device,
-            progress=progress_count, shards=shards,
+            progress=progress_count, shards=shards, metrics_out=drive_metrics,
+            max_rounds=max_rounds,
         )
     else:
         stacked, game_seeds, meta = league.build_batch(
             pop, hof, pairings, TRAINING_ARCH, seeds=seeds, device=device
         )
-        league.drive_pool(
-            stacked, game_seeds, meta, cap=cap, device=device, on_ply=on_ply
-        )
+        metrics = league.DriveMetrics()
+        try:
+            league.drive_pool(
+                stacked,
+                game_seeds,
+                meta,
+                cap=cap,
+                device=device,
+                metrics=metrics,
+                max_rounds=max_rounds,
+            )
+        except league.BatchRoundLimitReached:
+            limited = True
+        drive_metrics.append(metrics)
     elapsed = time.perf_counter() - began
-    phases["glue"] = elapsed - sum(phases.values())
+    batch_rounds = sum(item.batch_rounds for item in drive_metrics)
+    individual_actions = sum(item.individual_actions for item in drive_metrics)
+    action_counts = np.concatenate(
+        [np.asarray(item.action_counts, dtype=np.int64) for item in drive_metrics]
+    ) if drive_metrics else np.zeros(0, dtype=np.int64)
     print(
-        f"{plies} plies in {elapsed:.2f}s = {plies / elapsed:.0f} plies/s "
+        f"{batch_rounds} aggregate batch rounds in {elapsed:.2f}s = "
+        f"{batch_rounds / elapsed:.0f} rounds/s; "
+        f"{individual_actions / elapsed:.0f} individual actions/s "
         f"(device {device}, pop {population}, shards {shards})"
     )
+    if limited:
+        print(f"  bounded sample stopped at --max-rounds {max_rounds}")
+    print(
+        f"  critical-path rounds/s {max((item.batch_rounds for item in drive_metrics), default=0) / elapsed:.0f}; "
+        f"unfinished {sum(item.unfinished_games for item in drive_metrics)}; "
+        f"actions/game mean {action_counts.mean():.1f} "
+        f"p95 {np.percentile(action_counts, 95):.1f} "
+        f"p99 {np.percentile(action_counts, 99):.1f} max {action_counts.max()}"
+    )
+    phases = {
+        "encode": sum(item.encode_seconds for item in drive_metrics),
+        "forward": sum(item.forward_seconds for item in drive_metrics),
+        "apply": sum(item.apply_seconds for item in drive_metrics),
+    }
+    phases["glue"] = max(elapsed - max(phases.values(), default=0.0), 0.0)
     total = sum(phases.values()) or 1.0
     for name, seconds in phases.items():
         print(
             f"  {name:8s} {seconds:8.3f}s  {100 * seconds / total:5.1f}%  "
-            f"{1000 * seconds / max(plies, 1):7.1f} ms/ply"
+            f"{1000 * seconds / max(batch_rounds, 1):7.1f} ms/round"
         )
 
 
@@ -106,13 +152,33 @@ def main() -> None:
     parser.add_argument("--seeds", type=int, default=2)
     parser.add_argument("--cap", type=int, default=30_000)
     parser.add_argument("--shards", type=int, default=1)
+    parser.add_argument(
+        "--games",
+        type=int,
+        default=64,
+        help="number of games for the raw pool benchmark",
+    )
+    parser.add_argument(
+        "--pool-cap",
+        type=int,
+        default=None,
+        help="per-game action cap for the raw pool benchmark",
+    )
+    parser.add_argument(
+        "--max-rounds",
+        type=int,
+        default=None,
+        help="stop after this many batch rounds; useful for bounded calibration runs",
+    )
     args = parser.parse_args()
+    if args.max_rounds is not None and args.shards > 1:
+        parser.error("--max-rounds currently requires --shards 1")
     if args.shape == "pool":
-        _pool_shape()
+        _pool_shape(args.max_rounds, args.games, args.pool_cap)
     else:
         _league_shape(
             args.device, args.population, args.opponents, args.seeds,
-            args.cap, args.shards,
+            args.cap, args.shards, args.max_rounds,
         )
 
 

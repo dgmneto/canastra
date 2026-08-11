@@ -1,7 +1,7 @@
 """The live dashboard: a watch-only rich TUI over a running training run.
 
 Renders in-process — the trainer itself owns the screen, no second process,
-no polling. Intra-generation progress (games finished, plies/s, ETA) comes
+no polling. Intra-generation progress (games finished, batch rounds/s, ETA) comes
 from the pool loop's progress callback; generation records and promotion
 events (champion exports, HOF archivals, new bests) land as they happen.
 
@@ -177,8 +177,8 @@ class Dashboard:
         )
         progress = Text(
             f"{_bar(s.games_finished, games_total)} {pct:5.1f}%  "
-            f"games {s.games_finished}/{s.games_total}  plies {s.plies}  "
-            f"{pace:,.0f} plies/s",
+            f"games {s.games_finished}/{s.games_total}  batch rounds {s.plies}  "
+            f"{pace:,.0f} batch rounds/s",
         )
         timing = Text(
             f"elapsed {_fmt_duration(s.elapsed_seconds)}"

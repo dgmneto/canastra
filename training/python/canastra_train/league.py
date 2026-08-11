@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from itertools import pairwise
 
 import numpy as np
@@ -24,6 +25,60 @@ from canastra_train import ga, policy
 from canastra_train import genome as genome_mod
 
 MatchRow = tuple[int, tuple[int, int], int | None, int, bool]
+
+
+class BatchRoundLimitReached(RuntimeError):
+    """Raised only by explicitly bounded calibration runs."""
+
+    def __init__(self, max_rounds: int) -> None:
+        super().__init__(f"batch round limit reached: {max_rounds}")
+        self.max_rounds = max_rounds
+
+
+@dataclass
+class DriveMetrics:
+    """Counters for one pool driver, measured in both useful units."""
+
+    batch_rounds: int = 0
+    individual_actions: int = 0
+    elapsed_seconds: float = 0.0
+    encode_seconds: float = 0.0
+    forward_seconds: float = 0.0
+    apply_seconds: float = 0.0
+    action_counts: np.ndarray = field(
+        default_factory=lambda: np.zeros(0, dtype=np.int64)
+    )
+    unfinished_games: int = 0
+
+    def reset(self, game_count: int) -> None:
+        self.batch_rounds = 0
+        self.individual_actions = 0
+        self.elapsed_seconds = 0.0
+        self.encode_seconds = 0.0
+        self.forward_seconds = 0.0
+        self.apply_seconds = 0.0
+        self.action_counts = np.zeros(game_count, dtype=np.int64)
+        self.unfinished_games = 0
+
+    @property
+    def batch_rounds_per_second(self) -> float:
+        return self.batch_rounds / self.elapsed_seconds if self.elapsed_seconds else 0.0
+
+    @property
+    def individual_actions_per_second(self) -> float:
+        return self.individual_actions / self.elapsed_seconds if self.elapsed_seconds else 0.0
+
+    @property
+    def max_actions_per_game(self) -> int:
+        return int(self.action_counts.max()) if self.action_counts.size else 0
+
+    @property
+    def mean_actions_per_game(self) -> float:
+        return (
+            self.individual_actions / len(self.action_counts)
+            if self.action_counts
+            else 0.0
+        )
 
 
 def schedule_pairings(
@@ -110,6 +165,8 @@ def drive_pool(
     device: str,
     progress: Callable[[int, int], None] | None = None,
     on_ply: Callable[[float, float, float], None] | None = None,
+    metrics: DriveMetrics | None = None,
+    max_rounds: int | None = None,
 ) -> list[MatchRow]:
     """Run every game to completion, one batched ply at a time.
 
@@ -119,31 +176,50 @@ def drive_pool(
     wall-clock split — the bench uses it to attribute time to phases.
     """
     pool = Pool(game_seeds, max_actions_per_game=cap)
+    if metrics is not None:
+        metrics.reset(len(game_seeds))
     plies = 0
-    while pool.has_live():
-        began = time.perf_counter()
-        obs, acts, mask, rows = pool.encode()
-        encoded = time.perf_counter()
-        games = rows[:, 0]
-        seats = rows[:, 1]
-        pairing = meta[games]
-        # Genome owning this row: in seating 0, genome A holds the even seats
-        # (team 0); in seating 1 the sides are swapped.
-        genome_idx = np.where(
-            (seats % 2 == 0) == (pairing[:, 2] == 0), pairing[:, 0], pairing[:, 1]
-        )
-        picks = _pick_batch(stacked, obs, acts, mask, genome_idx, device)
-        scored = time.perf_counter()
-        pool.apply(picks.tolist())
-        applied = time.perf_counter()
-        if on_ply is not None:
-            on_ply(encoded - began, scored - encoded, applied - scored)
-        plies += 1
-        if progress is not None and plies % 8 == 0:
-            progress(plies, len(pool.results()))
-    if progress is not None:
-        progress(plies, len(pool.results()))
-    return pool.results()
+    started = time.perf_counter()
+    try:
+        while pool.has_live():
+            if max_rounds is not None and plies >= max_rounds:
+                raise BatchRoundLimitReached(max_rounds)
+            began = time.perf_counter()
+            obs, acts, mask, rows = pool.encode()
+            encoded = time.perf_counter()
+            games = rows[:, 0]
+            seats = rows[:, 1]
+            pairing = meta[games]
+            # Genome owning this row: in seating 0, genome A holds the even seats
+            # (team 0); in seating 1 the sides are swapped.
+            genome_idx = np.where(
+                (seats % 2 == 0) == (pairing[:, 2] == 0), pairing[:, 0], pairing[:, 1]
+            )
+            picks = _pick_batch(stacked, obs, acts, mask, genome_idx, device)
+            scored = time.perf_counter()
+            pool.apply(picks.tolist())
+            applied = time.perf_counter()
+            if metrics is not None:
+                metrics.batch_rounds += 1
+                metrics.individual_actions += len(rows)
+                metrics.encode_seconds += encoded - began
+                metrics.forward_seconds += scored - encoded
+                metrics.apply_seconds += applied - scored
+                np.add.at(metrics.action_counts, games, 1)
+            if on_ply is not None:
+                on_ply(encoded - began, scored - encoded, applied - scored)
+            plies += 1
+            if progress is not None and plies % 8 == 0:
+                progress(plies, len(pool.results()))
+        results = pool.results()
+        if progress is not None:
+            progress(plies, len(results))
+        if metrics is not None:
+            metrics.unfinished_games = sum(result[4] for result in results)
+        return results
+    finally:
+        if metrics is not None:
+            metrics.elapsed_seconds = time.perf_counter() - started
 
 
 def _pick_batch(
@@ -220,11 +296,14 @@ def _pick_batch(
             )
         valid = padded >= 0
         padded = np.where(valid, padded, 0)
+        row_order = inner[padded]
 
-        obs_t = torch.from_numpy(obs[inner][padded]).to(device)
-        acts_t = torch.from_numpy(acts[:, :bucket_width][inner][padded]).to(device)
+        # Compose the row index before indexing the source arrays. Chained
+        # advanced indexing materializes an avoidable intermediate copy.
+        obs_t = torch.from_numpy(obs[row_order]).to(device)
+        acts_t = torch.from_numpy(acts[:, :bucket_width][row_order]).to(device)
         mask_t = (
-            torch.from_numpy(mask[:, :bucket_width][inner][padded]).to(device)
+            torch.from_numpy(mask[:, :bucket_width][row_order]).to(device)
             & torch.from_numpy(valid)[:, :, None].to(device)
         )
         pres_t = torch.from_numpy(present).to(device)
@@ -269,10 +348,11 @@ def _pick_batch_flat(
         padded[g, : counts[g]] = flat[starts[g] : ends[g]]
     valid = padded >= 0
     padded = np.where(valid, padded, 0)
+    row_order = order[padded]
 
-    obs_t = torch.from_numpy(obs[order][padded])
-    acts_t = torch.from_numpy(acts[order][padded])
-    mask_t = torch.from_numpy(mask[order][padded]) & torch.from_numpy(valid)[:, :, None]
+    obs_t = torch.from_numpy(obs[row_order])
+    acts_t = torch.from_numpy(acts[row_order])
+    mask_t = torch.from_numpy(mask[row_order]) & torch.from_numpy(valid)[:, :, None]
 
     scores = policy.logits_stacked(stacked, obs_t, acts_t, mask_t)
     picks_sorted = scores.argmax(dim=2).numpy()[valid]
@@ -291,6 +371,8 @@ def evaluate_generation(
     device: str,
     progress: Callable[[int, int], None] | None = None,
     shards: int = 1,
+    metrics_out: list[DriveMetrics] | None = None,
+    max_rounds: int | None = None,
 ) -> np.ndarray:
     """Mean duplicate-deal differential for every population genome.
 
@@ -302,16 +384,32 @@ def evaluate_generation(
     counts across all shards.
     """
     roster, game_seeds, meta = batch_layout(pop, hof, pairings, seeds)
+    if max_rounds is not None and shards > 1:
+        raise ValueError("max_rounds calibration is only supported with shards=1")
     per_game = 2 * len(seeds)
     if shards > 1:
         from canastra_train import shards as shards_mod
 
         results = shards_mod.run_shards(
-            roster, game_seeds, meta, arch, cap, device, shards, progress
+            roster, game_seeds, meta, arch, cap, device, shards, progress,
+            metrics_out=metrics_out,
+            max_rounds=max_rounds,
         )
     else:
         stacked = build_stacked(roster, arch, device)
-        results = drive_pool(stacked, game_seeds, meta, cap, device, progress=progress)
+        metrics = DriveMetrics()
+        results = drive_pool(
+            stacked,
+            game_seeds,
+            meta,
+            cap,
+            device,
+            progress=progress,
+            metrics=metrics,
+            max_rounds=max_rounds,
+        )
+        if metrics_out is not None:
+            metrics_out.append(metrics)
 
     # Aggregate duplicate-deal differentials per pairing, then per genome.
     assert len(results) == len(game_seeds)
