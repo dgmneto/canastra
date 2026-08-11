@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from canastra_train import genome as genome_mod
+from canastra_train import policy
 
 if TYPE_CHECKING:
     from canastra_train.league import MatchRow
@@ -44,6 +45,7 @@ def run_shards(
     progress: _Progress | None,
     metrics_out: list[Any] | None = None,
     max_rounds: int | None = None,
+    kernel: policy.PolicyKernel = "einsum",
 ) -> list[MatchRow]:
     """Evaluate `game_seeds` across `shards` worker processes.
 
@@ -85,6 +87,7 @@ def run_shards(
                     progress_queue,
                     shard_id,
                     max_rounds,
+                    kernel,
                 ),
             )
         )
@@ -163,6 +166,7 @@ def _shard_worker(
     progress_queue: Any,
     shard_id: int,
     max_rounds: int | None,
+    kernel: policy.PolicyKernel,
 ) -> None:
     from canastra_train import league
 
@@ -188,6 +192,7 @@ def _shard_worker(
             progress=_progress,
             metrics=metrics,
             max_rounds=max_rounds,
+            kernel=kernel,
         )
         results_queue.put((shard_id, game_indices, results, metrics))
     except Exception:  # noqa: BLE001 - a worker must never exit silently
