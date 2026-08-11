@@ -6,9 +6,35 @@ use crate::deal::resolve_red_threes;
 use crate::meld::{Meld, MeldError};
 use crate::state::{GameState, Phase, Seat, TurnContext};
 
-/// Check whether a move is legal, without building the state it would produce.
+/// Check whether a move is legal without building the state it would produce.
+///
+/// This is deliberately separate from [`apply`]. The validator projects only
+/// the parts of the next state that later rules inspect (hand length, card
+/// values, and meld validity), so legal-move enumeration does not clone the
+/// complete position. The state transition below remains the pure, cloning
+/// implementation used by callers that need the resulting state.
 pub fn validate(state: &GameState, seat: Seat, action: &Action) -> Result<(), RuleViolation> {
-    apply(state, seat, action).map(|_| ())
+    if matches!(state.phase, Phase::HandOver | Phase::MatchOver) {
+        return Err(RuleViolation::HandIsOver);
+    }
+    if seat != state.turn {
+        return Err(RuleViolation::NotYourTurn {
+            current: state.turn,
+        });
+    }
+
+    match action {
+        Action::Draw => validate_draw(state),
+        Action::KeepDrawnCard => validate_keep_drawn(state),
+        Action::RefuseDrawnCard => validate_refuse_drawn(state),
+        Action::TakeDiscardPile { core, target } => {
+            validate_take_discard_pile(state, seat, *core, target)
+        }
+        Action::LayMeld { cards } => validate_lay_meld(state, seat, cards),
+        Action::AddToMeld { meld, cards } => validate_add_to_meld(state, seat, *meld, cards),
+        Action::Discard { card } => validate_discard(state, seat, *card),
+        Action::EndTurnWithoutDiscard => validate_end_turn_without_discard(state, seat),
+    }
 }
 
 /// Apply a move and return the resulting state.
@@ -57,6 +83,262 @@ fn require_phase(state: &GameState, expected: Phase) -> Result<(), RuleViolation
     } else {
         Err(RuleViolation::WrongPhase { phase: state.phase })
     }
+}
+
+fn validate_draw(state: &GameState) -> Result<(), RuleViolation> {
+    require_phase(state, Phase::AwaitingDraw)?;
+    if state.turn_context.refusal_available {
+        // The lead player is shown the first non-red-three card. A stock made
+        // entirely of red threes therefore still cannot satisfy the draw.
+        if !state.stock.iter().rev().any(|card| !card.is_red_three()) {
+            return Err(RuleViolation::StockEmpty);
+        }
+    } else if state.stock.is_empty() {
+        return Err(RuleViolation::StockEmpty);
+    }
+    Ok(())
+}
+
+fn validate_keep_drawn(state: &GameState) -> Result<(), RuleViolation> {
+    require_phase(state, Phase::AwaitingRefusalChoice)
+}
+
+fn validate_refuse_drawn(state: &GameState) -> Result<(), RuleViolation> {
+    require_phase(state, Phase::AwaitingRefusalChoice)?;
+    if state.stock.is_empty() {
+        return Err(RuleViolation::StockEmpty);
+    }
+    Ok(())
+}
+
+fn validate_take_discard_pile(
+    state: &GameState,
+    seat: Seat,
+    core: [Card; 2],
+    target: &MeldTarget,
+) -> Result<(), RuleViolation> {
+    require_phase(state, Phase::AwaitingDraw)?;
+
+    let top = *state
+        .discard
+        .last()
+        .ok_or(RuleViolation::DiscardPileEmpty)?;
+    if top.is_black_three() || top.is_wild() {
+        return Err(RuleViolation::DiscardPileBlocked { card: top });
+    }
+    if core.iter().any(|card| card.is_wild()) {
+        return Err(RuleViolation::WildInDiscardCore);
+    }
+
+    let block = [top, core[0], core[1]];
+    match target {
+        MeldTarget::NewMeld => {
+            Meld::new(&block).map_err(|reason| RuleViolation::InvalidMeld { reason })?;
+        }
+        MeldTarget::Existing { meld } => {
+            let existing = state.tables[seat.team().index()]
+                .melds
+                .get(*meld)
+                .cloned()
+                .ok_or(RuleViolation::NoSuchMeld { meld: *meld })?;
+            fold_block_into(existing, &block)?;
+        }
+    }
+
+    // Keep the same error ordering as the transition: meld shape and target
+    // are checked before the two named hand cards are consumed.
+    validate_cards_from_hand(state, seat, &core)?;
+
+    // Taking the pile replaces the discard with the swept cards in hand and
+    // freezes exactly those cards. Project that result without constructing it.
+    let swept = &state.discard[..state.discard.len() - 1];
+    let swept_value: u32 = swept.iter().map(|card| card.points()).sum();
+    let core_value: u32 = core.iter().map(|card| card.points()).sum();
+    let hand_value: u32 = state
+        .hand(seat)
+        .iter()
+        .map(|card| card.points())
+        .sum::<u32>()
+        - core_value
+        + swept_value;
+    let laid_value =
+        state.turn_context.laid_value + block.iter().map(|card| card.points()).sum::<u32>();
+    check_opening_reachable_values(
+        state,
+        seat,
+        state.hand(seat).len() - core.len() + swept.len(),
+        laid_value,
+        true,
+        hand_value,
+        swept_value,
+    )
+}
+
+fn validate_lay_meld(state: &GameState, seat: Seat, cards: &[Card]) -> Result<(), RuleViolation> {
+    require_phase(state, Phase::Melding)?;
+    let meld = Meld::new(cards).map_err(|reason| RuleViolation::InvalidMeld { reason })?;
+    validate_cards_from_hand(state, seat, cards)?;
+
+    let cards_value: u32 = cards.iter().map(|card| card.points()).sum();
+    let hand_value: u32 = state
+        .hand(seat)
+        .iter()
+        .map(|card| card.points())
+        .sum::<u32>()
+        - cards_value;
+    let laid_value = state.turn_context.laid_value + cards_value;
+    let clean = state.has_clean_canastra(seat.team()) || meld.canastra().is_clean();
+    let hand_len = state.hand(seat).len() - cards.len();
+
+    check_hand_end(state, seat, hand_len, clean, true, laid_value)?;
+    check_opening_reachable_values(
+        state,
+        seat,
+        hand_len,
+        laid_value,
+        true,
+        hand_value,
+        state
+            .turn_context
+            .frozen
+            .iter()
+            .map(|card| card.points())
+            .sum(),
+    )
+}
+
+fn validate_add_to_meld(
+    state: &GameState,
+    seat: Seat,
+    index: usize,
+    cards: &[Card],
+) -> Result<(), RuleViolation> {
+    require_phase(state, Phase::Melding)?;
+    if cards.is_empty() {
+        return Err(RuleViolation::NoCardsGiven);
+    }
+    let team = seat.team().index();
+    if state.turn_context.pile_core_meld == Some(index) && cards.iter().any(|card| card.is_wild()) {
+        return Err(RuleViolation::WildInPileCoreMeld);
+    }
+
+    let mut extended = state.tables[team]
+        .melds
+        .get(index)
+        .cloned()
+        .ok_or(RuleViolation::NoSuchMeld { meld: index })?;
+    for &card in cards {
+        extended
+            .add_card(card)
+            .map_err(|reason| RuleViolation::InvalidMeld { reason })?;
+    }
+    validate_cards_from_hand(state, seat, cards)?;
+
+    let cards_value: u32 = cards.iter().map(|card| card.points()).sum();
+    let hand_value: u32 = state
+        .hand(seat)
+        .iter()
+        .map(|card| card.points())
+        .sum::<u32>()
+        - cards_value;
+    let laid_value = state.turn_context.laid_value + cards_value;
+    let clean = state.tables[team]
+        .melds
+        .iter()
+        .enumerate()
+        .any(|(meld, current)| {
+            if meld == index {
+                extended.canastra().is_clean()
+            } else {
+                current.canastra().is_clean()
+            }
+        });
+    let hand_len = state.hand(seat).len() - cards.len();
+
+    check_hand_end(
+        state,
+        seat,
+        hand_len,
+        clean,
+        state.turn_context.laid_anything || !cards.is_empty(),
+        laid_value,
+    )?;
+    check_opening_reachable_values(
+        state,
+        seat,
+        hand_len,
+        laid_value,
+        state.turn_context.laid_anything || !cards.is_empty(),
+        hand_value,
+        state
+            .turn_context
+            .frozen
+            .iter()
+            .map(|card| card.points())
+            .sum(),
+    )
+}
+
+fn validate_discard(state: &GameState, seat: Seat, card: Card) -> Result<(), RuleViolation> {
+    require_phase(state, Phase::Melding)?;
+    if !state.hand(seat).contains(&card) {
+        return Err(RuleViolation::CardNotInHand { card });
+    }
+    check_opening_commit(
+        state,
+        seat,
+        state.turn_context.laid_anything,
+        state.turn_context.laid_value,
+    )?;
+    if state.hand(seat).len() == 1 && !state.has_clean_canastra(seat.team()) {
+        return Err(RuleViolation::NoCleanCanastra);
+    }
+    Ok(())
+}
+
+fn validate_end_turn_without_discard(state: &GameState, seat: Seat) -> Result<(), RuleViolation> {
+    require_phase(state, Phase::Melding)?;
+    let cornered = state.stock.is_empty()
+        && state.hand(seat).len() == 1
+        && !state.has_clean_canastra(seat.team());
+    if !cornered {
+        return Err(RuleViolation::MustDiscard);
+    }
+    check_opening_commit(
+        state,
+        seat,
+        state.turn_context.laid_anything,
+        state.turn_context.laid_value,
+    )
+}
+
+/// Validate the cards that a transition would remove from a hand. The prefix
+/// count models earlier duplicate cards in the same action without copying the
+/// hand or the surrounding `GameState`.
+fn validate_cards_from_hand(
+    state: &GameState,
+    seat: Seat,
+    cards: &[Card],
+) -> Result<(), RuleViolation> {
+    let hand = state.hand(seat);
+    for (index, &card) in cards.iter().enumerate() {
+        let held = hand.iter().filter(|held| **held == card).count();
+        let consumed = cards[..index].iter().filter(|held| **held == card).count();
+        let remaining = held.saturating_sub(consumed);
+        if remaining == 0 {
+            return Err(RuleViolation::CardNotInHand { card });
+        }
+        let frozen = state
+            .turn_context
+            .frozen
+            .iter()
+            .filter(|frozen| **frozen == card)
+            .count();
+        if remaining <= frozen {
+            return Err(RuleViolation::CardFrozen { card });
+        }
+    }
+    Ok(())
 }
 
 /// §4.1: draw one card from the stock.
@@ -298,21 +580,19 @@ fn add_to_meld(
 /// [`Action::EndTurnWithoutDiscard`] carries the turn (clarification #6).
 fn maybe_go_out(state: &mut GameState, seat: Seat) -> Result<(), RuleViolation> {
     let remaining = state.hands[seat.index()].len();
-    if remaining > 1 {
-        return Ok(());
-    }
     let clean = state.has_clean_canastra(seat.team());
-
-    if remaining == 1 {
-        if !clean && !state.stock.is_empty() {
-            return Err(RuleViolation::WouldStrandLastCard);
-        }
+    check_hand_end(
+        state,
+        seat,
+        remaining,
+        clean,
+        state.turn_context.laid_anything,
+        state.turn_context.laid_value,
+    )?;
+    if remaining != 0 {
         return Ok(());
     }
 
-    if !clean {
-        return Err(RuleViolation::NoCleanCanastra);
-    }
     commit_opening(state, seat)?;
     state.went_out = Some(seat);
     state.phase = Phase::HandOver;
@@ -380,22 +660,6 @@ fn record_laid(state: &mut GameState, cards: &[Card]) {
 /// of an arbitrary hand, which is the combinatorial problem `legal_actions` also
 /// runs into.
 fn check_opening_reachable(state: &GameState, seat: Seat) -> Result<(), RuleViolation> {
-    let team = seat.team();
-    if state.table(team).opened || !state.turn_context.laid_anything {
-        return Ok(());
-    }
-    // An empty hand means the turn is over; §6 is judged exactly, not predicted.
-    if state.hands[seat.index()].is_empty() {
-        return Ok(());
-    }
-
-    let required = state.opening_minimum_for(team);
-    let laid = state.turn_context.laid_value;
-    if laid >= required {
-        return Ok(());
-    }
-
-    // §5: cards frozen this turn cannot be melded, so they cannot help.
     let held: u32 = state.hand(seat).iter().map(|card| card.points()).sum();
     let frozen: u32 = state
         .turn_context
@@ -403,6 +667,42 @@ fn check_opening_reachable(state: &GameState, seat: Seat) -> Result<(), RuleViol
         .iter()
         .map(|card| card.points())
         .sum();
+    check_opening_reachable_values(
+        state,
+        seat,
+        state.hand(seat).len(),
+        state.turn_context.laid_value,
+        state.turn_context.laid_anything,
+        held,
+        frozen,
+    )
+}
+
+fn check_opening_reachable_values(
+    state: &GameState,
+    seat: Seat,
+    hand_len: usize,
+    laid_value: u32,
+    laid_anything: bool,
+    held: u32,
+    frozen: u32,
+) -> Result<(), RuleViolation> {
+    let team = seat.team();
+    if state.table(team).opened || !laid_anything {
+        return Ok(());
+    }
+    // An empty hand means the turn is over; §6 is judged exactly, not predicted.
+    if hand_len == 0 {
+        return Ok(());
+    }
+
+    let required = state.opening_minimum_for(team);
+    let laid = laid_value;
+    if laid >= required {
+        return Ok(());
+    }
+
+    // §5: cards frozen this turn cannot be melded, so they cannot help.
     let best_possible = laid + held.saturating_sub(frozen);
 
     if best_possible < required {
@@ -415,6 +715,29 @@ fn check_opening_reachable(state: &GameState, seat: Seat) -> Result<(), RuleViol
     Ok(())
 }
 
+fn check_hand_end(
+    state: &GameState,
+    seat: Seat,
+    remaining: usize,
+    clean: bool,
+    laid_anything: bool,
+    laid_value: u32,
+) -> Result<(), RuleViolation> {
+    match remaining {
+        0 => {
+            if !clean {
+                return Err(RuleViolation::NoCleanCanastra);
+            }
+            check_opening_commit(state, seat, laid_anything, laid_value)?;
+        }
+        1 if !clean && !state.stock.is_empty() => {
+            return Err(RuleViolation::WouldStrandLastCard);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// §6: a partnership's first melds must clear the bar within a single turn.
 ///
 /// Checked as the turn ends, because that is the first moment the total is
@@ -422,15 +745,34 @@ fn check_opening_reachable(state: &GameState, seat: Seat) -> Result<(), RuleViol
 /// caller backs out to the state the turn started from.
 fn commit_opening(state: &mut GameState, seat: Seat) -> Result<(), RuleViolation> {
     let team = seat.team();
+    check_opening_commit(
+        state,
+        seat,
+        state.turn_context.laid_anything,
+        state.turn_context.laid_value,
+    )?;
     if state.table(team).opened || !state.turn_context.laid_anything {
         return Ok(());
     }
+    state.tables[team.index()].opened = true;
+    Ok(())
+}
+
+fn check_opening_commit(
+    state: &GameState,
+    seat: Seat,
+    laid_anything: bool,
+    laid_value: u32,
+) -> Result<(), RuleViolation> {
+    let team = seat.team();
+    if state.table(team).opened || !laid_anything {
+        return Ok(());
+    }
     let required = state.opening_minimum_for(team);
-    let laid = state.turn_context.laid_value;
+    let laid = laid_value;
     if laid < required {
         return Err(RuleViolation::OpeningMinimumNotMet { laid, required });
     }
-    state.tables[team.index()].opened = true;
     Ok(())
 }
 

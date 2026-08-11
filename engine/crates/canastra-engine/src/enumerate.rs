@@ -3,11 +3,12 @@
 //! `enumerate` answers the question every bot has to ask — "what am I allowed
 //! to do right now?" — so policies rank real moves instead of guessing and
 //! checking `apply` errors. It generates a cheap superset of candidates and
-//! lets `apply` judge every one: the rules stay in exactly one place, and the
-//! two can never drift apart.
+//! lets the engine's non-cloning validator judge every one. The validator shares
+//! the transition's rule predicates, while `apply` remains the final pure state
+//! transition.
 
 use crate::action::{Action, MeldTarget};
-use crate::apply::apply;
+use crate::apply::validate;
 use crate::card::{Card, Rank, Suit};
 use crate::state::{GameState, Phase, Seat};
 
@@ -18,16 +19,11 @@ pub fn enumerate(state: &GameState, seat: Seat) -> Vec<Action> {
     if seat != state.turn {
         return Vec::new();
     }
-    let candidates = match state.phase {
-        Phase::AwaitingDraw => draw_candidates(state, seat),
-        Phase::AwaitingRefusalChoice => refusal_candidates(),
-        Phase::Melding => melding_candidates(state, seat),
-        Phase::HandOver | Phase::MatchOver => Vec::new(),
-    };
+    let candidates = candidate_actions(state, seat);
 
     let mut actions: Vec<Action> = candidates
         .into_iter()
-        .filter(|action| apply(state, seat, action).is_ok())
+        .filter(|action| validate(state, seat, action).is_ok())
         .collect();
     // Deterministic order matters: seed + action log must keep replaying, and
     // bots keyed on the list need a stable input. Candidates are already
@@ -36,6 +32,15 @@ pub fn enumerate(state: &GameState, seat: Seat) -> Vec<Action> {
     actions.sort_by_key(|action| format!("{action:?}"));
     actions.dedup();
     actions
+}
+
+fn candidate_actions(state: &GameState, seat: Seat) -> Vec<Action> {
+    match state.phase {
+        Phase::AwaitingDraw => draw_candidates(state, seat),
+        Phase::AwaitingRefusalChoice => refusal_candidates(),
+        Phase::Melding => melding_candidates(state, seat),
+        Phase::HandOver | Phase::MatchOver => Vec::new(),
+    }
 }
 
 /// §3: the lead player's one-time choice about the card they were shown.
@@ -65,7 +70,7 @@ fn draw_candidates(state: &GameState, seat: Seat) -> Vec<Action> {
 /// §5 cores: every unordered pair of natural cards held. Multiset-based — a
 /// same-value pair (e.g. two A♥) is a candidate when two copies are held,
 /// since a pair of aces with an ace on top is a legal capture. Wilds are
-/// excluded statically; `apply` filters blocked tops, frozen cores, §6
+/// excluded statically; the validator filters blocked tops, frozen cores, §6
 /// reachability, and invalid joins.
 fn natural_pairs(hand: &[Card]) -> Vec<[Card; 2]> {
     let mut uniques: Vec<Card> = hand
@@ -243,4 +248,78 @@ fn combinations(cards: &[Card], size: usize) -> Vec<Vec<Card>> {
 fn lay(mut cards: Vec<Card>) -> Action {
     cards.sort_by_key(|card| card.to_string());
     Action::LayMeld { cards }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::apply::{apply, validate};
+    use crate::deal::new_game;
+    use crate::score::settle_hand;
+
+    fn mix(seed: u64, ply: u64) -> usize {
+        let mut x = seed ^ ply.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        (x ^ (x >> 31)) as usize
+    }
+
+    /// Compare the non-cloning path with the existing transition for every
+    /// candidate the enumerator considers, including candidates that are
+    /// deliberately only a cheap superset. The wider seeded run is available
+    /// with `CANASTRA_VALIDATE_SEEDS=50`.
+    #[test]
+    fn validation_matches_apply_for_candidate_corpus() {
+        let seeds: u64 = std::env::var("CANASTRA_VALIDATE_SEEDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(2);
+
+        for seed in 0..seeds {
+            let mut state = new_game(seed);
+            let mut turn_start = state.clone();
+            let mut safe = false;
+            for ply in 0..20_000u64 {
+                if state.phase == Phase::HandOver {
+                    state = settle_hand(&state).expect("settle");
+                    continue;
+                }
+                if state.phase == Phase::MatchOver {
+                    break;
+                }
+                if matches!(
+                    state.phase,
+                    Phase::AwaitingDraw | Phase::AwaitingRefusalChoice
+                ) {
+                    turn_start = state.clone();
+                    safe = false;
+                }
+
+                let seat = state.turn;
+                for action in candidate_actions(&state, seat) {
+                    let expected = apply(&state, seat, &action).map(|_| ());
+                    assert_eq!(
+                        validate(&state, seat, &action),
+                        expected,
+                        "seed {seed}, ply {ply}, phase {:?}, action {action:?}",
+                        state.phase,
+                    );
+                }
+
+                let actions = enumerate(&state, seat);
+                if actions.is_empty() {
+                    assert!(!safe, "even the plain retry dead-ended (seed {seed})");
+                    state = turn_start.clone();
+                    safe = true;
+                    continue;
+                }
+                let pick = if safe {
+                    0
+                } else {
+                    mix(seed, ply) % actions.len()
+                };
+                state = apply(&state, seat, &actions[pick]).expect("enumerated action applies");
+            }
+        }
+    }
 }
