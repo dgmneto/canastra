@@ -7,7 +7,9 @@
 //! rule.
 
 use canastra_encode::{encode_actions, encode_observation, ACT_DIM, OBS_DIM};
-use canastra_engine::{apply, enumerate, new_game, observe, settle_hand, Action, GameState, Phase};
+use canastra_engine::{
+    apply, enumerate, new_game, observe, settle_hand, Action, GameState, Phase, RuleViolation,
+};
 use numpy::{PyArray2, PyArray3, PyArrayMethods};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -84,6 +86,64 @@ impl Game {
                 )
             })
             .collect()
+    }
+
+    fn apply_selected(
+        &mut self,
+        action: &Action,
+        max_actions_per_game: Option<u64>,
+    ) -> Result<(), RuleViolation> {
+        let next_state = apply(&self.state, self.state.turn, action);
+        self.commit_selected(action, next_state, max_actions_per_game)
+    }
+
+    fn commit_selected(
+        &mut self,
+        action: &Action,
+        next_state: Result<GameState, RuleViolation>,
+        max_actions_per_game: Option<u64>,
+    ) -> Result<(), RuleViolation> {
+        // Keep the whole transition together: checkpointing, safe-mode, settlement,
+        // and the cap all belong to this game's action, not to the batch.
+        if matches!(
+            self.state.phase,
+            Phase::AwaitingDraw | Phase::AwaitingRefusalChoice
+        ) {
+            self.turn_start = self.state.clone();
+        }
+        if matches!(
+            action,
+            Action::Discard { .. } | Action::EndTurnWithoutDiscard
+        ) {
+            self.safe = false;
+        }
+        self.state = next_state?;
+        if self.state.phase == Phase::HandOver {
+            self.state = settle_hand(&self.state)?;
+            if self.state.phase == Phase::MatchOver {
+                self.result = Some((
+                    self.seed,
+                    self.state.scores,
+                    self.state.winner().map(|team| team.index() as u8),
+                    self.hands,
+                    false,
+                ));
+            } else {
+                self.hands += 1;
+            }
+        }
+        self.actions_played += 1;
+        // A live game that blows past its action ceiling is ended as unfinished
+        // rather than left to straggle — one pathological genome pair must not
+        // hang a generation.
+        if self.result.is_none() {
+            if let Some(cap) = max_actions_per_game {
+                if self.actions_played >= cap {
+                    self.result = Some((self.seed, self.state.scores, None, self.hands, true));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -177,44 +237,43 @@ impl Pool {
         let mask = PyArray2::<bool>::zeros(py, [rows, width], false);
         let grid = PyArray2::<i64>::zeros(py, [rows, 2], false);
 
-        // Encode (views + features) in parallel into per-row scratch, then
-        // copy into the numpy buffers — enumerate/apply dominate; the copy is
-        // memcpy-cheap and keeps the numpy API single-threaded.
-        let encoded: Vec<(Vec<f32>, Vec<f32>)> = self
-            .pending
+        // Encode directly into the disjoint NumPy rows. Keeping the arrays
+        // NumPy-owned avoids per-row scratch vectors and serial row copies.
+        let obs_ptr = obs.data() as usize;
+        let acts_ptr = acts.data() as usize;
+        let mask_ptr = mask.data() as usize;
+        let grid_ptr = grid.data() as usize;
+        self.pending
             .par_iter()
+            .enumerate()
             .zip(self.menus.par_iter())
-            .map(|(&i, menu)| {
-                let view = observe(&self.games[i].state, self.games[i].state.turn);
-                let mut obs_row = vec![0.0; OBS_DIM];
-                encode_observation(&view, &mut obs_row);
-                let mut act_rows = vec![0.0; menu.len() * ACT_DIM];
-                encode_actions(&view, menu, &mut act_rows);
-                (obs_row, act_rows)
-            })
-            .collect();
-
-        {
-            let mut obs_view = unsafe { obs.as_array_mut() };
-            let mut acts_view = unsafe { acts.as_array_mut() };
-            let mut mask_view = unsafe { mask.as_array_mut() };
-            let mut rows_view = unsafe { grid.as_array_mut() };
-            for (row, (obs_row, act_rows)) in encoded.iter().enumerate() {
-                let game = self.pending[row];
-                rows_view[[row, 0]] = game as i64;
-                rows_view[[row, 1]] = self.games[game].state.turn.index() as i64;
-                obs_view
-                    .row_mut(row)
-                    .assign(&ndarray::ArrayView1::from(obs_row));
-                for (col, chunk) in act_rows.chunks(ACT_DIM).enumerate() {
-                    let mut acts_row = acts_view.index_axis_mut(ndarray::Axis(0), row);
-                    acts_row
-                        .index_axis_mut(ndarray::Axis(0), col)
-                        .assign(&ndarray::ArrayView1::from(chunk));
-                    mask_view[[row, col]] = true;
+            .for_each(|((row, &game), menu)| {
+                // SAFETY: each row range is unique to this closure, the arrays
+                // stay alive until the parallel loop completes, and the GIL
+                // prevents Python from accessing them during the writes.
+                unsafe {
+                    let obs_row = std::slice::from_raw_parts_mut(
+                        (obs_ptr as *mut f32).add(row * OBS_DIM),
+                        OBS_DIM,
+                    );
+                    let acts_row = std::slice::from_raw_parts_mut(
+                        (acts_ptr as *mut f32).add(row * width * ACT_DIM),
+                        width * ACT_DIM,
+                    );
+                    let mask_row = std::slice::from_raw_parts_mut(
+                        (mask_ptr as *mut bool).add(row * width),
+                        width,
+                    );
+                    let grid_row =
+                        std::slice::from_raw_parts_mut((grid_ptr as *mut i64).add(row * 2), 2);
+                    let view = observe(&self.games[game].state, self.games[game].state.turn);
+                    encode_observation(&view, obs_row);
+                    encode_actions(&view, menu, &mut acts_row[..menu.len() * ACT_DIM]);
+                    mask_row[..menu.len()].fill(true);
+                    grid_row[0] = game as i64;
+                    grid_row[1] = self.games[game].state.turn.index() as i64;
                 }
-            }
-        }
+            });
 
         Ok((obs, acts, mask, grid))
     }
@@ -228,61 +287,43 @@ impl Pool {
                 picks.len()
             )));
         }
+        let max_actions_per_game = self.max_actions_per_game;
+        let mut selected = vec![None; self.games.len()];
         for (row, pick) in picks.into_iter().enumerate() {
-            let game = &mut self.games[self.pending[row]];
-            let action = self.menus[row]
-                .get(pick)
-                .ok_or_else(|| PyValueError::new_err("menu index out of range"))?
-                .clone();
-            // Refresh the turn checkpoint on entry to a fresh turn. Note the
-            // deliberate divergence from the harness driver here: we also
-            // re-capture on `AwaitingRefusalChoice`, so a red-3 replacement
-            // turn replays from the post-draw position with the red 3 already
-            // on the table, rather than replaying the draw. Safe-clearing is
-            // independent of this and happens on turn end below.
-            if matches!(
-                game.state.phase,
-                Phase::AwaitingDraw | Phase::AwaitingRefusalChoice
-            ) {
-                game.turn_start = game.state.clone();
-            }
-            // The safe flag lasts the whole retried turn — the harness driver
-            // clears safeMode the same way, on the turn-ending action.
-            // Clearing it earlier (e.g. on the retry's own Draw) would hand
-            // the full meld menu straight back and reproduce the dead-end.
-            if matches!(
-                action,
-                Action::Discard { .. } | Action::EndTurnWithoutDiscard
-            ) {
-                game.safe = false;
-            }
-            game.state = apply(&game.state, game.state.turn, &action)
-                .map_err(|violation| PyValueError::new_err(violation.to_string()))?;
-            if game.state.phase == Phase::HandOver {
-                game.state = settle_hand(&game.state)
-                    .map_err(|violation| PyValueError::new_err(violation.to_string()))?;
-                if game.state.phase == Phase::MatchOver {
-                    game.result = Some((
-                        game.seed,
-                        game.state.scores,
-                        game.state.winner().map(|team| team.index() as u8),
-                        game.hands,
-                        false,
-                    ));
-                } else {
-                    game.hands += 1;
-                }
-            }
-            game.actions_played += 1;
-            // A live game that blows past its action ceiling is ended as
-            // unfinished rather than left to straggle — one pathological
-            // genome pair must not hang a generation.
-            if game.result.is_none() {
-                if let Some(cap) = self.max_actions_per_game {
-                    if game.actions_played >= cap {
-                        game.result = Some((game.seed, game.state.scores, None, game.hands, true));
+            let game_index = self.pending[row];
+            let action = match self.menus[row].get(pick) {
+                Some(action) => action.clone(),
+                None => {
+                    // Preserve the old error path: rows before the bad pick
+                    // have already been applied when the error is reported.
+                    for &previous_game in self.pending.iter().take(row) {
+                        let action = selected[previous_game].take().expect("selected action");
+                        self.games[previous_game]
+                            .apply_selected(&action, max_actions_per_game)
+                            .map_err(|violation| PyValueError::new_err(violation.to_string()))?;
                     }
+                    return Err(PyValueError::new_err("menu index out of range"));
                 }
+            };
+            selected[game_index] = Some(action);
+        }
+
+        let mut applied: Vec<(usize, Result<GameState, RuleViolation>)> = self
+            .games
+            .par_iter()
+            .enumerate()
+            .filter_map(|(game_index, game)| {
+                let action = selected[game_index].as_ref()?;
+                Some((game_index, apply(&game.state, game.state.turn, action)))
+            })
+            .collect();
+        applied.sort_unstable_by_key(|(game, _)| *game);
+        for (game_index, next_state) in applied {
+            let action = selected[game_index].as_ref().expect("selected action");
+            if let Err(violation) =
+                self.games[game_index].commit_selected(action, next_state, max_actions_per_game)
+            {
+                return Err(PyValueError::new_err(violation.to_string()));
             }
         }
         Ok(())

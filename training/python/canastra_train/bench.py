@@ -4,9 +4,9 @@
   when touching the pool or the encoder.
 - `--shape league` measures the real generation loop through `drive_pool`:
   the same batched encode/forward/apply with the whole roster scored in one
-  stacked `einsum` forward, and reports the per-ply phase split. This is the
-  number to watch when touching the policy/glue. Use `--device` to compare
-  cpu and cuda.
+  stacked policy-kernel forward, and reports the per-ply phase split. This is
+  the number to watch when touching the policy/glue. Use `--device` to compare
+  cpu and cuda, and `--kernel` to select the policy implementation.
 
 Per-ply cost scales with the batch size, so tune `--population`/`--opponents`/
 `--seeds`/`--cap` to the shape you actually train with — the pop-8 defaults are
@@ -23,7 +23,7 @@ import time
 import numpy as np
 from canastra_py import Pool
 
-from canastra_train import ga, league
+from canastra_train import ga, league, policy
 from canastra_train.train import TRAINING_ARCH
 
 
@@ -68,6 +68,7 @@ def _league_shape(
     cap: int,
     shards: int,
     max_rounds: int | None,
+    kernel: policy.PolicyKernel,
 ) -> None:
     pop = ga.initial_population(
         TRAINING_ARCH, ga.GAConfig(population=population), run_seed=7
@@ -88,7 +89,7 @@ def _league_shape(
         league.evaluate_generation(
             pop, hof, pairings, TRAINING_ARCH, seeds, cap, device,
             progress=progress_count, shards=shards, metrics_out=drive_metrics,
-            max_rounds=max_rounds,
+            max_rounds=max_rounds, kernel=kernel,
         )
     else:
         stacked, game_seeds, meta = league.build_batch(
@@ -104,6 +105,7 @@ def _league_shape(
                 device=device,
                 metrics=metrics,
                 max_rounds=max_rounds,
+                kernel=kernel,
             )
         except league.BatchRoundLimitReached:
             limited = True
@@ -118,7 +120,7 @@ def _league_shape(
         f"{batch_rounds} aggregate batch rounds in {elapsed:.2f}s = "
         f"{batch_rounds / elapsed:.0f} rounds/s; "
         f"{individual_actions / elapsed:.0f} individual actions/s "
-        f"(device {device}, pop {population}, shards {shards})"
+        f"(device {device}, kernel {kernel}, pop {population}, shards {shards})"
     )
     if limited:
         print(f"  bounded sample stopped at --max-rounds {max_rounds}")
@@ -147,6 +149,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--shape", choices=["pool", "league"], default="pool")
     parser.add_argument("--device", choices=["cpu", "cuda", "mps"], default="cpu")
+    parser.add_argument("--kernel", choices=["einsum", "bmm"], default="einsum")
     parser.add_argument("--population", type=int, default=8)
     parser.add_argument("--opponents", type=int, default=2)
     parser.add_argument("--seeds", type=int, default=2)
@@ -179,6 +182,7 @@ def main() -> None:
         _league_shape(
             args.device, args.population, args.opponents, args.seeds,
             args.cap, args.shards, args.max_rounds,
+            args.kernel,
         )
 
 

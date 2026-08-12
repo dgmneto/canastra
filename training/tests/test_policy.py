@@ -31,3 +31,31 @@ def test_scoring_is_deterministic() -> None:
     first = policy.logits(trunk, head, obs, acts, mask)
     second = policy.logits(trunk, head, obs, acts, mask)
     assert torch.equal(first, second)
+
+
+def test_stacked_bmm_preserves_fixed_batch_picks() -> None:
+    roster = [genome.random_genome(ARCH, seed) for seed in (11, 23, 37)]
+    stack = policy.stack_weights(roster, ARCH, "cpu")
+    generator = torch.Generator().manual_seed(91)
+    obs = torch.randn(3, 5, 2002, generator=generator)
+    acts = torch.randn(3, 5, 7, 101, generator=generator)
+    mask = torch.tensor(
+        [
+            [[True, True, False, False, False, False, False]] * 5,
+            [[True, True, True, False, False, False, False]] * 5,
+            [[True, True, True, True, True, False, False]] * 5,
+        ]
+    )
+
+    default = policy.logits_stacked(stack, obs, acts, mask)
+    einsum = policy.logits_stacked(stack, obs, acts, mask, kernel="einsum")
+    bmm = policy.logits_stacked(stack, obs, acts, mask, kernel="bmm")
+    valid = mask
+    max_abs = float((einsum[valid] - bmm[valid]).abs().max())
+    disagreements = int(
+        (einsum.argmax(dim=2) != bmm.argmax(dim=2)).sum()
+    )
+    print(f"\nstacked bmm max_abs={max_abs:.3e}, argmax_disagreements={disagreements}")
+
+    assert torch.equal(default, einsum)
+    assert disagreements == 0
