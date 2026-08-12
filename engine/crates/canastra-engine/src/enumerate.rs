@@ -319,6 +319,11 @@ mod tests {
                     mix(seed, ply) % actions.len()
                 };
                 state = apply(&state, seat, &actions[pick]).expect("enumerated action applies");
+            }
+        }
+    }
+}
+
 /// The fixed-width key for the card's wire/display string (`"6D"`, `"JOKER"`).
 /// Zeroes are the string terminator for the two-byte standard-card form, so the
 /// array's ordinary lexicographic order is the same as `Card::to_string()`.
