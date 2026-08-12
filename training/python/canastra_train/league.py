@@ -133,8 +133,8 @@ def build_stacked(roster: list[np.ndarray], arch: genome_mod.Arch, device: str) 
     """Stack the roster's flat genomes into one set of `[G, ...]` weight tensors.
 
     Built once per generation (or per shard worker), then reused every ply:
-    the ply loop forwards the whole population in a handful of batched
-    `einsum` calls instead of one tiny per-genome forward.
+    the ply loop forwards the whole population in a handful of batched policy
+    kernel calls instead of one tiny per-genome forward.
     """
     return policy.stack_weights(roster, arch, device)
 
@@ -167,6 +167,7 @@ def drive_pool(
     on_ply: Callable[[float, float, float], None] | None = None,
     metrics: DriveMetrics | None = None,
     max_rounds: int | None = None,
+    kernel: policy.PolicyKernel = "einsum",
 ) -> list[MatchRow]:
     """Run every game to completion, one batched ply at a time.
 
@@ -195,7 +196,7 @@ def drive_pool(
             genome_idx = np.where(
                 (seats % 2 == 0) == (pairing[:, 2] == 0), pairing[:, 0], pairing[:, 1]
             )
-            picks = _pick_batch(stacked, obs, acts, mask, genome_idx, device)
+            picks = _pick_batch(stacked, obs, acts, mask, genome_idx, device, kernel)
             scored = time.perf_counter()
             pool.apply(picks.tolist())
             applied = time.perf_counter()
@@ -229,6 +230,7 @@ def _pick_batch(
     mask: np.ndarray,
     genome_idx: np.ndarray,
     device: str,
+    kernel: policy.PolicyKernel = "einsum",
 ) -> np.ndarray:
     """One argmax pick per pending row, routed to the row's owner genome.
 
@@ -240,9 +242,12 @@ def _pick_batch(
     a ~2× cut in the cuda forward. CPU pays no transfer cost, so bucketing only
     adds small-op overhead there; it bypasses the bucket logic entirely.
 
-    Both paths are bit-identical to each other (and so shard and single-process
-    agree), because the einsum kernels are stable across the batch shape (N, G,
-    and width), and the invariants below pin the last ulps:
+    With the default `einsum` kernel, both picker paths are bit-identical to
+    each other (and so shard and single-process agree), because the einsum
+    kernels are stable across the batch shape (N, G, and width), and the
+    invariants below pin the last ulps. The opt-in `bmm` kernel is the measured
+    experiment and is expected to be compared by policy picks rather than this
+    default bit-identity contract:
 
     - Every group is padded to at least 4 rows. torch's batched kernels switch
       GEMM implementations when a batch element has N<=3 rows, which changes
@@ -254,7 +259,7 @@ def _pick_batch(
       weights match the roster the generation was built from.
     """
     if device == "cpu":
-        return _pick_batch_flat(stacked, obs, acts, mask, genome_idx)
+        return _pick_batch_flat(stacked, obs, acts, mask, genome_idx, kernel)
     rw = mask.sum(axis=1)  # real menu size per row
     n_rows = len(rw)
     order = np.argsort(rw, kind="stable")
@@ -279,7 +284,7 @@ def _pick_batch(
             continue
         sel = order[start:end]
         bucket_width = int(rw_sorted[end - 1])
-        # Sort the bucket's rows by genome for block einsum efficiency.
+        # Sort the bucket's rows by genome for block-kernel efficiency.
         o2 = np.argsort(genome_idx[sel], kind="stable")
         inner = sel[o2]
         g_sel = genome_idx[inner]
@@ -313,7 +318,7 @@ def _pick_batch(
             [w[pres_t] for w in stacked.head_w],
             [b[pres_t] for b in stacked.head_b],
         )
-        scores = policy.logits_stacked(sub, obs_t, acts_t, mask_t)
+        scores = policy.logits_stacked(sub, obs_t, acts_t, mask_t, kernel=kernel)
         picks[inner] = scores.argmax(dim=2).cpu().numpy()[valid]
 
     return picks
@@ -325,6 +330,7 @@ def _pick_batch_flat(
     acts: np.ndarray,
     mask: np.ndarray,
     genome_idx: np.ndarray,
+    kernel: policy.PolicyKernel = "einsum",
 ) -> np.ndarray:
     """The un-bucketed full-roster forward, used on CPU.
 
@@ -354,7 +360,7 @@ def _pick_batch_flat(
     acts_t = torch.from_numpy(acts[row_order])
     mask_t = torch.from_numpy(mask[row_order]) & torch.from_numpy(valid)[:, :, None]
 
-    scores = policy.logits_stacked(stacked, obs_t, acts_t, mask_t)
+    scores = policy.logits_stacked(stacked, obs_t, acts_t, mask_t, kernel=kernel)
     picks_sorted = scores.argmax(dim=2).numpy()[valid]
     inverse = np.empty_like(order)
     inverse[order] = np.arange(len(order))
@@ -373,6 +379,7 @@ def evaluate_generation(
     shards: int = 1,
     metrics_out: list[DriveMetrics] | None = None,
     max_rounds: int | None = None,
+    kernel: policy.PolicyKernel = "einsum",
 ) -> np.ndarray:
     """Mean duplicate-deal differential for every population genome.
 
@@ -392,7 +399,7 @@ def evaluate_generation(
 
         results = shards_mod.run_shards(
             roster, game_seeds, meta, arch, cap, device, shards, progress,
-            metrics_out=metrics_out,
+            metrics_out=metrics_out, kernel=kernel,
             max_rounds=max_rounds,
         )
     else:
@@ -407,6 +414,7 @@ def evaluate_generation(
             progress=progress,
             metrics=metrics,
             max_rounds=max_rounds,
+            kernel=kernel,
         )
         if metrics_out is not None:
             metrics_out.append(metrics)
