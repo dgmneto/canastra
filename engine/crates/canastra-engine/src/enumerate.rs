@@ -10,6 +10,7 @@ use crate::action::{Action, MeldTarget};
 use crate::apply::apply;
 use crate::card::{Card, Rank, Suit};
 use crate::state::{GameState, Phase, Seat};
+use std::cmp::Ordering;
 
 /// Every action `seat` may legally take right now, one ply, in deterministic
 /// order. Call it with the player whose turn it is; any other seat, or a
@@ -30,10 +31,9 @@ pub fn enumerate(state: &GameState, seat: Seat) -> Vec<Action> {
         .filter(|action| apply(state, seat, action).is_ok())
         .collect();
     // Deterministic order matters: seed + action log must keep replaying, and
-    // bots keyed on the list need a stable input. Candidates are already
-    // emitted with their cards in canonical (string) order, so equivalent
-    // candidates are equal values and dedup collapses them.
-    actions.sort_by_key(|action| format!("{action:?}"));
+    // bots keyed on the list need a stable input. This key mirrors the old
+    // derived-Debug lexicographic order without formatting an owned String.
+    actions.sort_unstable_by(|left, right| action_sort_key(left).cmp(&action_sort_key(right)));
     actions.dedup();
     actions
 }
@@ -73,7 +73,7 @@ fn natural_pairs(hand: &[Card]) -> Vec<[Card; 2]> {
         .copied()
         .filter(|card| card.is_natural())
         .collect();
-    uniques.sort_by_key(|card| card.to_string());
+    uniques.sort_unstable_by_key(|&card| card_string_key(card));
     uniques.dedup();
 
     let mut pairs = Vec::new();
@@ -95,7 +95,7 @@ fn melding_candidates(state: &GameState, seat: Seat) -> Vec<Action> {
     let mut candidates = lay_meld_candidates(hand);
 
     let mut distinct: Vec<Card> = hand.to_vec();
-    distinct.sort_by_key(|card| card.to_string());
+    distinct.sort_unstable_by_key(|&card| card_string_key(card));
     distinct.dedup();
 
     for meld in 0..state.table(seat.team()).melds.len() {
@@ -141,7 +141,7 @@ fn lay_meld_candidates(hand: &[Card]) -> Vec<Action> {
                 card.is_joker() || (card.suit() == Some(suit) && card.rank() == Some(Rank::Two))
             })
             .collect();
-        wilds.sort_by_key(|card| card.to_string());
+        wilds.sort_unstable_by_key(|&card| card_string_key(card));
         wilds.dedup();
 
         // Every rank window of length ≥ 3 in 4..A (indices 0..=10).
@@ -180,10 +180,10 @@ fn lay_meld_candidates(hand: &[Card]) -> Vec<Action> {
         .copied()
         .filter(|card| card.rank() == Some(Rank::Ace))
         .collect();
-    aces.sort_by_key(|card| card.to_string());
+    aces.sort_unstable_by_key(|&card| card_string_key(card));
 
     let mut wilds: Vec<Card> = hand.iter().copied().filter(|card| card.is_wild()).collect();
-    wilds.sort_by_key(|card| card.to_string());
+    wilds.sort_unstable_by_key(|&card| card_string_key(card));
     wilds.dedup();
 
     for size in 2..=aces.len() {
@@ -241,6 +241,251 @@ fn combinations(cards: &[Card], size: usize) -> Vec<Vec<Card>> {
 
 /// A `LayMeld` candidate with its cards in canonical (string) order.
 fn lay(mut cards: Vec<Card>) -> Action {
-    cards.sort_by_key(|card| card.to_string());
+    cards.sort_unstable_by_key(|&card| card_string_key(card));
     Action::LayMeld { cards }
+}
+
+/// The fixed-width key for the card's wire/display string (`"6D"`, `"JOKER"`).
+/// Zeroes are the string terminator for the two-byte standard-card form, so the
+/// array's ordinary lexicographic order is the same as `Card::to_string()`.
+fn card_string_key(card: Card) -> [u8; 5] {
+    match card {
+        Card::Joker => *b"JOKER",
+        Card::Standard { rank, suit } => [rank.code() as u8, suit_code(suit), 0, 0, 0],
+    }
+}
+
+fn suit_code(suit: Suit) -> u8 {
+    match suit {
+        Suit::Clubs => b'C',
+        Suit::Diamonds => b'D',
+        Suit::Hearts => b'H',
+        Suit::Spades => b'S',
+    }
+}
+
+/// A borrowed action key that compares exactly like the old derived `Debug`
+/// string, but does not allocate while sorting.
+struct ActionSortKey<'a>(&'a Action);
+
+fn action_sort_key(action: &Action) -> ActionSortKey<'_> {
+    ActionSortKey(action)
+}
+
+impl Ord for ActionSortKey<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let kind = action_debug_kind(self.0).cmp(&action_debug_kind(other.0));
+        if kind != Ordering::Equal {
+            return kind;
+        }
+
+        match (self.0, other.0) {
+            (
+                Action::TakeDiscardPile {
+                    core: left_core,
+                    target: left_target,
+                },
+                Action::TakeDiscardPile {
+                    core: right_core,
+                    target: right_target,
+                },
+            ) => cmp_debug_cards(left_core, right_core)
+                .then_with(|| cmp_debug_targets(left_target, right_target)),
+            (Action::LayMeld { cards: left }, Action::LayMeld { cards: right }) => {
+                cmp_debug_cards(left, right)
+            }
+            (
+                Action::AddToMeld {
+                    meld: left_meld,
+                    cards: left_cards,
+                },
+                Action::AddToMeld {
+                    meld: right_meld,
+                    cards: right_cards,
+                },
+            ) => cmp_decimal(*left_meld, *right_meld)
+                .then_with(|| cmp_debug_cards(left_cards, right_cards)),
+            (Action::Discard { card: left }, Action::Discard { card: right }) => {
+                card_debug_key(*left).cmp(&card_debug_key(*right))
+            }
+            _ => Ordering::Equal,
+        }
+    }
+}
+
+impl PartialOrd for ActionSortKey<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for ActionSortKey<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for ActionSortKey<'_> {}
+
+/// Lexical order of the action variant names emitted by derived `Debug`.
+fn action_debug_kind(action: &Action) -> u8 {
+    match action {
+        Action::AddToMeld { .. } => 0,       // AddToMeld
+        Action::Discard { .. } => 1,         // Discard
+        Action::Draw => 2,                   // Draw
+        Action::EndTurnWithoutDiscard => 3,  // EndTurnWithoutDiscard
+        Action::KeepDrawnCard => 4,          // KeepDrawnCard
+        Action::LayMeld { .. } => 5,         // LayMeld
+        Action::RefuseDrawnCard => 6,        // RefuseDrawnCard
+        Action::TakeDiscardPile { .. } => 7, // TakeDiscardPile
+    }
+}
+
+/// Derived `Debug` prints lists with `]` after a shared prefix and `,` when the
+/// other list continues, so a longer list sorts before its exact prefix.
+fn cmp_debug_cards(left: &[Card], right: &[Card]) -> Ordering {
+    for (&left, &right) in left.iter().zip(right) {
+        let ordering = card_debug_key(left).cmp(&card_debug_key(right));
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    right.len().cmp(&left.len())
+}
+
+/// Lexical order of a `usize` as rendered by derived `Debug` (no leading zero).
+fn cmp_decimal(mut left: usize, mut right: usize) -> Ordering {
+    let mut left_divisor = decimal_factor(left);
+    let mut right_divisor = decimal_factor(right);
+    loop {
+        let ordering = (left / left_divisor).cmp(&(right / right_divisor));
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+        if left_divisor == 1 || right_divisor == 1 {
+            // A shorter string sorts first when the shared digits are a prefix.
+            return left_divisor.cmp(&right_divisor);
+        }
+        left %= left_divisor;
+        right %= right_divisor;
+        left_divisor /= 10;
+        right_divisor /= 10;
+    }
+}
+
+fn decimal_factor(mut value: usize) -> usize {
+    let mut factor = 1;
+    while value >= 10 {
+        value /= 10;
+        factor *= 10;
+    }
+    factor
+}
+
+fn cmp_debug_targets(left: &MeldTarget, right: &MeldTarget) -> Ordering {
+    match (left, right) {
+        (MeldTarget::Existing { meld: left }, MeldTarget::Existing { meld: right }) => {
+            cmp_decimal(*left, *right)
+        }
+        (MeldTarget::Existing { .. }, MeldTarget::NewMeld) => Ordering::Less,
+        (MeldTarget::NewMeld, MeldTarget::Existing { .. }) => Ordering::Greater,
+        (MeldTarget::NewMeld, MeldTarget::NewMeld) => Ordering::Equal,
+    }
+}
+
+/// Lexical order of the derived `Debug` output for `Card`, `Rank`, and `Suit`.
+fn card_debug_key(card: Card) -> (u8, u8, u8) {
+    match card {
+        Card::Joker => (0, 0, 0), // Joker
+        Card::Standard { rank, suit } => (1, rank_debug_key(rank), suit_debug_key(suit)),
+    }
+}
+
+fn rank_debug_key(rank: Rank) -> u8 {
+    match rank {
+        Rank::Ace => 0,   // Ace
+        Rank::Eight => 1, // Eight
+        Rank::Five => 2,  // Five
+        Rank::Four => 3,  // Four
+        Rank::Jack => 4,  // Jack
+        Rank::King => 5,  // King
+        Rank::Nine => 6,  // Nine
+        Rank::Queen => 7, // Queen
+        Rank::Seven => 8, // Seven
+        Rank::Six => 9,   // Six
+        Rank::Ten => 10,  // Ten
+        Rank::Three => 11,
+        Rank::Two => 12,
+    }
+}
+
+fn suit_debug_key(suit: Suit) -> u8 {
+    match suit {
+        Suit::Clubs => 0,
+        Suit::Diamonds => 1,
+        Suit::Hearts => 2,
+        Suit::Spades => 3,
+    }
+}
+
+#[cfg(test)]
+mod sort_tests {
+    use super::*;
+
+    #[test]
+    fn allocation_free_keys_match_the_legacy_sort_orders() {
+        let mut cards: Vec<Card> = Suit::ALL
+            .into_iter()
+            .flat_map(|suit| {
+                Rank::ALL
+                    .into_iter()
+                    .map(move |rank| Card::Standard { rank, suit })
+            })
+            .collect();
+        cards.push(Card::Joker);
+
+        let mut legacy_cards = cards.clone();
+        legacy_cards.sort_by_key(|card| card.to_string());
+        cards.sort_unstable_by_key(|&card| card_string_key(card));
+        assert_eq!(cards, legacy_cards);
+
+        let mut actions = vec![
+            Action::Draw,
+            Action::KeepDrawnCard,
+            Action::RefuseDrawnCard,
+            Action::EndTurnWithoutDiscard,
+            Action::LayMeld { cards: Vec::new() },
+        ];
+        actions.extend(cards.iter().copied().map(|card| Action::Discard { card }));
+        for &meld in &[0, 1, 9, 10, 11, 99] {
+            actions.extend(cards.iter().copied().map(|card| Action::AddToMeld {
+                meld,
+                cards: vec![card],
+            }));
+        }
+        actions.extend([
+            Action::LayMeld {
+                cards: vec![cards[0], cards[1]],
+            },
+            Action::LayMeld {
+                cards: vec![cards[0], cards[1], cards[2]],
+            },
+            Action::TakeDiscardPile {
+                core: [cards[0], cards[1]],
+                target: MeldTarget::NewMeld,
+            },
+            Action::TakeDiscardPile {
+                core: [cards[0], cards[1]],
+                target: MeldTarget::Existing { meld: 10 },
+            },
+        ]);
+
+        for left in &actions {
+            for right in &actions {
+                let expected = format!("{left:?}").cmp(&format!("{right:?}"));
+                let actual = action_sort_key(left).cmp(&action_sort_key(right));
+                assert_eq!(actual, expected, "{left:?} vs {right:?}");
+            }
+        }
+    }
 }

@@ -4,24 +4,25 @@ Two flavors of the same forward pass:
 
 - `logits` scores one genome's rows (`[N, M]` from a `(trunk, head)` pair).
 - `logits_stacked` scores a whole roster at once: the per-genome weights are
-  stacked on a batch dimension G and every layer runs as one batched `einsum`
+  stacked on a batch dimension G and every layer runs as one batched operation
   over the padded group blocks, so a ply costs ~2·layers torch ops regardless
   of how many genomes are in the roster. Same math as `logits`, just tiled —
-  this is what makes large populations cheap on both CPU and GPU. (einsum,
-  not `bmm`: torch's batched `bmm` switches kernels at small block sizes and
-  produces last-ulp score differences, which would flip near-tie argmax picks
-  between sharded and single-process evaluation. einsum is bit-stable across
-  block shapes, which is required for the shards-are-identical contract.)
+  this is what makes large populations cheap on both CPU and GPU. `einsum` is
+  the default kernel; `bmm` is an opt-in experiment for comparing equivalent
+  matmul implementations.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np
 import torch
 
 from canastra_train import genome as genome_mod
+
+PolicyKernel = Literal["einsum", "bmm"]
 
 
 def _forward(stack: torch.nn.ModuleList, x: torch.Tensor, final: bool) -> torch.Tensor:
@@ -59,7 +60,7 @@ class WeightStack:
 
     `trunk_w[0]` is `[G, hidden, obs]`, `head_w[-1]` is `[G, 1, hidden]`, each
     bias is `[G, out]`. Built once per generation by `stack_weights` and reused
-    every ply — the per-ply forward is pure batched `einsum`.
+    every ply — the per-ply forward uses the selected batched kernel.
     """
 
     trunk_w: list[torch.Tensor]
@@ -102,12 +103,30 @@ def stack_weights(
     return WeightStack(trunk_w, trunk_b, head_w, head_b)
 
 
+def _stacked_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    kernel: PolicyKernel,
+) -> torch.Tensor:
+    if kernel == "einsum":
+        result = torch.einsum("gni,goi->gno", x, weight)
+    elif kernel == "bmm":
+        result = torch.bmm(x, weight.transpose(1, 2))
+    else:
+        raise ValueError(f"unsupported policy kernel: {kernel!r}")
+    if bias is not None:
+        result = result + bias.unsqueeze(1)
+    return result
+
+
 @torch.inference_mode()
 def logits_stacked(
     stack: WeightStack,
     obs: torch.Tensor,
     acts: torch.Tensor,
     mask: torch.Tensor,
+    kernel: PolicyKernel = "einsum",
 ) -> torch.Tensor:
     """[G, Nmax, width] action logits, -inf where the mask is false.
 
@@ -118,18 +137,26 @@ def logits_stacked(
     g, n, width = acts.shape[0], acts.shape[1], acts.shape[2]
     x = obs
     for w, b in zip(stack.trunk_w, stack.trunk_b):
-        x = torch.tanh(torch.einsum("gni,goi->gno", x, w) + b.unsqueeze(1))  # [G, N, E]
+        x = torch.tanh(_stacked_linear(x, w, b, kernel))                    # [G, N, E]
     emb = x
     # The first head layer is linear over cat(emb, acts), so split its weight
     # matrix and fold the two pieces independently — this avoids materializing
     # [G, N, width, E+ACT] (the cat) entirely, the dominant cost of a wide ply.
     emb_w, act_w = torch.split(stack.head_w[0], [emb.shape[2], acts.shape[3]], dim=2)
-    emb_in = torch.einsum("gni,goi->gno", emb, emb_w).unsqueeze(2)           # [G, N, 1, H]
-    act_in = torch.einsum("gnwi,goi->gnwo", acts, act_w)                     # [G, N, W, H]
+    emb_in = _stacked_linear(emb, emb_w, None, kernel)
+    emb_in = emb_in.unsqueeze(2)                                               # [G, N, 1, H]
+    if kernel == "einsum":
+        act_in = torch.einsum("gnwi,goi->gnwo", acts, act_w)                  # [G, N, W, H]
+    elif kernel == "bmm":
+        act_in = torch.bmm(
+            acts.reshape(g, n * width, acts.shape[3]), act_w.transpose(1, 2)
+        ).reshape(g, n, width, act_w.shape[1])                                 # [G, N, W, H]
+    else:
+        raise ValueError(f"unsupported policy kernel: {kernel!r}")
     x = emb_in + act_in + stack.head_b[0].unsqueeze(1).unsqueeze(1)
     x = torch.tanh(x).reshape(g, n * width, x.shape[3])
     for index, (w, b) in enumerate(list(zip(stack.head_w, stack.head_b))[1:]):
-        x = torch.einsum("gmi,goi->gmo", x, w) + b.unsqueeze(1)
+        x = _stacked_linear(x, w, b, kernel)
         if index < len(stack.head_w) - 2:
             x = torch.tanh(x)
     scores = x.reshape(g, n, width)                                        # [G, N, width]
