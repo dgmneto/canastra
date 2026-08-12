@@ -177,44 +177,43 @@ impl Pool {
         let mask = PyArray2::<bool>::zeros(py, [rows, width], false);
         let grid = PyArray2::<i64>::zeros(py, [rows, 2], false);
 
-        // Encode (views + features) in parallel into per-row scratch, then
-        // copy into the numpy buffers — enumerate/apply dominate; the copy is
-        // memcpy-cheap and keeps the numpy API single-threaded.
-        let encoded: Vec<(Vec<f32>, Vec<f32>)> = self
-            .pending
+        // Encode directly into the disjoint NumPy rows. Keeping the arrays
+        // NumPy-owned avoids per-row scratch vectors and serial row copies.
+        let obs_ptr = obs.data() as usize;
+        let acts_ptr = acts.data() as usize;
+        let mask_ptr = mask.data() as usize;
+        let grid_ptr = grid.data() as usize;
+        self.pending
             .par_iter()
+            .enumerate()
             .zip(self.menus.par_iter())
-            .map(|(&i, menu)| {
-                let view = observe(&self.games[i].state, self.games[i].state.turn);
-                let mut obs_row = vec![0.0; OBS_DIM];
-                encode_observation(&view, &mut obs_row);
-                let mut act_rows = vec![0.0; menu.len() * ACT_DIM];
-                encode_actions(&view, menu, &mut act_rows);
-                (obs_row, act_rows)
-            })
-            .collect();
-
-        {
-            let mut obs_view = unsafe { obs.as_array_mut() };
-            let mut acts_view = unsafe { acts.as_array_mut() };
-            let mut mask_view = unsafe { mask.as_array_mut() };
-            let mut rows_view = unsafe { grid.as_array_mut() };
-            for (row, (obs_row, act_rows)) in encoded.iter().enumerate() {
-                let game = self.pending[row];
-                rows_view[[row, 0]] = game as i64;
-                rows_view[[row, 1]] = self.games[game].state.turn.index() as i64;
-                obs_view
-                    .row_mut(row)
-                    .assign(&ndarray::ArrayView1::from(obs_row));
-                for (col, chunk) in act_rows.chunks(ACT_DIM).enumerate() {
-                    let mut acts_row = acts_view.index_axis_mut(ndarray::Axis(0), row);
-                    acts_row
-                        .index_axis_mut(ndarray::Axis(0), col)
-                        .assign(&ndarray::ArrayView1::from(chunk));
-                    mask_view[[row, col]] = true;
+            .for_each(|((row, &game), menu)| {
+                // SAFETY: each row range is unique to this closure, the arrays
+                // stay alive until the parallel loop completes, and the GIL
+                // prevents Python from accessing them during the writes.
+                unsafe {
+                    let obs_row = std::slice::from_raw_parts_mut(
+                        (obs_ptr as *mut f32).add(row * OBS_DIM),
+                        OBS_DIM,
+                    );
+                    let acts_row = std::slice::from_raw_parts_mut(
+                        (acts_ptr as *mut f32).add(row * width * ACT_DIM),
+                        width * ACT_DIM,
+                    );
+                    let mask_row = std::slice::from_raw_parts_mut(
+                        (mask_ptr as *mut bool).add(row * width),
+                        width,
+                    );
+                    let grid_row =
+                        std::slice::from_raw_parts_mut((grid_ptr as *mut i64).add(row * 2), 2);
+                    let view = observe(&self.games[game].state, self.games[game].state.turn);
+                    encode_observation(&view, obs_row);
+                    encode_actions(&view, menu, &mut acts_row[..menu.len() * ACT_DIM]);
+                    mask_row[..menu.len()].fill(true);
+                    grid_row[0] = game as i64;
+                    grid_row[1] = self.games[game].state.turn.index() as i64;
                 }
-            }
-        }
+            });
 
         Ok((obs, acts, mask, grid))
     }
