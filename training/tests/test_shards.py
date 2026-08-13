@@ -23,7 +23,7 @@ def run_into(directory: Path, shards: int) -> None:
         tournament=2,
         opponents=2,
         seeds=2,
-        cap=4000,
+        max_hands=1,
         run_seed=13,
         hof_interval=1,
         shards=shards,

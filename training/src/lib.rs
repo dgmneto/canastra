@@ -46,10 +46,14 @@ struct Game {
     /// How many actions this match has played (one per `Pool::apply` row).
     actions_played: u64,
     result: Option<MatchResult>,
+    /// Stop after this many hands have settled (scores banked). `None` plays
+    /// full matches to MatchOver. A hand is guaranteed to finish in finite
+    /// time (the stock depletes), so no action cap is needed when this is set.
+    max_hands: Option<u32>,
 }
 
 impl Game {
-    fn new(seed: u64) -> Game {
+    fn new(seed: u64, max_hands: Option<u32>) -> Game {
         let state = new_game(seed);
         Game {
             turn_start: state.clone(),
@@ -59,6 +63,7 @@ impl Game {
             hands: 1,
             actions_played: 0,
             result: None,
+            max_hands,
         }
     }
 
@@ -128,6 +133,16 @@ impl Game {
                     self.hands,
                     false,
                 ));
+            } else if let Some(max) = self.max_hands {
+                if self.hands >= max {
+                    // The hand just settled and the scores are banked in
+                    // `self.state.scores`. Stop here — the next hand would
+                    // start, but we only wanted `max` hands.
+                    self.result =
+                        Some((self.seed, self.state.scores, None, self.hands, false));
+                    return Ok(());
+                }
+                self.hands += 1;
             } else {
                 self.hands += 1;
             }
@@ -156,18 +171,25 @@ struct Pool {
     menus: Vec<Vec<Action>>,
     /// Per-game action ceiling; a live match that reaches it ends unfinished.
     max_actions_per_game: Option<u64>,
+    /// Stop after this many hands have settled. `None` plays full matches.
+    max_hands: Option<u32>,
 }
 
 #[pymethods]
 impl Pool {
     #[new]
-    #[pyo3(signature = (seeds, max_actions_per_game=None))]
-    fn new(seeds: Vec<u64>, max_actions_per_game: Option<u64>) -> Pool {
+    #[pyo3(signature = (seeds, max_actions_per_game=None, max_hands=None))]
+    fn new(
+        seeds: Vec<u64>,
+        max_actions_per_game: Option<u64>,
+        max_hands: Option<u32>,
+    ) -> Pool {
         Pool {
-            games: seeds.into_iter().map(Game::new).collect(),
+            games: seeds.into_iter().map(|s| Game::new(s, max_hands)).collect(),
             pending: Vec::new(),
             menus: Vec::new(),
             max_actions_per_game,
+            max_hands,
         }
     }
 

@@ -29,7 +29,7 @@ class EloTracker:
         self.base = base
 
     def expected(self, a: int, b: int) -> float:
-        return 1.0 / (1.0 + 10.0 ** ((self.ratings[b] - self.ratings[a]) / 400.0))
+        return float(1.0 / (1.0 + 10.0 ** ((self.ratings[b] - self.ratings[a]) / 400.0)))
 
     def update(self, a: int, b: int, result: float) -> None:
         exp_a = self.expected(a, b)

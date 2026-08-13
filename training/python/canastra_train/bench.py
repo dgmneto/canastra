@@ -66,7 +66,7 @@ def _league_shape(
     population: int,
     opponents: int,
     seed_count: int,
-    cap: int,
+    max_hands: int | None,
     shards: int,
     max_rounds: int | None,
     kernel: policy.PolicyKernel,
@@ -89,7 +89,7 @@ def _league_shape(
     elo = elo_mod.EloTracker(population)
     if shards > 1:
         league.evaluate_generation(
-            pop, hof, pairings, TRAINING_ARCH, seeds, cap, device, elo,
+            pop, hof, pairings, TRAINING_ARCH, seeds, max_hands, device, elo,
             progress=progress_count, shards=shards, metrics_out=drive_metrics,
             max_rounds=max_rounds, kernel=kernel,
         )
@@ -103,7 +103,7 @@ def _league_shape(
                 stacked,
                 game_seeds,
                 meta,
-                cap=cap,
+                max_hands=max_hands,
                 device=device,
                 metrics=metrics,
                 max_rounds=max_rounds,
@@ -155,7 +155,8 @@ def main() -> None:
     parser.add_argument("--population", type=int, default=8)
     parser.add_argument("--opponents", type=int, default=2)
     parser.add_argument("--seeds", type=int, default=2)
-    parser.add_argument("--cap", type=int, default=30_000)
+    parser.add_argument("--max-hands", type=int, default=1,
+                        help="hands per game for the league shape (default 1; 0 = full matches)")
     parser.add_argument("--shards", type=int, default=1)
     parser.add_argument(
         "--games",
@@ -183,7 +184,7 @@ def main() -> None:
     else:
         _league_shape(
             args.device, args.population, args.opponents, args.seeds,
-            args.cap, args.shards, args.max_rounds,
+            args.max_hands if args.max_hands > 0 else None, args.shards, args.max_rounds,
             args.kernel,
         )
 

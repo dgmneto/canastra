@@ -15,6 +15,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+
 import numpy as np
 import torch
 from canastra_py import Pool
@@ -160,7 +161,7 @@ def drive_pool(
     stacked: policy.WeightStack,
     game_seeds: list[int],
     meta: np.ndarray,
-    cap: int,
+    max_hands: int | None,
     device: str,
     progress: Callable[[int, int], None] | None = None,
     on_ply: Callable[[float, float, float], None] | None = None,
@@ -170,12 +171,15 @@ def drive_pool(
 ) -> list[MatchRow]:
     """Run every game to completion, one batched ply at a time.
 
+    `max_hands` stops each game after that many hands have settled (scores
+    banked); ``None`` plays full matches to MatchOver. A hand is guaranteed to
+    finish in finite time (the stock depletes), so no action cap is needed.
     `progress`, when given, is called every few plies with
     (plies, games_finished) so a caller can render live progress and ETA.
     `on_ply(encode_s, forward_s, apply_s)`, when given, receives the per-ply
     wall-clock split — the bench uses it to attribute time to phases.
     """
-    pool = Pool(game_seeds, max_actions_per_game=cap)
+    pool = Pool(game_seeds, max_hands=max_hands)
     if metrics is not None:
         metrics.reset(len(game_seeds))
     plies = 0
@@ -392,7 +396,7 @@ def evaluate_generation(
     pairings: list[tuple[int, int]],
     arch: genome_mod.Arch,
     seeds: list[int],
-    cap: int,
+    max_hands: int | None,
     device: str,
     elo: elo_mod.EloTracker,
     progress: Callable[[int, int], None] | None = None,
@@ -404,10 +408,10 @@ def evaluate_generation(
     """Play one generation of self-play and update ELO ratings in-place.
 
     Each game's result is win/loss/draw based on which team scored more.
-    With a 1-hand cap (``cap`` ≈ 175), each game plays exactly one hand, so
-    the result is a single hand's score comparison — fast and uniform-length,
-    with no convergence tail. The ELO tracker is updated in deterministic
-    game order and returned (same object, modified in-place).
+    With ``max_hands=1`` each game plays exactly one hand, so the result is a
+    single hand's score comparison — fast and uniform-length, with no
+    convergence tail. The ELO tracker is updated in deterministic game order
+    and returned (same object, modified in-place).
 
     With ``shards > 1`` the games are split across worker processes, each
     running its own batched ply loop (``shards.run_shards``). Results are
@@ -422,7 +426,7 @@ def evaluate_generation(
         from canastra_train import shards as shards_mod
 
         results = shards_mod.run_shards(
-            roster, game_seeds, meta, arch, cap, device, shards, progress,
+            roster, game_seeds, meta, arch, max_hands, device, shards, progress,
             metrics_out=metrics_out, kernel=kernel,
             max_rounds=max_rounds,
         )
@@ -433,7 +437,7 @@ def evaluate_generation(
             stacked,
             game_seeds,
             meta,
-            cap,
+            max_hands,
             device,
             progress=progress,
             metrics=metrics,

@@ -13,11 +13,12 @@ checkpoint. The spec's success gate — champion beats `random`, parity with
     npx tsx harness/src/eval-nn.ts <champion.json> random 1000     # from repo root
     npx tsx harness/src/eval-nn.ts <champion.json> random-plus 1000
 
-Games are capped at one hand (default cap=175 actions ≈ 1.6× the median
-single-hand length of ~109 actions). This eliminates the convergence tail:
-all games finish at nearly the same ply, so the pool runs at full parallelism
-for its entire lifetime. Genomes are ranked by a persistent ELO rating that
-carries across generations; children inherit their parent's rating.
+Each game plays exactly one hand (``max_hands=1``). A hand is guaranteed to
+finish in finite time — the stock depletes — so no action cap is needed.
+This eliminates the convergence tail: all games finish at nearly the same
+ply, so the pool runs at full parallelism for its entire lifetime. Genomes
+are ranked by a persistent ELO rating that carries across generations;
+children inherit their parent's rating.
 """
 
 from __future__ import annotations
@@ -38,12 +39,6 @@ from canastra_train.tui import Dashboard
 
 TRAINING_ARCH = {"obs": 2002, "act": 101, "trunk": [512, 256], "head": [128], "activation": "tanh"}
 
-# 1.6x the median single-hand action count (~109). 98.4% of games complete
-# exactly one hand; the remaining 1.6% hit the cap mid-hand (scores=[0,0],
-# treated as a draw). All games finish at nearly the same ply, eliminating
-# the convergence tail that plagued full-match play.
-ONE_HAND_CAP = 175
-
 
 def run(
     arch: genome_mod.Arch,
@@ -54,7 +49,7 @@ def run(
     tournament: int = 4,
     opponents: int = 4,
     seeds: int = 8,
-    cap: int = ONE_HAND_CAP,
+    max_hands: int | None = 1,
     run_seed: int = 7,
     sigma: float = 0.02,
     sigma_decay: float = 0.995,
@@ -89,7 +84,7 @@ def run(
         )
     (run_dir / "config.json").write_text(
         json.dumps({"arch": arch, "ga": asdict(cfg), "run_seed": run_seed,
-                    "seeds": seeds, "cap": cap, "device": device,
+                    "seeds": seeds, "max_hands": max_hands, "device": device,
                     "shards": shards}, indent=2)
     )
 
@@ -135,7 +130,7 @@ def run(
         drive_metrics: list[league.DriveMetrics] = []
         evaluation_began = time.perf_counter()
         elo = league.evaluate_generation(
-            pop, hof, pairings, arch, gen_seeds, cap, device, elo,
+            pop, hof, pairings, arch, gen_seeds, max_hands, device, elo,
             progress=dash.on_progress, shards=shards, metrics_out=drive_metrics,
         )
         evaluation_seconds = time.perf_counter() - evaluation_began
@@ -244,8 +239,8 @@ def main() -> None:
     parser.add_argument("--tournament", type=int, default=4)
     parser.add_argument("--opponents", type=int, default=4)
     parser.add_argument("--seeds", type=int, default=8)
-    parser.add_argument("--cap", type=int, default=ONE_HAND_CAP,
-                        help=f"actions per game (default {ONE_HAND_CAP} = one hand)")
+    parser.add_argument("--max-hands", type=int, default=1,
+                        help="hands per game (default 1; 0 = full matches)")
     parser.add_argument("--run-seed", type=int, default=7)
     parser.add_argument("--sigma", type=float, default=0.02)
     parser.add_argument("--sigma-decay", type=float, default=0.995)
@@ -278,7 +273,7 @@ def main() -> None:
         tournament=args.tournament,
         opponents=args.opponents,
         seeds=args.seeds,
-        cap=args.cap,
+        max_hands=args.max_hands if args.max_hands > 0 else None,
         run_seed=args.run_seed,
         sigma=args.sigma,
         sigma_decay=args.sigma_decay,

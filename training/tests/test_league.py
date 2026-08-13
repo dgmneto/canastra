@@ -22,7 +22,7 @@ def test_a_generation_updates_elo_ratings() -> None:
         pairings,
         ARCH,
         seeds=[5],
-        cap=6000,
+        max_hands=1,
         device="cpu",
         elo=elo,
         metrics_out=metrics,
@@ -43,6 +43,6 @@ def test_self_pairing_elo_stays_near_base() -> None:
     hof = ga.HallOfFame()
     elo = elo_mod.EloTracker(1)
     league.evaluate_generation(
-        pop, hof, [(0, 0)], ARCH, seeds=[7], cap=6000, device="cpu", elo=elo
+        pop, hof, [(0, 0)], ARCH, seeds=[7], max_hands=1, device="cpu", elo=elo
     )
     assert abs(elo.ratings[0] - 1200.0) < 100, f"ELO drifted {elo.ratings[0]} from base 1200"
