@@ -2,7 +2,6 @@
 
 use crate::card::{Card, Rank, Suit};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::fmt;
 
 /// §7.1: the longest possible sequence runs 4 through Ace.
@@ -323,13 +322,13 @@ impl Sequence {
         }
         check_two_suit(wild, suit)?;
 
-        let mut positions = BTreeMap::new();
+        let mut positions = Positions::new();
         for &card in naturals {
             let index = card
                 .rank()
                 .and_then(Rank::sequence_index)
                 .ok_or(MeldError::NotASequence)?;
-            if positions.insert(index, card).is_some() {
+            if !positions.insert(index, card) {
                 return Err(MeldError::DuplicateRank);
             }
         }
@@ -339,15 +338,15 @@ impl Sequence {
     /// Lay one more card onto this sequence, sliding a free wild if that is what
     /// it takes. Leaves the sequence untouched when the card cannot be placed.
     pub fn add_card(&mut self, card: Card) -> Result<(), MeldError> {
-        let mut positions: BTreeMap<u8, Card> = self
-            .slots
-            .iter()
-            .enumerate()
-            .filter_map(|(offset, slot)| match *slot {
-                Slot::Natural(natural) => Some((self.low + offset as u8, natural)),
-                Slot::Wild(_) => None,
-            })
-            .collect();
+        let mut positions = Positions::new();
+        for (offset, slot) in self.slots.iter().enumerate() {
+            match *slot {
+                Slot::Natural(natural) => {
+                    positions.insert(self.low + offset as u8, natural);
+                }
+                Slot::Wild(_) => {}
+            }
+        }
 
         let held_wild = self.wild_index().map(|index| self.slots[index].card());
 
@@ -365,7 +364,7 @@ impl Sequence {
                 .rank()
                 .and_then(Rank::sequence_index)
                 .ok_or(MeldError::NotASequence)?;
-            if positions.insert(index, card).is_some() {
+            if !positions.insert(index, card) {
                 return Err(MeldError::DuplicateRank);
             }
             // A locked wild is frozen at the rank it already represents.
@@ -392,42 +391,98 @@ fn check_two_suit(wild: Option<Card>, suit: Suit) -> Result<(), MeldError> {
     }
 }
 
+/// Stack-allocated position map for sequence construction. Replaces a
+/// `BTreeMap<u8, Card>` that allocated per insert — sequence indices are
+/// 0..=10 (4 through Ace), so a fixed `[Option<Card>; 11]` covers the range
+/// with O(1) insert/lookup and no heap traffic.
+struct Positions {
+    slots: [Option<Card>; MAX_SEQUENCE_LEN],
+    min: u8,
+    max: u8,
+    count: usize,
+}
+
+impl Positions {
+    fn new() -> Positions {
+        Positions {
+            slots: [None; MAX_SEQUENCE_LEN],
+            min: 0,
+            max: 0,
+            count: 0,
+        }
+    }
+
+    /// Insert a card at `index`. Returns `false` if the slot was already
+    /// occupied (a duplicate rank), `true` if it was inserted.
+    fn insert(&mut self, index: u8, card: Card) -> bool {
+        let idx = index as usize;
+        if self.slots[idx].is_some() {
+            return false;
+        }
+        self.slots[idx] = Some(card);
+        if self.count == 0 {
+            self.min = index;
+            self.max = index;
+        } else {
+            self.min = self.min.min(index);
+            self.max = self.max.max(index);
+        }
+        self.count += 1;
+        true
+    }
+
+    fn contains(&self, index: u8) -> bool {
+        self.slots[index as usize].is_some()
+    }
+
+    fn get(&self, index: u8) -> Card {
+        self.slots[index as usize].expect("caller checks contains first")
+    }
+}
+
 /// Place the naturals and the wild into a contiguous run.
 ///
 /// `pinned` names the rank index a locked wild is nailed to; a free wild is
 /// positioned by this function, which is exactly the sliding of §9.
 fn assemble(
     suit: Suit,
-    positions: BTreeMap<u8, Card>,
+    positions: Positions,
     wild: Option<Card>,
     pinned: Option<u8>,
 ) -> Result<Sequence, MeldError> {
-    let lowest = *positions.keys().next().ok_or(MeldError::TooFewCards)?;
-    let highest = *positions.keys().next_back().expect("just proved non-empty");
+    if positions.count == 0 {
+        return Err(MeldError::TooFewCards);
+    }
+    let lowest = positions.min;
+    let highest = positions.max;
 
     let (low, wild_at) = match (wild, pinned) {
         // Locked: the wild cannot move, so the run has to close around it.
         (Some(_), Some(pin)) => {
-            if positions.contains_key(&pin) {
+            if positions.contains(pin) {
                 return Err(MeldError::WildLocked);
             }
             let low = lowest.min(pin);
             let high = highest.max(pin);
-            if (low..=high).any(|index| index != pin && !positions.contains_key(&index)) {
+            if (low..=high).any(|index| index != pin && !positions.contains(index)) {
                 return Err(MeldError::NotASequence);
             }
             (low, Some(pin))
         }
         // Free: the wild fills the single gap, or caps an end.
         (Some(_), None) => {
-            let gaps: Vec<u8> = (lowest..=highest)
-                .filter(|index| !positions.contains_key(index))
-                .collect();
-            match gaps.as_slice() {
-                [] => {
-                    // Both ends accept the same future cards while the wild stays
-                    // free, so store it high and only fall back when the Ace is
-                    // already taken (§9: `J-Q-K-A-Coringa` is not a thing).
+            let mut gap_count = 0usize;
+            let mut first_gap: Option<u8> = None;
+            for index in lowest..=highest {
+                if !positions.contains(index) {
+                    gap_count += 1;
+                    if first_gap.is_none() {
+                        first_gap = Some(index);
+                    }
+                }
+            }
+            match gap_count {
+                0 => {
                     if (highest as usize) + 1 < MAX_SEQUENCE_LEN {
                         (lowest, Some(highest + 1))
                     } else if lowest >= 1 {
@@ -436,12 +491,12 @@ fn assemble(
                         return Err(MeldError::TooLong);
                     }
                 }
-                [gap] => (lowest, Some(*gap)),
+                1 => (lowest, first_gap),
                 _ => return Err(MeldError::NotASequence),
             }
         }
         (None, _) => {
-            if (lowest..=highest).any(|index| !positions.contains_key(&index)) {
+            if (lowest..=highest).any(|index| !positions.contains(index)) {
                 return Err(MeldError::NotASequence);
             }
             (lowest, None)
@@ -456,7 +511,7 @@ fn assemble(
     let slots = (low..=high)
         .map(|index| match wild_at {
             Some(at) if at == index => Slot::Wild(wild.expect("wild_at implies a wild")),
-            _ => Slot::Natural(positions[&index]),
+            _ => Slot::Natural(positions.get(index)),
         })
         .collect();
 
