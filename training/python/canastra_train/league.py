@@ -238,12 +238,13 @@ def _pick_batch(
     """One argmax pick per pending row, routed to the row's owner genome.
 
     The dominant cost of a ply is moving the acts tensor to the device: the
-    encoder pads every row to the ply's global max menu, so one rogue 600-action
+    encoder pads every row to the ply's global max menu, so one rogue 288-action
     meld makes every row pay that width. On GPU (`device != "cpu"`) rows are
-    sorted by their real menu size (p50 ≈ 2, p99 ≈ 26) and split into width
-    buckets, so each bucket's acts tensor is trimmed to the bucket's max width —
-    a ~2× cut in the cuda forward. CPU pays no transfer cost, so bucketing only
-    adds small-op overhead there; it bypasses the bucket logic entirely.
+    bucketed by their real menu size (p50 ≈ 2, p99 ≈ 26) into power-of-2 width
+    buckets, so each bucket's acts tensor is trimmed to the bucket's max width
+    — a ~17× cut in transfer volume when one game has a wide menu. CPU pays no
+    transfer cost, so bucketing only adds small-op overhead there; it bypasses
+    the bucket logic entirely.
 
     With the default `einsum` kernel, both picker paths are bit-identical to
     each other (and so shard and single-process agree), because the einsum
@@ -275,29 +276,83 @@ def _pick_batch_gpu(
     device: str,
     kernel: policy.PolicyKernel = "einsum",
 ) -> np.ndarray:
-    """Single-forward GPU path: one contiguous transfer, one ``logits_stacked``
-    call, all row-reordering done on-device.
+    """Width-bucketed GPU path: rows are grouped by their real menu width so a
+    single rogue wide menu doesn't inflate the acts tensor for every other row.
 
-    The prior per-bucket path (sorting rows by menu width, splitting into width
-    buckets, per-bucket transfer + weight slicing + forward) was designed to
-    trim the acts tensor to the bucket max rather than the ply global max. On a
-    constrained PCIe link (Gen 3 x8 ≈ 8 GB/s) the per-bucket overhead — multiple
-    small host→device transfers, per-bucket weight slicing, multiple kernel
-    launches — costs more than the padding waste it avoids. Benchmarking showed
-    a ~2.9× speedup from collapsing to a single transfer + single forward at the
-    ply's global max width, with all row-reordering done via ``index_select`` on
-    the device (eliminating the ~36 ms/ply numpy fancy-indexing copy the prior
-    path paid on CPU before the transfer).
+    The prior single-forward path (one transfer + one ``logits_stacked`` at the
+    ply's global max width) was 2.9× faster when menus were uniformly small
+    (gen 0 random play, p50≈2). But once evolved deterministic policies produce
+    positions with 200+ action menus, the global ``ply_max`` explodes and every
+    row pays for it — a [6144, 288, 101] tensor (715 MB) transferred per ply.
 
-    Bit-identical picks to ``_pick_batch_flat`` (same einsum batch shape
-    invariants; the GPU and CPU einsum kernels agree on argmax under the
-    padding-to-4 floor and stable-sort contract documented above).
+    Bucketing by power-of-2 width bounds keeps each bucket's transfer
+    proportional to the rows that actually need that width. The typical
+    distribution (p50≈2, p99≈26, max≈288) puts 90%+ of rows in the first
+    bucket (width ≤ 4), so the total transfer drops from 715 MB to ~40 MB.
+
+    Bit-identical to ``_pick_batch_flat`` under the ``einsum`` kernel (same
+    invariants: padding-to-4 floor, stable sort, weight slicing not re-creation).
     """
     n_rows = len(genome_idx)
-    n_groups = stacked.trunk_w[0].shape[0]
-    rw = mask.sum(axis=1)
-    ply_max = int(rw.max()) if n_rows else 1
+    if n_rows == 0:
+        return np.empty(0, dtype=np.int64)
 
+    rw = mask.sum(axis=1)
+    n_groups = stacked.trunk_w[0].shape[0]
+
+    # Power-of-2 width buckets: [1,4], [5,8], [9,16], [17,32], [33,64], [65,+inf)
+    bucket_bounds = [4, 8, 16, 32, 64]
+    bucket_id = np.digitize(rw, bucket_bounds, right=True)  # 0 for ≤4, 1 for 5-8, ...
+    # Each row is assigned to the bucket whose max width covers its real width.
+    # bucket_id=0 → width ≤ 4, bucket_id=1 → 5-8, ..., bucket_id=5 → 65+
+    unique_buckets = np.unique(bucket_id)
+
+    picks = np.empty(n_rows, dtype=np.int64)
+
+    for bid in unique_buckets:
+        bucket_mask = bucket_id == bid
+        bucket_indices = np.flatnonzero(bucket_mask)
+        if bucket_indices.size == 0:
+            continue
+
+        b_obs = obs[bucket_indices]
+        b_acts = acts[bucket_indices]
+        b_mask = mask[bucket_indices]
+        b_genome_idx = genome_idx[bucket_indices]
+        b_rw = rw[bucket_indices]
+        b_ply_max = int(b_rw.max())
+
+        # Trim to the bucket's max width — the key savings.
+        b_acts = np.ascontiguousarray(b_acts[:, :b_ply_max])
+        b_mask = np.ascontiguousarray(b_mask[:, :b_ply_max])
+
+        b_picks = _gpu_forward_bucket(
+            stacked, b_obs, b_acts, b_mask, b_genome_idx, b_ply_max,
+            n_groups, device, kernel,
+        )
+        picks[bucket_indices] = b_picks
+
+    return picks
+
+
+def _gpu_forward_bucket(
+    stacked: policy.WeightStack,
+    obs: np.ndarray,
+    acts: np.ndarray,
+    mask: np.ndarray,
+    genome_idx: np.ndarray,
+    ply_max: int,
+    n_groups: int,
+    device: str,
+    kernel: policy.PolicyKernel,
+) -> np.ndarray:
+    """One GPU forward for a single width bucket (rows already trimmed to ply_max).
+
+    Shares the genome-grouping + padding-to-4 + weight-slicing logic of the
+    prior single-forward path, but operates on only the bucket's rows at the
+    bucket's max width.
+    """
+    n_rows = len(genome_idx)
     order = np.argsort(genome_idx, kind="stable")
     sorted_gidx = genome_idx[order]
     counts = np.bincount(sorted_gidx, minlength=n_groups)
@@ -311,13 +366,10 @@ def _pick_batch_gpu(
     valid = padded >= 0
     padded = np.where(valid, padded, 0)
 
-    # Transfer contiguous (no CPU fancy-index), then index on device.
-    row_order = order[padded]  # [G_present, n_max] — original row indices
+    row_order = order[padded]
     obs_gpu = torch.from_numpy(obs).to(device)
-    acts_trim = np.ascontiguousarray(acts[:, :ply_max])
-    acts_gpu = torch.from_numpy(acts_trim).to(device)
-    mask_trim = np.ascontiguousarray(mask[:, :ply_max])
-    mask_gpu = torch.from_numpy(mask_trim).to(device)
+    acts_gpu = torch.from_numpy(acts).to(device)
+    mask_gpu = torch.from_numpy(mask).to(device)
 
     ro_t = torch.from_numpy(row_order.flatten()).to(device)
     obs_t = obs_gpu.index_select(0, ro_t).view(len(present), n_max, obs.shape[1])
@@ -336,7 +388,6 @@ def _pick_batch_gpu(
     scores = policy.logits_stacked(sub, obs_t, acts_t, mask_t, kernel=kernel)
     picks_sorted = scores.argmax(dim=2).cpu().numpy()[valid]
 
-    # Unsort: map picks from sorted-by-genome order back to original row order.
     picks = np.empty(n_rows, dtype=np.int64)
     pos = 0
     for i in range(len(present)):
