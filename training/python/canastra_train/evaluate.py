@@ -46,20 +46,30 @@ def evaluate_pair(
 
     while pool.has_live():
         obs, acts, mask, rows = pool.encode()
-        obs_t = torch.from_numpy(obs)
-        acts_t = torch.from_numpy(acts)
-        mask_t = torch.from_numpy(mask)
-        scores_a = policy.logits(trunk_a, head_a, obs_t, acts_t, mask_t)
-        scores_b = policy.logits(trunk_b, head_b, obs_t, acts_t, mask_t)
-        # Route each row to its genome: in the first half of the pool, genome A
-        # owns the even seats (team 0); in the second half, the odd ones.
-        use_a = torch.zeros(mask_t.shape[0], dtype=torch.bool)
-        for row, (game, seat) in enumerate(rows):
-            a_is_team_zero = game < count
-            owns = (seat % 2 == 0) == a_is_team_zero
-            use_a[row] = bool(owns)
-        scores = torch.where(use_a.unsqueeze(1), scores_a, scores_b)
-        pool.apply(policy.pick_argmax(scores))
+        games = rows[:, 0]
+        seats = rows[:, 1]
+        a_is_team_zero = games < count
+        use_a = (seats % 2 == 0) == a_is_team_zero
+        picks = np.empty(len(rows), dtype=np.int64)
+        if use_a.any():
+            sel = np.flatnonzero(use_a)
+            scores_a = policy.logits(
+                trunk_a, head_a,
+                torch.from_numpy(obs[sel]),
+                torch.from_numpy(acts[sel]),
+                torch.from_numpy(mask[sel]),
+            )
+            picks[sel] = policy.pick_argmax(scores_a)
+        if (~use_a).any():
+            sel = np.flatnonzero(~use_a)
+            scores_b = policy.logits(
+                trunk_b, head_b,
+                torch.from_numpy(obs[sel]),
+                torch.from_numpy(acts[sel]),
+                torch.from_numpy(mask[sel]),
+            )
+            picks[sel] = policy.pick_argmax(scores_b)
+        pool.apply(picks.tolist())
 
     results = pool.results()
     assert len(results) == 2 * count
