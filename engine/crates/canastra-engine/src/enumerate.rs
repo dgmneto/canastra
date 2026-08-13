@@ -180,68 +180,101 @@ fn lay_meld_candidates(hand: &[Card]) -> Vec<Action> {
     // wild is a legal meld and must be offered. Sub-multiset, not subset: the
     // deck holds two copies of each ace and `AcesMeld` accepts duplicates, so
     // `AH AH AD` is a legal meld.
-    let mut aces: Vec<Card> = hand
+    //
+    // The deck holds at most 2 copies of each of 4 ace values (AH, AD, AC, AS),
+    // so distinct value-multisets are the Cartesian product (0..=2)^4 = 81,
+    // filtered to size ≥ 2. This replaces the previous C(n,k)+HashSet approach
+    // which generated 247 index-combinations for an 8-ace hand and deduplicated
+    // most of them — the multiset enumeration produces each distinct set exactly
+    // once with no allocations beyond the output.
+    let aces: Vec<Card> = hand
         .iter()
         .copied()
         .filter(|card| card.rank() == Some(Rank::Ace))
         .collect();
-    aces.sort_unstable_by_key(|&card| card_string_key(card));
 
     let mut wilds: Vec<Card> = hand.iter().copied().filter(|card| card.is_wild()).collect();
     wilds.sort_unstable_by_key(|&card| card_string_key(card));
     wilds.dedup();
 
-    for size in 2..=aces.len() {
-        for combo in combinations(&aces, size) {
-            // Three or more natural aces can stand alone; a backbone of two
-            // aces needs a wild to clear the three-card minimum.
-            if size >= 3 {
-                candidates.push(lay(combo.clone()));
-            }
-            for &wild in &wilds {
-                let mut cards = combo.clone();
-                cards.push(wild);
-                candidates.push(lay(cards));
-            }
+    for combo in ace_multisets(&aces) {
+        // Three or more natural aces can stand alone; a backbone of two
+        // aces needs a wild to clear the three-card minimum.
+        if combo.len() >= 3 {
+            candidates.push(lay(combo.clone()));
+        }
+        for &wild in &wilds {
+            let mut cards = combo.clone();
+            cards.push(wild);
+            candidates.push(lay(cards));
         }
     }
 
     candidates
 }
 
-/// Every `size`-card combination of `cards`, deduplicated by value (the hand
-/// may hold two copies of the same card).
+/// Every distinct sub-multiset of the aces held, with ≥ 2 cards.
 ///
-/// `cards` must arrive sorted and let indices ascend, so each emitted combination
-/// is already in sorted order. Output order follows `next` ascending.
-fn combinations(cards: &[Card], size: usize) -> Vec<Vec<Card>> {
-    fn pick(
-        cards: &[Card],
-        size: usize,
-        next: usize,
-        stack: &mut Vec<usize>,
-        seen: &mut HashSet<Vec<Card>>,
-        out: &mut Vec<Vec<Card>>,
-    ) {
-        if stack.len() == size {
-            let combo: Vec<Card> = stack.iter().map(|&i| cards[i]).collect();
-            if seen.insert(combo.clone()) {
-                out.push(combo);
+/// Groups aces by value (AH, AD, AC, AS — at most 2 copies each) and
+/// enumerates the Cartesian product of per-value counts (0..=held), filtering
+/// to total size ≥ 2. Output is naturally deduplicated: since identical card
+/// values are grouped before enumeration, each multiset appears exactly once.
+fn ace_multisets(aces: &[Card]) -> Vec<Vec<Card>> {
+    let mut groups: [(Suit, u8); 4] = [
+        (Suit::Hearts, 0),
+        (Suit::Diamonds, 0),
+        (Suit::Clubs, 0),
+        (Suit::Spades, 0),
+    ];
+    for &card in aces {
+        if let Some(suit) = card.suit() {
+            for entry in &mut groups {
+                if entry.0 == suit {
+                    entry.1 += 1;
+                    break;
+                }
             }
-            return;
-        }
-        for i in next..cards.len() {
-            stack.push(i);
-            pick(cards, size, i + 1, stack, seen, out);
-            stack.pop();
         }
     }
 
-    use std::collections::HashSet;
-    let mut seen = HashSet::new();
     let mut out = Vec::new();
-    pick(cards, size, 0, &mut Vec::new(), &mut seen, &mut out);
+    let mut current: Vec<Card> = Vec::new();
+    enumerate_ace_multisets(&groups, 0, &mut current, &mut out);
     out
+}
+
+fn enumerate_ace_multisets(
+    groups: &[(Suit, u8); 4],
+    index: usize,
+    current: &mut Vec<Card>,
+    out: &mut Vec<Vec<Card>>,
+) {
+    if index == groups.len() {
+        if current.len() >= 2 {
+            out.push(current.clone());
+        }
+        return;
+    }
+
+    let (suit, max_count) = groups[index];
+    let card = Card::Standard {
+        rank: Rank::Ace,
+        suit,
+    };
+    let remaining: u8 = groups[index + 1..].iter().map(|g| g.1).sum();
+    for count in 0..=max_count {
+        // Prune branches that cannot reach the 2-card minimum.
+        if current.len() + count as usize + (remaining as usize) < 2 {
+            continue;
+        }
+        for _ in 0..count {
+            current.push(card);
+        }
+        enumerate_ace_multisets(groups, index + 1, current, out);
+        for _ in 0..count {
+            current.pop();
+        }
+    }
 }
 
 /// A `LayMeld` candidate with its cards in canonical (string) order.
