@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from canastra_train import elo as elo_mod
 from canastra_train import ga, genome
 
 ARCH = {"obs": 2002, "act": 101, "trunk": [16], "head": [], "activation": "tanh"}
@@ -33,19 +34,32 @@ def test_initial_population_is_deterministic_and_shaped() -> None:
 def test_elites_survive_unchanged() -> None:
     c = cfg()
     pop = np.random.default_rng(0).normal(0, 1, (8, 50)).astype(np.float32)
-    fitness = np.arange(8, dtype=np.float32)  # genome 7 best, then 6, ...
+    elo_ratings = np.arange(8, dtype=np.float64)  # genome 7 best, then 6, ...
     rng = np.random.default_rng(1)
-    nxt = ga.next_generation(pop, fitness, c, generation=1, rng=rng)
+    nxt, next_elo = ga.next_generation(pop, elo_ratings, c, generation=1, rng=rng)
     assert np.array_equal(nxt[0], pop[7]), "best genome is elite slot 0"
     assert np.array_equal(nxt[1], pop[6]), "second-best is elite slot 1"
+    assert next_elo[0] == elo_ratings[7], "elite keeps its ELO"
+    assert next_elo[1] == elo_ratings[6]
+
+
+def test_children_inherit_parent_elo() -> None:
+    c = cfg(population=4, elites=1, tournament=2)
+    pop = np.zeros((4, 10), dtype=np.float32)
+    elo_ratings = np.array([1000, 1100, 1200, 1300], dtype=np.float64)
+    rng = np.random.default_rng(5)
+    _nxt, next_elo = ga.next_generation(pop, elo_ratings, c, generation=0, rng=rng)
+    # The 3 children must have inherited one of the 4 parent ELOs.
+    for child_elo in next_elo[c.elites:]:
+        assert child_elo in elo_ratings, f"child ELO {child_elo} not a parent ELO"
 
 
 def test_mutation_scale_tracks_sigma() -> None:
     c = cfg(sigma=0.05)
     pop = np.zeros((8, 4000), dtype=np.float32)
-    fitness = np.arange(8, dtype=np.float32)
+    elo_ratings = np.arange(8, dtype=np.float64)
     rng = np.random.default_rng(2)
-    nxt = ga.next_generation(pop, fitness, c, generation=1, rng=rng)
+    nxt, _ = ga.next_generation(pop, elo_ratings, c, generation=1, rng=rng)
     mutants = nxt[c.elites :]
     std = float(mutants.std())
     assert 0.03 < std < 0.07, f"mutation std {std} should track sigma 0.05"
@@ -63,21 +77,24 @@ def test_hall_of_fame_archives_on_cadence() -> None:
     genome_vec = np.ones(10, dtype=np.float32)
     for generation in range(10):
         if generation % 5 == 0:
-            hof.archive(genome_vec + generation, fitness=float(genome_vec.sum()), generation=generation)
+            hof.archive(genome_vec + generation, elo_rating=1200.0 + generation, generation=generation)
     assert len(hof) == 2
     sample = hof.sample(np.random.default_rng(3))
     assert sample.shape == (10,)
+    assert hof.elo_ratings == [1200.0, 1205.0]
 
 
 def test_checkpoint_round_trip(tmp_path: Path) -> None:
     pop = np.random.default_rng(4).normal(0, 1, (8, 50)).astype(np.float32)
-    fitness = np.arange(8, dtype=np.float32)
+    elo = elo_mod.EloTracker(8)
+    elo.ratings = np.arange(8, dtype=np.float64) * 100 + 1000
     hof = ga.HallOfFame()
-    hof.archive(pop[0], fitness=1.0, generation=0)
-    ga.save_checkpoint(tmp_path, generation=5, pop=pop, fitness=fitness, hof=hof, seeds=[1, 2, 3])
+    hof.archive(pop[0], elo_rating=1500.0, generation=0)
+    ga.save_checkpoint(tmp_path, generation=5, pop=pop, elo=elo, hof=hof, seeds=[1, 2, 3])
     state = ga.load_checkpoint(tmp_path)
     assert state["generation"] == 5
     assert np.array_equal(state["pop"], pop)
-    assert np.array_equal(state["fitness"], fitness)
+    assert np.array_equal(state["elo"], elo.ratings)
     assert state["seeds"] == [1, 2, 3]
     assert len(state["hof"]) == 1
+    assert state["hof"].elo_ratings == [1500.0]

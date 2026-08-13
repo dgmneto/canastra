@@ -132,13 +132,13 @@ class Dashboard:
     def on_generation(self, record: dict[str, Any]) -> None:
         self.history.append(record)
         self.status.generation = int(record["generation"]) + 1
-        self.status.last_best = float(record["fitness_best"])
-        self.status.last_mean = float(record["fitness_mean"])
+        self.status.last_best = float(record["elo_best"])
+        self.status.last_mean = float(record["elo_mean"])
         self.status.sigma = float(record["sigma"])
         if self.no_tui:
             print(
-                f"gen {record['generation']}: best {record['fitness_best']:+.1f} "
-                f"mean {record['fitness_mean']:+.1f} "
+                f"gen {record['generation']}: best {record['elo_best']:.1f} "
+                f"mean {record['elo_mean']:.1f} "
                 f"sigma {record['sigma']:.4f} ({record['wall_seconds']}s)"
             )
         self._tick()
@@ -189,11 +189,11 @@ class Dashboard:
         fitness: RenderableType
         if s.last_best is not None:
             fitness = Text(
-                f"fitness  best {s.last_best:+.1f}  mean {s.last_mean:+.1f}"
-                + (f"  ·  best ever {s.best_ever:+.1f}" if s.best_ever is not None else "")
+                f"ELO  best {s.last_best:.1f}  mean {s.last_mean:.1f}"
+                + (f"  ·  best ever {s.best_ever:.1f}" if s.best_ever is not None else "")
             )
         else:
-            fitness = Text("fitness: waiting for the first generation to finish", style="dim")
+            fitness = Text("ELO: waiting for the first generation to finish", style="dim")
         spark = self._sparklines()
 
         blocks: list[RenderableType] = [header, progress, timing, fitness]
@@ -218,8 +218,8 @@ class Dashboard:
         for record in self.history[-8:]:
             table.add_row(
                 str(record["generation"]),
-                f"{record['fitness_best']:+.1f}",
-                f"{record['fitness_mean']:+.1f}",
+                f"{record['elo_best']:.1f}",
+                f"{record['elo_mean']:.1f}",
                 f"{record['sigma']:.4f}",
                 _fmt_duration(float(record["wall_seconds"])),
             )
@@ -228,8 +228,8 @@ class Dashboard:
     def _sparklines(self) -> RenderableType | None:
         if len(self.history) < 2:
             return None
-        bests = [float(r["fitness_best"]) for r in self.history]
-        means = [float(r["fitness_mean"]) for r in self.history]
+        bests = [float(r["elo_best"]) for r in self.history]
+        means = [float(r["elo_mean"]) for r in self.history]
         return Group(
             Text("best " + _spark(bests)),
             Text("mean " + _spark(means)),

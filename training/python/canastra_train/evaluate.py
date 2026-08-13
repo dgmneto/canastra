@@ -79,14 +79,14 @@ def evaluate_pair(
     wins_a = wins_b = 0
     by_seed: dict[int, list[float]] = {}
     for index, (_seed, pair_scores, winner, _hands, is_unfinished) in enumerate(results):
-        a_is_team_zero = index < count
-        a_score = pair_scores[0] if a_is_team_zero else pair_scores[1]
-        b_score = pair_scores[1] if a_is_team_zero else pair_scores[0]
+        a_team_zero = index < count
+        a_score = pair_scores[0] if a_team_zero else pair_scores[1]
+        b_score = pair_scores[1] if a_team_zero else pair_scores[0]
         by_seed.setdefault(_seed, []).append(a_score - b_score)
         if is_unfinished:
             unfinished += 1
         elif winner is not None:
-            won_a = (winner == 0) == a_is_team_zero
+            won_a = (winner == 0) == a_team_zero
             if won_a:
                 wins_a += 1
             else:

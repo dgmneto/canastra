@@ -12,6 +12,12 @@ checkpoint. The spec's success gate — champion beats `random`, parity with
     .venv/bin/python -m canastra_train.train --generations N ...   # train
     npx tsx harness/src/eval-nn.ts <champion.json> random 1000     # from repo root
     npx tsx harness/src/eval-nn.ts <champion.json> random-plus 1000
+
+Games are capped at one hand (default cap=175 actions ≈ 1.6× the median
+single-hand length of ~109 actions). This eliminates the convergence tail:
+all games finish at nearly the same ply, so the pool runs at full parallelism
+for its entire lifetime. Genomes are ranked by a persistent ELO rating that
+carries across generations; children inherit their parent's rating.
 """
 
 from __future__ import annotations
@@ -25,11 +31,18 @@ from pathlib import Path
 
 import numpy as np
 
+from canastra_train import elo as elo_mod
 from canastra_train import ga, league, seedstream
 from canastra_train import genome as genome_mod
 from canastra_train.tui import Dashboard
 
 TRAINING_ARCH = {"obs": 2002, "act": 101, "trunk": [512, 256], "head": [128], "activation": "tanh"}
+
+# 1.6x the median single-hand action count (~109). 98.4% of games complete
+# exactly one hand; the remaining 1.6% hit the cap mid-hand (scores=[0,0],
+# treated as a draw). All games finish at nearly the same ply, eliminating
+# the convergence tail that plagued full-match play.
+ONE_HAND_CAP = 175
 
 
 def run(
@@ -41,7 +54,7 @@ def run(
     tournament: int = 4,
     opponents: int = 4,
     seeds: int = 8,
-    cap: int = 200_000,
+    cap: int = ONE_HAND_CAP,
     run_seed: int = 7,
     sigma: float = 0.02,
     sigma_decay: float = 0.995,
@@ -84,19 +97,22 @@ def run(
         state = ga.load_checkpoint(run_dir)
         pop, hof = state["pop"], state["hof"]
         start = state["generation"] + 1
+        elo = elo_mod.EloTracker(len(state["elo"]))
+        elo.ratings = state["elo"].copy()
         best_ever = max(
-            float(state["fitness"].max()),
-            max(hof.fitnesses) if len(hof) else float(state["fitness"].max()),
+            float(elo.ratings[:len(pop)].max()),
+            max(hof.elo_ratings) if len(hof) else float(elo.ratings[:len(pop)].max()),
         )
     else:
         pop = ga.initial_population(arch, cfg, run_seed)
         hof = ga.HallOfFame()
+        elo = elo_mod.EloTracker(population)
         start = 0
         best_ever = float("-inf")
 
     log_path = run_dir / "generations.jsonl"
     last_pop = pop
-    last_fitness: np.ndarray | None = None
+    last_elo: np.ndarray | None = None
     dash = Dashboard(
         run_dir,
         generations,
@@ -118,14 +134,14 @@ def run(
         dash.set_phase("evaluating")
         drive_metrics: list[league.DriveMetrics] = []
         evaluation_began = time.perf_counter()
-        fitness = league.evaluate_generation(
-            pop, hof, pairings, arch, gen_seeds, cap, device,
+        elo = league.evaluate_generation(
+            pop, hof, pairings, arch, gen_seeds, cap, device, elo,
             progress=dash.on_progress, shards=shards, metrics_out=drive_metrics,
         )
         evaluation_seconds = time.perf_counter() - evaluation_began
 
         last_pop = pop
-        last_fitness = fitness
+        last_elo = elo.ratings[:len(pop)].copy()
 
         action_counts = np.concatenate(
             [np.asarray(item.action_counts, dtype=np.int64) for item in drive_metrics]
@@ -160,12 +176,13 @@ def run(
             ),
         }
 
-        champion = int(np.argmax(fitness))
+        champion = int(np.argmax(elo.ratings[:len(pop)]))
+        elo_ratings = elo.ratings[:len(pop)]
         record = {
             "generation": generation,
-            "fitness_mean": float(fitness.mean()),
-            "fitness_best": float(fitness[champion]),
-            "fitness_worst": float(fitness.min()),
+            "elo_mean": float(elo_ratings.mean()),
+            "elo_best": float(elo_ratings[champion]),
+            "elo_worst": float(elo_ratings.min()),
             "champion": champion,
             "sigma": ga.sigma_for(cfg, generation),
             "seeds": gen_seeds,
@@ -176,14 +193,14 @@ def run(
         with log_path.open("a") as handle:
             handle.write(json.dumps(record) + "\n")
 
-        improved = fitness[champion] > best_ever
+        improved = elo_ratings[champion] > best_ever
         if improved:
-            best_ever = float(fitness[champion])
+            best_ever = float(elo_ratings[champion])
             dash.status.best_ever = float(best_ever)
         dash.on_generation(record)
         if improved:
             dash.on_event(
-                "best", f"new best-ever {fitness[champion]:+.1f} (gen {generation})"
+                "best", f"new best-ever ELO {elo_ratings[champion]:.1f} (gen {generation})"
             )
         if generation % cfg.hof_interval == 0 or improved:
             genome_mod.save_json(
@@ -191,25 +208,27 @@ def run(
             )
             dash.on_event(
                 "export",
-                f"champion-gen{generation:05d}.json ({fitness[champion]:+.1f})",
+                f"champion-gen{generation:05d}.json (ELO {elo_ratings[champion]:.1f})",
             )
         if generation % cfg.hof_interval == 0:
-            hof.archive(pop[champion], fitness=float(fitness[champion]), generation=generation)
+            hof.archive(pop[champion], elo_rating=float(elo_ratings[champion]), generation=generation)
+            elo.grow(1)
+            elo.ratings[-1] = float(elo_ratings[champion])
             dash.on_event(
                 "hof",
-                f"archived gen-{generation} champion ({fitness[champion]:+.1f})",
+                f"archived gen-{generation} champion (ELO {elo_ratings[champion]:.1f})",
             )
 
         dash.set_phase("evolving")
-        pop = ga.next_generation(pop, fitness, cfg, generation, gen_rng)
+        pop, next_elo = ga.next_generation(pop, elo.ratings[:len(pop)], cfg, generation, gen_rng)
+        elo.ratings[:len(pop)] = next_elo
         # Checkpoint the EVOLVED population (what generation+1 evaluates) so a
-        # resumed run starts from the exact hand-off — bit identical. The saved
-        # fitness pairs with the population that was evaluated this generation.
+        # resumed run starts from the exact hand-off — bit identical.
         if generation % 5 == 0 or generation == generations - 1 or improved:
-            ga.save_checkpoint(run_dir, generation, pop, fitness, hof, gen_seeds)
+            ga.save_checkpoint(run_dir, generation, pop, elo, hof, gen_seeds)
 
-    assert last_fitness is not None, "no generation was evaluated"
-    final = int(np.argmax(last_fitness))
+    assert last_elo is not None, "no generation was evaluated"
+    final = int(np.argmax(last_elo))
     genome_mod.save_json(str(run_dir / "champion-final.json"), arch, last_pop[final])
     dash.stop()
     print(f"done: {run_dir}")
@@ -225,7 +244,8 @@ def main() -> None:
     parser.add_argument("--tournament", type=int, default=4)
     parser.add_argument("--opponents", type=int, default=4)
     parser.add_argument("--seeds", type=int, default=8)
-    parser.add_argument("--cap", type=int, default=200_000)
+    parser.add_argument("--cap", type=int, default=ONE_HAND_CAP,
+                        help=f"actions per game (default {ONE_HAND_CAP} = one hand)")
     parser.add_argument("--run-seed", type=int, default=7)
     parser.add_argument("--sigma", type=float, default=0.02)
     parser.add_argument("--sigma-decay", type=float, default=0.995)

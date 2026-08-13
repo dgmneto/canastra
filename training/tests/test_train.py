@@ -27,7 +27,7 @@ def test_train_smoke_produces_the_artifacts(tmp_path: Path) -> None:
     assert len(lines) == 2
     first = json.loads(lines[0])
     assert first["generation"] == 0
-    assert "fitness_best" in first and "sigma" in first and "seeds" in first
+    assert "elo_best" in first and "sigma" in first and "seeds" in first
     champions = sorted(tmp_path.glob("champion-*.json"))
     assert champions, "champion weights exported"
     arch_loaded, _vec = genome.load_json(str(champions[-1]))
@@ -88,7 +88,7 @@ def test_resume_is_bit_identical_to_an_uninterrupted_run(tmp_path: Path) -> None
                 return entry
         raise AssertionError(f"no generation {generation} record in {directory}")
 
-    keys = ("fitness_mean", "fitness_best", "champion", "seeds")
+    keys = ("elo_mean", "elo_best", "champion", "seeds")
     cont = record(continuous, 1)
     res = record(resumed, 1)
     for key in keys:

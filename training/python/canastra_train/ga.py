@@ -12,6 +12,7 @@ from typing import TypedDict
 
 import numpy as np
 
+from canastra_train import elo as elo_mod
 from canastra_train import genome as genome_mod
 
 
@@ -44,21 +45,29 @@ def _tournament(fitness: np.ndarray, k: int, rng: np.random.Generator) -> int:
 
 def next_generation(
     pop: np.ndarray,
-    fitness: np.ndarray,
+    elo_ratings: np.ndarray,
     cfg: GAConfig,
     generation: int,
     rng: np.random.Generator,
-) -> np.ndarray:
-    """Elites carried unchanged; the rest are mutated tournament winners."""
-    order = np.argsort(fitness)[::-1]
+) -> tuple[np.ndarray, np.ndarray]:
+    """Elites carried unchanged; the rest are mutated tournament winners.
+
+    Returns ``(next_pop, next_elo)`` where ``next_elo`` is the ratings array
+    for the new population: elites keep their rating, children inherit their
+    parent's rating.
+    """
+    order = np.argsort(elo_ratings)[::-1]
     sigma = sigma_for(cfg, generation)
     next_pop = np.empty_like(pop)
+    next_elo = np.empty_like(elo_ratings)
     next_pop[: cfg.elites] = pop[order[: cfg.elites]]
+    next_elo[: cfg.elites] = elo_ratings[order[: cfg.elites]]
     for child_index in range(cfg.population - cfg.elites):
-        parent = pop[_tournament(fitness, cfg.tournament, rng)]
-        child = parent + rng.normal(0.0, sigma, size=parent.shape).astype(np.float32)
+        parent = _tournament(elo_ratings, cfg.tournament, rng)
+        child = pop[parent] + rng.normal(0.0, sigma, size=pop[parent].shape).astype(np.float32)
         next_pop[cfg.elites + child_index] = child
-    return next_pop
+        next_elo[cfg.elites + child_index] = elo_ratings[parent]
+    return next_pop, next_elo
 
 
 class HallOfFame:
@@ -66,12 +75,12 @@ class HallOfFame:
 
     def __init__(self) -> None:
         self.genomes: list[np.ndarray] = []
-        self.fitnesses: list[float] = []
+        self.elo_ratings: list[float] = []
         self.generations: list[int] = []
 
-    def archive(self, genome: np.ndarray, fitness: float, generation: int) -> None:
+    def archive(self, genome: np.ndarray, elo_rating: float, generation: int) -> None:
         self.genomes.append(genome.astype(np.float32).copy())
-        self.fitnesses.append(float(fitness))
+        self.elo_ratings.append(float(elo_rating))
         self.generations.append(int(generation))
 
     def sample(self, rng: np.random.Generator) -> np.ndarray:
@@ -85,7 +94,7 @@ def save_checkpoint(
     directory: Path,
     generation: int,
     pop: np.ndarray,
-    fitness: np.ndarray,
+    elo: elo_mod.EloTracker,
     hof: HallOfFame,
     seeds: list[int],
 ) -> Path:
@@ -94,10 +103,10 @@ def save_checkpoint(
     np.savez_compressed(
         path,
         pop=pop,
-        fitness=fitness,
-        seeds=np.asarray(seeds, dtype=np.uint64),  # splitmix64 spans the full u64 range
+        elo=elo.ratings,
+        seeds=np.asarray(seeds, dtype=np.uint64),
         hof=np.vstack(hof.genomes) if len(hof) else np.zeros((0, pop.shape[1]), dtype=np.float32),
-        hof_fitness=np.asarray(hof.fitnesses, dtype=np.float32),
+        hof_elo=np.asarray(hof.elo_ratings, dtype=np.float64),
         hof_generations=np.asarray(hof.generations, dtype=np.int64),
         generation=np.int64(generation),
     )
@@ -114,7 +123,7 @@ def _prune(directory: Path, keep: int) -> None:
 class _Checkpoint(TypedDict):
     generation: int
     pop: np.ndarray
-    fitness: np.ndarray
+    elo: np.ndarray
     seeds: list[int]
     hof: HallOfFame
 
@@ -125,13 +134,13 @@ def load_checkpoint(directory: Path) -> _Checkpoint:
         raise FileNotFoundError(f"no checkpoint in {directory}")
     with np.load(checkpoints[-1]) as data:
         hof = HallOfFame()
-        for genome_row, fit, gen in zip(data["hof"], data["hof_fitness"], data["hof_generations"]):
+        for genome_row, elo_val, gen in zip(data["hof"], data["hof_elo"], data["hof_generations"]):
             if genome_row.size:
-                hof.archive(genome_row, fitness=float(fit), generation=int(gen))
+                hof.archive(genome_row, float(elo_val), int(gen))
         return {
             "generation": int(data["generation"]),
             "pop": data["pop"],
-            "fitness": data["fitness"],
+            "elo": data["elo"],
             "seeds": [int(s) for s in data["seeds"]],
             "hof": hof,
         }

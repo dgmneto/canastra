@@ -23,6 +23,7 @@ import time
 import numpy as np
 from canastra_py import Pool
 
+from canastra_train import elo as elo_mod
 from canastra_train import ga, league, policy
 from canastra_train.train import TRAINING_ARCH
 
@@ -85,9 +86,10 @@ def _league_shape(
 
     began = time.perf_counter()
     limited = False
+    elo = elo_mod.EloTracker(population)
     if shards > 1:
         league.evaluate_generation(
-            pop, hof, pairings, TRAINING_ARCH, seeds, cap, device,
+            pop, hof, pairings, TRAINING_ARCH, seeds, cap, device, elo,
             progress=progress_count, shards=shards, metrics_out=drive_metrics,
             max_rounds=max_rounds, kernel=kernel,
         )

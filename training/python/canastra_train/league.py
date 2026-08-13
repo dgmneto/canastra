@@ -19,6 +19,7 @@ import numpy as np
 import torch
 from canastra_py import Pool
 
+from canastra_train import elo as elo_mod
 from canastra_train import ga, policy
 from canastra_train import genome as genome_mod
 
@@ -393,20 +394,25 @@ def evaluate_generation(
     seeds: list[int],
     cap: int,
     device: str,
+    elo: elo_mod.EloTracker,
     progress: Callable[[int, int], None] | None = None,
     shards: int = 1,
     metrics_out: list[DriveMetrics] | None = None,
     max_rounds: int | None = None,
     kernel: policy.PolicyKernel = "einsum",
-) -> np.ndarray:
-    """Mean duplicate-deal differential for every population genome.
+) -> elo_mod.EloTracker:
+    """Play one generation of self-play and update ELO ratings in-place.
 
-    With `shards > 1` the generation's games are split across that many worker
-    processes, each running its own batched ply loop (`shards.run_shards`).
-    Results are bit-identical to the `shards == 1` path — per-game play is
-    deterministic, and the workers return their results in global game order.
-    `progress`, when given, receives the aggregated (plies, games_finished)
-    counts across all shards.
+    Each game's result is win/loss/draw based on which team scored more.
+    With a 1-hand cap (``cap`` ≈ 175), each game plays exactly one hand, so
+    the result is a single hand's score comparison — fast and uniform-length,
+    with no convergence tail. The ELO tracker is updated in deterministic
+    game order and returned (same object, modified in-place).
+
+    With ``shards > 1`` the games are split across worker processes, each
+    running its own batched ply loop (``shards.run_shards``). Results are
+    bit-identical to the ``shards == 1`` path — per-game play is deterministic,
+    and workers return results in global game order.
     """
     roster, game_seeds, meta = batch_layout(pop, hof, pairings, seeds)
     if max_rounds is not None and shards > 1:
@@ -437,31 +443,20 @@ def evaluate_generation(
         if metrics_out is not None:
             metrics_out.append(metrics)
 
-    # Aggregate duplicate-deal differentials per pairing, then per genome.
+    # Compute ELO updates from game results in deterministic order.
     assert len(results) == len(game_seeds)
-    pairing_by_seed: dict[int, dict[int, list[float]]] = {
-        p: {} for p in range(len(pairings))
-    }
-    for gidx, (_seed, result_scores, _winner, _hands, _unfinished) in enumerate(
-        results
-    ):
+    elo_results: list[tuple[int, int, float]] = []
+    for gidx, (_seed, result_scores, _winner, _hands, _unfinished) in enumerate(results):
         pairing = gidx // per_game
         seating = gidx % 2
-        seed = game_seeds[gidx]
-        a_is_team_zero = seating == 0
-        a_score = result_scores[0] if a_is_team_zero else result_scores[1]
-        b_score = result_scores[1] if a_is_team_zero else result_scores[0]
-        pairing_by_seed[pairing].setdefault(seed, []).append(a_score - b_score)
-
-    fitness = np.zeros(len(pop), dtype=np.float64)
-    counts = np.zeros(len(pop), dtype=np.float64)
-    for pidx, (ga_idx, _gb_idx) in enumerate(pairings):
-        diffs = []
-        for seed in seeds:
-            pair = pairing_by_seed[pidx][seed]
-            assert len(pair) == 2, f"pairing {pidx} seed {seed} lost a seating"
-            diffs.append((pair[0] + pair[1]) / 2)
-        fitness[ga_idx] += float(np.mean(diffs))
-        counts[ga_idx] += 1
-    assert (counts > 0).all()
-    return (fitness / counts).astype(np.float32)
+        ga_idx, gb_idx = pairings[pairing]
+        # Win/loss/draw from the team that scored more.
+        if result_scores[0] == result_scores[1]:
+            result = 0.5
+        elif (result_scores[0] > result_scores[1]) == (seating == 0):
+            result = 1.0  # genome A's team won
+        else:
+            result = 0.0  # genome B's team won
+        elo_results.append((ga_idx, gb_idx, result))
+    elo.batch_update(elo_results)
+    return elo

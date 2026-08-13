@@ -42,7 +42,7 @@ def test_shards_are_bit_identical_to_single_process(tmp_path: Path) -> None:
     for one, two in zip(single_lines, sharded_lines):
         one_rec = json.loads(one)
         two_rec = json.loads(two)
-        for key in ("generation", "fitness_mean", "fitness_best", "fitness_worst",
+        for key in ("generation", "elo_mean", "elo_best", "elo_worst",
                     "champion", "sigma", "seeds"):
             assert one_rec[key] == two_rec[key], f"{key} diverges: {one} vs {two}"
 
