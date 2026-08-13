@@ -8,7 +8,7 @@
 //! transition.
 
 use crate::action::{Action, MeldTarget};
-use crate::apply::validate;
+use crate::apply::{HandContext, validate_with_context};
 use crate::card::{Card, Rank, Suit};
 use crate::state::{GameState, Phase, Seat};
 use std::cmp::Ordering;
@@ -21,10 +21,11 @@ pub fn enumerate(state: &GameState, seat: Seat) -> Vec<Action> {
         return Vec::new();
     }
     let candidates = candidate_actions(state, seat);
+    let ctx = HandContext::build(state, seat);
 
     let mut actions: Vec<Action> = candidates
         .into_iter()
-        .filter(|action| validate(state, seat, action).is_ok())
+        .filter(|action| validate_with_context(state, seat, action, &ctx).is_ok())
         .collect();
     // Deterministic order matters: seed + action log must keep replaying, and
     // bots keyed on the list need a stable input. This key mirrors the old

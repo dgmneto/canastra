@@ -1,10 +1,100 @@
 //! The state machine: apply an [`Action`] to a [`GameState`].
 
 use crate::action::{Action, MeldTarget, RuleViolation};
-use crate::card::{Card, Rank};
+use crate::card::{Card, Rank, Suit};
 use crate::deal::resolve_red_threes;
 use crate::meld::{Meld, MeldError};
 use crate::state::{GameState, Phase, Seat, TurnContext};
+
+/// Values derived from the hand and frozen set that every validator needs,
+/// computed once per `enumerate` call so 200+ candidates don't each re-iterate
+/// the full hand.
+///
+/// `hand_value` and `frozen_value` are the total card points in the hand and
+/// frozen set respectively. `hand_len` is the number of cards in hand. The
+/// count arrays let `validate_cards_from_hand` answer "how many of this card are
+/// held / frozen" in O(1) instead of O(hand) per card.
+///
+/// There are 53 possible card values (52 standard + joker), so the count arrays
+/// are fixed `[u8; 53]` indexed by [`card_count_index`] — stack allocated, no
+/// overflow risk even when the discard pile is taken and the hand grows large.
+pub(crate) struct HandContext {
+    pub hand_value: u32,
+    pub frozen_value: u32,
+    pub hand_len: usize,
+    hand_counts: [u8; 53],
+    frozen_counts: [u8; 53],
+}
+
+/// Index into the 53-slot count arrays. Matches the card ordering used by
+/// `canastra-encode` (suits in declaration order, ranks in game order), but is
+/// self-contained here to avoid a cross-crate dependency for a 3-line function.
+fn card_count_index(card: Card) -> usize {
+    match card {
+        Card::Joker => 52,
+        Card::Standard { rank, suit } => {
+            let s = match suit {
+                Suit::Clubs => 0,
+                Suit::Diamonds => 1,
+                Suit::Hearts => 2,
+                Suit::Spades => 3,
+            };
+            let r = match rank {
+                Rank::Two => 0,
+                Rank::Three => 1,
+                Rank::Four => 2,
+                Rank::Five => 3,
+                Rank::Six => 4,
+                Rank::Seven => 5,
+                Rank::Eight => 6,
+                Rank::Nine => 7,
+                Rank::Ten => 8,
+                Rank::Jack => 9,
+                Rank::Queen => 10,
+                Rank::King => 11,
+                Rank::Ace => 12,
+            };
+            s * 13 + r
+        }
+    }
+}
+
+impl HandContext {
+    pub(crate) fn build(state: &GameState, seat: Seat) -> HandContext {
+        let hand = state.hand(seat);
+        let frozen = &state.turn_context.frozen;
+
+        let mut hand_value = 0u32;
+        let mut hand_counts = [0u8; 53];
+        for &card in hand {
+            hand_value += card.points();
+            hand_counts[card_count_index(card)] += 1;
+        }
+
+        let mut frozen_value = 0u32;
+        let mut frozen_counts = [0u8; 53];
+        for &card in frozen {
+            frozen_value += card.points();
+            frozen_counts[card_count_index(card)] += 1;
+        }
+
+        HandContext {
+            hand_value,
+            frozen_value,
+            hand_len: hand.len(),
+            hand_counts,
+            frozen_counts,
+        }
+    }
+
+    fn hand_count(&self, card: Card) -> u8 {
+        self.hand_counts[card_count_index(card)]
+    }
+
+    fn frozen_count(&self, card: Card) -> u8 {
+        self.frozen_counts[card_count_index(card)]
+    }
+}
 
 /// Check whether a move is legal without building the state it would produce.
 ///
@@ -23,17 +113,39 @@ pub fn validate(state: &GameState, seat: Seat, action: &Action) -> Result<(), Ru
         });
     }
 
+    let ctx = HandContext::build(state, seat);
+    validate_with_context(state, seat, action, &ctx)
+}
+
+/// Validate with a pre-built [`HandContext`]. Used by `enumerate` to avoid
+/// rebuilding the context for every candidate. The public `validate` delegates
+/// here after building its own context.
+pub(crate) fn validate_with_context(
+    state: &GameState,
+    seat: Seat,
+    action: &Action,
+    ctx: &HandContext,
+) -> Result<(), RuleViolation> {
+    if matches!(state.phase, Phase::HandOver | Phase::MatchOver) {
+        return Err(RuleViolation::HandIsOver);
+    }
+    if seat != state.turn {
+        return Err(RuleViolation::NotYourTurn {
+            current: state.turn,
+        });
+    }
+
     match action {
         Action::Draw => validate_draw(state),
         Action::KeepDrawnCard => validate_keep_drawn(state),
         Action::RefuseDrawnCard => validate_refuse_drawn(state),
         Action::TakeDiscardPile { core, target } => {
-            validate_take_discard_pile(state, seat, *core, target)
+            validate_take_discard_pile(state, seat, *core, target, ctx)
         }
-        Action::LayMeld { cards } => validate_lay_meld(state, seat, cards),
-        Action::AddToMeld { meld, cards } => validate_add_to_meld(state, seat, *meld, cards),
-        Action::Discard { card } => validate_discard(state, seat, *card),
-        Action::EndTurnWithoutDiscard => validate_end_turn_without_discard(state, seat),
+        Action::LayMeld { cards } => validate_lay_meld(state, seat, cards, ctx),
+        Action::AddToMeld { meld, cards } => validate_add_to_meld(state, seat, *meld, cards, ctx),
+        Action::Discard { card } => validate_discard(state, seat, *card, ctx),
+        Action::EndTurnWithoutDiscard => validate_end_turn_without_discard(state, seat, ctx),
     }
 }
 
@@ -116,6 +228,7 @@ fn validate_take_discard_pile(
     seat: Seat,
     core: [Card; 2],
     target: &MeldTarget,
+    ctx: &HandContext,
 ) -> Result<(), RuleViolation> {
     require_phase(state, Phase::AwaitingDraw)?;
 
@@ -147,26 +260,20 @@ fn validate_take_discard_pile(
 
     // Keep the same error ordering as the transition: meld shape and target
     // are checked before the two named hand cards are consumed.
-    validate_cards_from_hand(state, seat, &core)?;
+    validate_cards_from_hand_ctx(ctx, &core)?;
 
     // Taking the pile replaces the discard with the swept cards in hand and
     // freezes exactly those cards. Project that result without constructing it.
     let swept = &state.discard[..state.discard.len() - 1];
     let swept_value: u32 = swept.iter().map(|card| card.points()).sum();
     let core_value: u32 = core.iter().map(|card| card.points()).sum();
-    let hand_value: u32 = state
-        .hand(seat)
-        .iter()
-        .map(|card| card.points())
-        .sum::<u32>()
-        - core_value
-        + swept_value;
+    let hand_value: u32 = ctx.hand_value - core_value + swept_value;
     let laid_value =
         state.turn_context.laid_value + block.iter().map(|card| card.points()).sum::<u32>();
     check_opening_reachable_values(
         state,
         seat,
-        state.hand(seat).len() - core.len() + swept.len(),
+        ctx.hand_len - core.len() + swept.len(),
         laid_value,
         true,
         hand_value,
@@ -174,21 +281,21 @@ fn validate_take_discard_pile(
     )
 }
 
-fn validate_lay_meld(state: &GameState, seat: Seat, cards: &[Card]) -> Result<(), RuleViolation> {
+fn validate_lay_meld(
+    state: &GameState,
+    seat: Seat,
+    cards: &[Card],
+    ctx: &HandContext,
+) -> Result<(), RuleViolation> {
     require_phase(state, Phase::Melding)?;
     let meld = Meld::new(cards).map_err(|reason| RuleViolation::InvalidMeld { reason })?;
-    validate_cards_from_hand(state, seat, cards)?;
+    validate_cards_from_hand_ctx(ctx, cards)?;
 
     let cards_value: u32 = cards.iter().map(|card| card.points()).sum();
-    let hand_value: u32 = state
-        .hand(seat)
-        .iter()
-        .map(|card| card.points())
-        .sum::<u32>()
-        - cards_value;
+    let hand_value: u32 = ctx.hand_value - cards_value;
     let laid_value = state.turn_context.laid_value + cards_value;
     let clean = state.has_clean_canastra(seat.team()) || meld.canastra().is_clean();
-    let hand_len = state.hand(seat).len() - cards.len();
+    let hand_len = ctx.hand_len - cards.len();
 
     check_hand_end(state, seat, hand_len, clean, true, laid_value)?;
     check_opening_reachable_values(
@@ -198,12 +305,7 @@ fn validate_lay_meld(state: &GameState, seat: Seat, cards: &[Card]) -> Result<()
         laid_value,
         true,
         hand_value,
-        state
-            .turn_context
-            .frozen
-            .iter()
-            .map(|card| card.points())
-            .sum(),
+        ctx.frozen_value,
     )
 }
 
@@ -212,6 +314,7 @@ fn validate_add_to_meld(
     seat: Seat,
     index: usize,
     cards: &[Card],
+    ctx: &HandContext,
 ) -> Result<(), RuleViolation> {
     require_phase(state, Phase::Melding)?;
     if cards.is_empty() {
@@ -232,15 +335,10 @@ fn validate_add_to_meld(
             .add_card(card)
             .map_err(|reason| RuleViolation::InvalidMeld { reason })?;
     }
-    validate_cards_from_hand(state, seat, cards)?;
+    validate_cards_from_hand_ctx(ctx, cards)?;
 
     let cards_value: u32 = cards.iter().map(|card| card.points()).sum();
-    let hand_value: u32 = state
-        .hand(seat)
-        .iter()
-        .map(|card| card.points())
-        .sum::<u32>()
-        - cards_value;
+    let hand_value: u32 = ctx.hand_value - cards_value;
     let laid_value = state.turn_context.laid_value + cards_value;
     let clean = state.tables[team]
         .melds
@@ -253,7 +351,7 @@ fn validate_add_to_meld(
                 current.canastra().is_clean()
             }
         });
-    let hand_len = state.hand(seat).len() - cards.len();
+    let hand_len = ctx.hand_len - cards.len();
 
     check_hand_end(
         state,
@@ -270,18 +368,18 @@ fn validate_add_to_meld(
         laid_value,
         state.turn_context.laid_anything || !cards.is_empty(),
         hand_value,
-        state
-            .turn_context
-            .frozen
-            .iter()
-            .map(|card| card.points())
-            .sum(),
+        ctx.frozen_value,
     )
 }
 
-fn validate_discard(state: &GameState, seat: Seat, card: Card) -> Result<(), RuleViolation> {
+fn validate_discard(
+    state: &GameState,
+    seat: Seat,
+    card: Card,
+    ctx: &HandContext,
+) -> Result<(), RuleViolation> {
     require_phase(state, Phase::Melding)?;
-    if !state.hand(seat).contains(&card) {
+    if ctx.hand_count(card) == 0 {
         return Err(RuleViolation::CardNotInHand { card });
     }
     check_opening_commit(
@@ -290,17 +388,20 @@ fn validate_discard(state: &GameState, seat: Seat, card: Card) -> Result<(), Rul
         state.turn_context.laid_anything,
         state.turn_context.laid_value,
     )?;
-    if state.hand(seat).len() == 1 && !state.has_clean_canastra(seat.team()) {
+    if ctx.hand_len == 1 && !state.has_clean_canastra(seat.team()) {
         return Err(RuleViolation::NoCleanCanastra);
     }
     Ok(())
 }
 
-fn validate_end_turn_without_discard(state: &GameState, seat: Seat) -> Result<(), RuleViolation> {
+fn validate_end_turn_without_discard(
+    state: &GameState,
+    seat: Seat,
+    ctx: &HandContext,
+) -> Result<(), RuleViolation> {
     require_phase(state, Phase::Melding)?;
-    let cornered = state.stock.is_empty()
-        && state.hand(seat).len() == 1
-        && !state.has_clean_canastra(seat.team());
+    let cornered =
+        state.stock.is_empty() && ctx.hand_len == 1 && !state.has_clean_canastra(seat.team());
     if !cornered {
         return Err(RuleViolation::MustDiscard);
     }
@@ -315,25 +416,18 @@ fn validate_end_turn_without_discard(state: &GameState, seat: Seat) -> Result<()
 /// Validate the cards that a transition would remove from a hand. The prefix
 /// count models earlier duplicate cards in the same action without copying the
 /// hand or the surrounding `GameState`.
-fn validate_cards_from_hand(
-    state: &GameState,
-    seat: Seat,
-    cards: &[Card],
-) -> Result<(), RuleViolation> {
-    let hand = state.hand(seat);
+///
+/// Uses precomputed counts from a [`HandContext`] instead of re-iterating the
+/// hand and frozen set per card.
+fn validate_cards_from_hand_ctx(ctx: &HandContext, cards: &[Card]) -> Result<(), RuleViolation> {
     for (index, &card) in cards.iter().enumerate() {
-        let held = hand.iter().filter(|held| **held == card).count();
-        let consumed = cards[..index].iter().filter(|held| **held == card).count();
+        let held = ctx.hand_count(card);
+        let consumed = cards[..index].iter().filter(|&&c| c == card).count() as u8;
         let remaining = held.saturating_sub(consumed);
         if remaining == 0 {
             return Err(RuleViolation::CardNotInHand { card });
         }
-        let frozen = state
-            .turn_context
-            .frozen
-            .iter()
-            .filter(|frozen| **frozen == card)
-            .count();
+        let frozen = ctx.frozen_count(card);
         if remaining <= frozen {
             return Err(RuleViolation::CardFrozen { card });
         }
