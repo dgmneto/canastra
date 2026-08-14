@@ -100,7 +100,11 @@ def save_checkpoint(
 ) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"gen-{generation:05d}.npz"
-    np.savez_compressed(
+    # Uncompressed: savez_compressed took ~18s on a 96×1.2M float32 array
+    # (zlib is serial), which was ~50% of gen-0 wall time. Uncompressed is
+    # <0.5s; the disk cost (~440 MB per checkpoint, pruned to 10) is trivial
+    # next to a training run's time budget.
+    np.savez(
         path,
         pop=pop,
         elo=elo.ratings,
