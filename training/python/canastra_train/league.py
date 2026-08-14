@@ -184,6 +184,7 @@ def drive_pool(
         metrics.reset(len(game_seeds))
     plies = 0
     started = time.perf_counter()
+
     try:
         while pool.has_live():
             if max_rounds is not None and plies >= max_rounds:
@@ -194,8 +195,6 @@ def drive_pool(
             games = rows[:, 0]
             seats = rows[:, 1]
             pairing = meta[games]
-            # Genome owning this row: in seating 0, genome A holds the even seats
-            # (team 0); in seating 1 the sides are swapped.
             genome_idx = np.where(
                 (seats % 2 == 0) == (pairing[:, 2] == 0), pairing[:, 0], pairing[:, 1]
             )

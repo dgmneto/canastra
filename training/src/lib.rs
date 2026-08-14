@@ -224,21 +224,25 @@ impl Pool {
             })
             .collect();
 
-        // Menus first (enumerate is the expensive part — parallel). A game
-        // whose menu comes back empty has dead-ended its turn: back out to
-        // the turn's start and retry safe, exactly the harness driver's path.
-        let mut menus: Vec<Vec<Action>> = self
-            .pending
-            .par_iter()
-            .map(|&i| self.games[i].menu())
-            .collect();
+        // Menus first (enumerate is the expensive part — parallel, GIL-free).
+        // We split the computation: the menu enumeration is read-only on
+        // self.games, so it runs inside py.allow_threads, releasing the GIL
+        // so a GPU forward thread can run concurrently. Safe-mode backout
+        // (rare, needs &mut self.games) runs after, GIL held.
+        let pending = self.pending.clone();
+        let games = &self.games[..];
+
+        let mut menus: Vec<Vec<Action>> = py.allow_threads(move || {
+            pending
+                .par_iter()
+                .map(|&i| games[i].menu())
+                .collect()
+        });
+
+        // Safe-mode backout (GIL held, rare — only when a turn dead-ended).
         for (row, &game) in self.pending.iter().enumerate() {
             if menus[row].is_empty() {
                 let game = &mut self.games[game];
-                // §6.1: backing out after laying cards, before the partnership
-                // has opened, is a failed opening — the bar steps up one tier.
-                // Judge it before the restore (the laid cards vanish in it) and
-                // latch it after, exactly like the harness driver's restartTurn.
                 let failed = game.state.restart_penalizes_opening(game.state.turn);
                 let team = game.state.turn.team();
                 game.state = game.turn_start.clone();
@@ -261,47 +265,56 @@ impl Pool {
 
         // Encode directly into the disjoint NumPy rows. Keeping the arrays
         // NumPy-owned avoids per-row scratch vectors and serial row copies.
+        // Released GIL: the array pointers are valid (arrays live until the
+        // function returns), each row's range is unique, and the GIL prevents
+        // Python from accessing the arrays during the writes.
         let obs_ptr = obs.data() as usize;
         let acts_ptr = acts.data() as usize;
         let mask_ptr = mask.data() as usize;
         let grid_ptr = grid.data() as usize;
-        self.pending
-            .par_iter()
-            .enumerate()
-            .zip(self.menus.par_iter())
-            .for_each(|((row, &game), menu)| {
-                // SAFETY: each row range is unique to this closure, the arrays
-                // stay alive until the parallel loop completes, and the GIL
-                // prevents Python from accessing them during the writes.
-                unsafe {
-                    let obs_row = std::slice::from_raw_parts_mut(
-                        (obs_ptr as *mut f32).add(row * OBS_DIM),
-                        OBS_DIM,
-                    );
-                    let acts_row = std::slice::from_raw_parts_mut(
-                        (acts_ptr as *mut f32).add(row * width * ACT_DIM),
-                        width * ACT_DIM,
-                    );
-                    let mask_row = std::slice::from_raw_parts_mut(
-                        (mask_ptr as *mut bool).add(row * width),
-                        width,
-                    );
-                    let grid_row =
-                        std::slice::from_raw_parts_mut((grid_ptr as *mut i64).add(row * 2), 2);
-                    let view = observe(&self.games[game].state, self.games[game].state.turn);
-                    encode_observation(&view, obs_row);
-                    encode_actions(&view, menu, &mut acts_row[..menu.len() * ACT_DIM]);
-                    mask_row[..menu.len()].fill(true);
-                    grid_row[0] = game as i64;
-                    grid_row[1] = self.games[game].state.turn.index() as i64;
-                }
-            });
+        let pending = self.pending.clone();
+        let menus = self.menus.clone();
+        let games = &self.games[..];
+
+        py.allow_threads(move || {
+            pending
+                .par_iter()
+                .enumerate()
+                .zip(menus.par_iter())
+                .for_each(|((row, &game), menu)| {
+                    // SAFETY: each row range is unique to this closure, the arrays
+                    // stay alive until the parallel loop completes, and the GIL
+                    // prevents Python from accessing them during the writes.
+                    unsafe {
+                        let obs_row = std::slice::from_raw_parts_mut(
+                            (obs_ptr as *mut f32).add(row * OBS_DIM),
+                            OBS_DIM,
+                        );
+                        let acts_row = std::slice::from_raw_parts_mut(
+                            (acts_ptr as *mut f32).add(row * width * ACT_DIM),
+                            width * ACT_DIM,
+                        );
+                        let mask_row = std::slice::from_raw_parts_mut(
+                            (mask_ptr as *mut bool).add(row * width),
+                            width,
+                        );
+                        let grid_row =
+                            std::slice::from_raw_parts_mut((grid_ptr as *mut i64).add(row * 2), 2);
+                        let view = observe(&games[game].state, games[game].state.turn);
+                        encode_observation(&view, obs_row);
+                        encode_actions(&view, menu, &mut acts_row[..menu.len() * ACT_DIM]);
+                        mask_row[..menu.len()].fill(true);
+                        grid_row[0] = game as i64;
+                        grid_row[1] = games[game].state.turn.index() as i64;
+                    }
+                });
+        });
 
         Ok((obs, acts, mask, grid))
     }
 
     /// Play the picked menu index on every pending row.
-    fn apply(&mut self, picks: Vec<usize>) -> PyResult<()> {
+    fn apply(&mut self, py: Python<'_>, picks: Vec<usize>) -> PyResult<()> {
         if picks.len() != self.pending.len() {
             return Err(PyValueError::new_err(format!(
                 "expected {} picks, got {}",
@@ -330,15 +343,22 @@ impl Pool {
             selected[game_index] = Some(action);
         }
 
-        let mut applied: Vec<(usize, Result<GameState, RuleViolation>)> = self
-            .games
-            .par_iter()
-            .enumerate()
-            .filter_map(|(game_index, game)| {
-                let action = selected[game_index].as_ref()?;
-                Some((game_index, apply(&game.state, game.state.turn, action)))
-            })
-            .collect();
+        // The parallel apply is CPU-heavy and GIL-free. Releasing the GIL
+        // here lets a GPU forward thread run concurrently during pipelined
+        // single-process training.
+        let games = &self.games[..];
+        let selected_ref = &selected[..];
+        let mut applied: Vec<(usize, Result<GameState, RuleViolation>)> =
+            py.allow_threads(move || {
+                games
+                    .par_iter()
+                    .enumerate()
+                    .filter_map(|(game_index, game)| {
+                        let action = selected_ref[game_index].as_ref()?;
+                        Some((game_index, apply(&game.state, game.state.turn, action)))
+                    })
+                    .collect()
+            });
         applied.sort_unstable_by_key(|(game, _)| *game);
         for (game_index, next_state) in applied {
             let action = selected[game_index].as_ref().expect("selected action");
