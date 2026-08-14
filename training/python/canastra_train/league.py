@@ -282,17 +282,6 @@ def _pick_batch_gpu(
     buckets so a rogue 288-action menu only inflates its own bucket's transfer.
     The typical distribution (p50≈2, p99≈26) puts 99%+ in the narrow bucket.
 
-    Three optimizations over the prior 6-bucket path:
-
-    1. **Three buckets, not six.** Halves kernel launches, weight slices, and
-       CPU indexing vs the 6-bucket version.
-    2. **Hoisted weight slicing.** The set of genomes present in a ply is the
-       same for all buckets. Slicing once (not per-bucket) eliminates redundant
-       ``index_select`` on the weight tensors.
-    3. **Vectorized genome grouping.** The per-bucket padded index array is
-       built with a vectorized cumsum + scatter instead of a Python ``for``
-       loop over 96 genomes, eliminating ~16 ms/ply of Python overhead.
-
     Bit-identical to ``_pick_batch_flat`` under the ``einsum`` kernel (same
     invariants: padding-to-4 floor, stable sort, weight slicing not re-creation).
     """
@@ -306,8 +295,6 @@ def _pick_batch_gpu(
     obs_dim = obs.shape[1]
 
     # --- Hoisted weight slicing (once per ply, shared across buckets) ---
-    # The set of genomes present is the same regardless of which bucket a row
-    # lands in. Compute it once from the full genome_idx array.
     order = np.argsort(genome_idx, kind="stable")
     sorted_gidx = genome_idx[order]
     counts = np.bincount(sorted_gidx, minlength=n_groups)
@@ -340,22 +327,16 @@ def _pick_batch_gpu(
         b_order = np.argsort(b_genome_idx, kind="stable")
         b_sorted_gidx = b_genome_idx[b_order]
         b_counts = np.bincount(b_sorted_gidx, minlength=n_groups)
-        # Only keep genomes present in this bucket (subset of `present`).
         b_present = np.flatnonzero(b_counts > 0)
         b_n_max = max(int(b_counts[b_present].max()) if b_present.size else 0, 4)
 
-        # Vectorized padded index construction:
-        # For each genome in b_present, fill [start:start+count] with sequential
-        # indices into the bucket-local sorted array. This replaces the Python
-        # for-loop with a single scatter operation.
         b_padded = _vectorized_padded(b_counts, b_present, b_n_max, len(b_genome_idx))
         b_valid = b_padded >= 0
         b_padded = np.where(b_valid, b_padded, 0)
 
-        # Map bucket-local sorted indices back to global row indices.
-        row_order = b_order[b_padded]  # [b_present, b_n_max] → bucket-local row indices
+        row_order = b_order[b_padded]
 
-        # Transfer bucket data (trimmed to bucket max width).
+        # Transfer bucket data via pinned memory for async overlap with CPU.
         b_obs = obs[bucket_indices]
         b_acts = np.ascontiguousarray(
             acts[bucket_indices[:, None], np.arange(b_ply_max)[None, :]]
@@ -381,8 +362,6 @@ def _pick_batch_gpu(
         b_valid_t = torch.from_numpy(b_valid).to(device)
         b_mask_t = b_mask_t & b_valid_t.unsqueeze(2)
 
-        # Use hoisted weight slice for the narrow bucket (almost all genomes
-        # present); slice per-bucket only for the rare medium/wide buckets.
         if bid == 0 and np.array_equal(b_present, present):
             b_sub = sub
         else:
@@ -397,7 +376,6 @@ def _pick_batch_gpu(
         scores = policy.logits_stacked(b_sub, b_obs_t, b_acts_t, b_mask_t, kernel=kernel)
         b_picks_sorted = scores.argmax(dim=2).cpu().numpy()[b_valid]
 
-        # Vectorized unsort: scatter picks back to original row order.
         _vectorized_unsort(
             picks, b_picks_sorted, b_order, b_counts, b_present, bucket_indices
         )
@@ -415,18 +393,19 @@ def _vectorized_padded(
 
     Each genome `g` in `present` gets a row filled with sequential indices
     `[start_g, start_g + count_g)` into the sorted array, padded with -1.
-    Vectorized via cumsum + arange + scatter.
+    Fully vectorized: builds a [G_present, n_max] grid of column indices,
+    masks by count, and adds the per-genome start offset in one pass.
     """
     n_present = len(present)
-    padded = np.full((n_present, n_max), -1, dtype=np.int64)
     starts = np.cumsum(counts) - counts
-    # For each column j in [0, n_max), fill the genomes whose count > j.
-    for j in range(n_max):
-        mask = counts[present] > j
-        if not mask.any():
-            break
-        rows = np.flatnonzero(mask)
-        padded[rows, j] = starts[present[rows]] + j
+    # [G_present, n_max] grid: column j has value j
+    cols = np.broadcast_to(np.arange(n_max), (n_present, n_max))
+    # [G_present, 1] count per genome (only for present genomes)
+    cnts = counts[present].reshape(-1, 1)
+    # Valid where column index < count
+    valid_mask = cols < cnts
+    # Fill: start + column index
+    padded = np.where(valid_mask, starts[present].reshape(-1, 1) + cols, -1)
     return padded
 
 

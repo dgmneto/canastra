@@ -231,6 +231,103 @@ Each generation record includes `individual_actions`, `mean_actions_per_game`,
 fields, rather than the dashboard's historical batch-round count alone, to decide whether 200
 generations fit the available window.
 
+## Gradient trainer (REINFORCE)
+
+An alternative to the GA: one network is trained by policy gradient (REINFORCE)
+against a fixed (or periodically frozen) opponent, with the match score
+differential as the reward — the same tabula rasa reward the GA uses (spec §G).
+The GA trainer is untouched; this is an opt-in path.
+
+```bash
+.venv/bin/python -m canastra_train.train_pg --episodes 100 --device cuda --shards 4
+```
+
+### Algorithm
+
+REINFORCE with an EMA baseline. Each gradient update:
+
+1. Play `--games-per-update` games via duplicate deal (each seed in both
+   seatings, so the deal cancels — same layout as `evaluate.evaluate_pair`).
+   The learner samples actions stochastically; the opponent plays argmax from a
+   frozen weights file.
+2. Per-game reward = `learner_team_score - opponent_team_score`, sign-flipped for
+   the seating where the learner is team 1. Terminal reward — every ply in a
+   game's trajectory gets that game's reward.
+3. Loss = `-(log_prob * (reward - baseline)).mean()` summed over all learner
+   plies, plus an optional entropy bonus (`--entropy`). Gradient accumulation
+   splits the batch into mini-batches so the autograd graph fits in GPU memory.
+4. EMA baseline = the running mean of batch rewards; subtracting it lowers
+   variance without biasing the gradient.
+
+### GPU adaptations (16GB 5060 Ti target)
+
+- **bf16 autocast** on by default (`--no-amp` for fp32). Half the activation
+  memory, ~2x throughput. Master weights stay fp32; resume reproduces parameters
+  exactly, but per-episode rewards drift ~1e-3 (documented). Use `--no-amp` for
+  exact bit-identical reproducibility.
+- **`torch.compile`** the learner net (`--no-compile` to disable).
+- **Gradient accumulation**: `--games-per-update 512 --mini-batch 64` runs eight
+  64-game rollouts, backward each, step once.
+- **Sharded rollouts** (`--shards N`): N worker processes, each with its own
+  `Pool` and `CanastraNet` on the GPU, each driving a slice of the games. Workers
+  compute losses + `backward` locally, ship flat grads to the parent. The parent
+  sums, divides by total mini-batches, clips, steps the optimizer. Seeds are
+  partitioned by unique deal (keeping dup-deal pairs together). With `--shards 1`,
+  the sharded path reproduces the single-process gradient exactly (pinned by
+  `test_shards_pg`). 4 shards ≈ 7GB on a 16GB card; 8 shards ≈ 14GB.
+
+### Default architecture
+
+The PG trainer defaults to a bigger net than the GA: trunk `[1024, 512, 256]`,
+head `[256]` (~5M params). The `canastra-weights@1` format supports any tanh MLP
+arch, so the deployment path (`bots/`, `harness/src/eval-nn.ts`) needs no changes.
+
+### Flags
+
+- `--episodes` (required) — number of gradient updates.
+- `--games-per-update` (512) — games per gradient step (via duplicate deal, so
+  `games_per_update / 2` unique deals).
+- `--mini-batch` (64) — games per rollout (the autograd graph is bounded to
+  this many games' worth of plies).
+- `--lr` (1e-3) — Adam learning rate.
+- `--baseline-decay` (0.95) — EMA decay for the reward baseline.
+- `--entropy` (0.0) — entropy bonus coefficient (encourages exploration).
+- `--grad-clip` (0.0) — max grad norm (0 = no clipping).
+- `--cap` (200_000) — actions per game.
+- `--run-seed` (7) — derives every seed stream, so a run is reproducible.
+- `--device` (`cpu`|`cuda`|`mps`) — where the torch forward/backward runs.
+  Default `cpu`; pass `--device cuda` on the 5060 Ti.
+- `--no-amp` — disable bf16 autocast (use fp32 for exact reproducibility).
+- `--no-compile` — disable `torch.compile`.
+- `--shards` (1) — worker processes for parallel rollouts.
+- `--opponent` — path to a `canastra-weights@1` JSON (fixed opponent), or `self`
+  for frozen-self-play (snapshot the learner as the opponent every
+  `--opponent-refresh` updates).
+- `--opponent-refresh` (0) — with `--opponent self`: refresh the frozen opponent
+  every N updates.
+- `--resume` — continue from the latest checkpoint in `--run-dir`.
+- `--no-tui` — print plain lines instead of a dashboard (automatic on non-TTY).
+
+### Success gate
+
+Same as the GA — measured after training with the M2 tools:
+
+```bash
+.venv/bin/python -m canastra_train.train_pg --episodes 100 --device cuda --shards 4
+npx tsx harness/src/eval-nn.ts runs/<run>/champion-final.json random 1000      # from repo root
+npx tsx harness/src/eval-nn.ts runs/<run>/champion-final.json random-plus 1000
+```
+
+### Checkpoints
+
+`model-*.pt` under `--run-dir` store the net state dict, optimizer state, EMA
+baseline, update step, and opponent weights. With fp32 (`--no-amp`), `--resume`
+reproduces parameters bit-identically (pinned by `test_pg`). With bf16, resume
+reproduces parameters and optimizer state exactly, but per-episode rewards drift
+~1e-3 (non-associative reductions). Champion weights export as
+`champion-update*.json` and `champion-final.json` in the `canastra-weights@1`
+format, playable directly through the TS evaluator.
+
 ## Performance note
 
 CUDA is supported by the current training loop. It is not automatically selected because the

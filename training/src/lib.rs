@@ -372,5 +372,18 @@ fn canastra_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Pool>()?;
     module.add("OBS_DIM", OBS_DIM)?;
     module.add("ACT_DIM", ACT_DIM)?;
+
+    /// Limit the number of threads rayon uses for parallel encode/apply.
+    /// Call once per process, before creating a Pool. With N shard workers
+    /// each spawning rayon threads, the default (one per core) oversubscribes
+    /// the CPU; this lets the caller cap it (e.g. 2 threads per shard).
+    #[pyfn(module)]
+    fn set_rayon_threads(n: usize) -> PyResult<()> {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global()
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
     Ok(())
 }

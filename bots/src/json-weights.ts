@@ -28,10 +28,29 @@ export function makeJsonWeightsBot(weights: WeightsJson, id: string): Bot {
       if (encoded.obs.length !== compiled.arch.obs) {
         throw new Error(`${id}: observation width ${encoded.obs.length} != ${compiled.arch.obs}`);
       }
+      // §6 safe mode: a dead-ended turn was restarted. Restrict to draw/discard
+      // so the bot doesn't walk into the same dead end. The legal list is not
+      // filtered by the driver — the bot is expected to self-restrict.
+      const filtered = context.safeMode
+        ? legal.filter((a) =>
+            a.type === "Draw" ||
+            a.type === "KeepDrawnCard" ||
+            a.type === "RefuseDrawnCard" ||
+            a.type === "Discard" ||
+            a.type === "EndTurnWithoutDiscard")
+        : legal;
+      const filteredEncoded = context.safeMode
+        ? encoded.actions.filter((_, i) =>
+            legal[i].type === "Draw" ||
+            legal[i].type === "KeepDrawnCard" ||
+            legal[i].type === "RefuseDrawnCard" ||
+            legal[i].type === "Discard" ||
+            legal[i].type === "EndTurnWithoutDiscard")
+        : encoded.actions;
       const emb = embed(compiled, encoded.obs);
-      const scored = legal.map((action, index) => ({
+      const scored = filtered.map((action, index) => ({
         action,
-        score: scoreAction(compiled, emb, encoded.actions[index]),
+        score: scoreAction(compiled, emb, filteredEncoded[index]),
       }));
       scored.sort((a, b) => b.score - a.score);
       return scored.map((entry) => entry.action);

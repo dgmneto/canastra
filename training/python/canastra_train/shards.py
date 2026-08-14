@@ -174,6 +174,11 @@ def _shard_worker(
         import torch
 
         torch.set_num_threads(1)
+        # Limit rayon's thread count so 6 shard workers × N rayon threads don't
+        # oversubscribe the CPU. With 16 cores and 6 shards, 2 threads each
+        # leaves headroom for the Python glue and GPU dispatch.
+        import canastra_py
+        canastra_py.set_rayon_threads(2)
         stacked = league.build_stacked(roster, arch, device)
         metrics = league.DriveMetrics()
 
