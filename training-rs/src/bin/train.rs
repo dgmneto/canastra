@@ -1,7 +1,7 @@
 use canastra_train::elo::EloTracker;
 use canastra_train::ga::{self, GAConfig, HallOfFame};
 use canastra_train::genome::{self, TRAINING_ARCH};
-use canastra_train::league;
+use canastra_train::league::{self, Rollout};
 use canastra_train::seedstream;
 use candle_core::Device;
 use clap::Parser;
@@ -65,6 +65,10 @@ struct Args {
     /// Device: "cuda" or "cpu".
     #[arg(long, default_value = "cuda")]
     device: String,
+
+    /// Rollout path: "auto", "lockstep", or "coalesced".
+    #[arg(long, default_value = "auto")]
+    rollout: String,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -84,6 +88,11 @@ fn main() -> anyhow::Result<()> {
         "cuda" => Device::new_cuda(0)
             .unwrap_or_else(|e| panic!("CUDA device 0 not available: {e}. Use --device cpu.")),
         _ => Device::Cpu,
+    };
+    let rollout = match args.rollout.as_str() {
+        "lockstep" => Rollout::Lockstep,
+        "coalesced" => Rollout::Coalesced,
+        _ => Rollout::default_for(args.population),
     };
 
     std::fs::create_dir_all(&args.run_dir)?;
@@ -116,6 +125,7 @@ fn main() -> anyhow::Result<()> {
                 max_hands,
                 device: &device,
                 n_workers: args.workers,
+                rollout,
             },
             &mut elo,
         );

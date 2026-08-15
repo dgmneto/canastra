@@ -127,6 +127,41 @@ impl WeightStack {
     }
 }
 
+/// A roster of flat genomes kept on CPU. Used by the coalesced rollout path:
+/// the GPU never holds the full roster — instead, `build_chunk` uploads a
+/// subset to the device as a `WeightStack`. The lockstep path builds its own
+/// `WeightStack` directly via `from_roster`.
+pub struct CpuRoster {
+    pub genomes: Vec<Genome>,
+    pub arch: Arch,
+}
+
+impl CpuRoster {
+    pub fn new(genomes: Vec<Genome>, arch: Arch) -> Self {
+        Self { genomes, arch }
+    }
+
+    pub fn n_genomes(&self) -> usize {
+        self.genomes.len()
+    }
+
+    /// Build a `WeightStack` on `device` for genomes at indices `which`.
+    /// dtype is f32 — the coalesced path used fp32 throughout.
+    pub fn build_chunk(
+        &self,
+        which: &[usize],
+        device: &Device,
+    ) -> candle_core::Result<WeightStack> {
+        let refs: Vec<&Genome> = which.iter().map(|&i| &self.genomes[i]).collect();
+        Ok(WeightStack::from_roster(
+            &refs,
+            &self.arch,
+            device,
+            DType::F32,
+        ))
+    }
+}
+
 /// (name, out, in) for every layer, in genome order.
 fn layer_shapes_owned(arch: &Arch) -> Vec<(String, usize, usize)> {
     let mut result = Vec::new();

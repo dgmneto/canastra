@@ -12,7 +12,7 @@
 use canastra_train::elo::EloTracker;
 use canastra_train::ga::{self, GAConfig, HallOfFame};
 use canastra_train::genome::{self, TRAINING_ARCH};
-use canastra_train::league;
+use canastra_train::league::{self, Rollout};
 use canastra_train::policy::{forward_scores, single_genome_weights};
 use canastra_train::pool::Pool;
 use canastra_train::seedstream;
@@ -446,6 +446,7 @@ fn elo_arithmetic_matches_python() {
             max_hands: Some(1),
             device: &device,
             n_workers: 1,
+            rollout: Rollout::Lockstep,
         },
         &mut elo,
     );
@@ -740,6 +741,7 @@ fn generation_is_self_deterministic_across_thread_counts() {
                     max_hands: Some(1),
                     device: &device,
                     n_workers: n_threads,
+                    rollout: Rollout::Lockstep,
                 },
                 &mut elo,
             );

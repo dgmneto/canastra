@@ -1,7 +1,7 @@
 use canastra_train::elo::EloTracker;
 use canastra_train::ga::{self, GAConfig};
 use canastra_train::genome::TRAINING_ARCH;
-use canastra_train::league;
+use canastra_train::league::{self, Rollout};
 use candle_core::Device;
 use clap::Parser;
 use rand::rngs::StdRng;
@@ -31,6 +31,10 @@ struct Args {
     /// Device: "cuda" or "cpu".
     #[arg(long, default_value = "cuda")]
     device: String,
+
+    /// Rollout path: "auto", "lockstep", or "coalesced".
+    #[arg(long, default_value = "auto")]
+    rollout: String,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -56,11 +60,26 @@ fn main() -> anyhow::Result<()> {
     } else {
         "cpu"
     };
+    let rollout = match args.rollout.as_str() {
+        "lockstep" => Rollout::Lockstep,
+        "coalesced" => Rollout::Coalesced,
+        _ => Rollout::default_for(args.population),
+    };
+    let rollout_label = match rollout {
+        Rollout::Lockstep => "lockstep",
+        Rollout::Coalesced => "coalesced",
+    };
     let mut elo = EloTracker::new(args.population);
 
     eprintln!(
-        "pop={} opponents={} seeds={} games={} workers={} device={}",
-        args.population, args.opponents, args.seeds, games, args.workers, device_label
+        "pop={} opponents={} seeds={} games={} workers={} device={} rollout={}",
+        args.population,
+        args.opponents,
+        args.seeds,
+        games,
+        args.workers,
+        device_label,
+        rollout_label
     );
 
     let began = Instant::now();
@@ -74,15 +93,17 @@ fn main() -> anyhow::Result<()> {
             max_hands: Some(1),
             device: &device,
             n_workers: args.workers,
+            rollout,
         },
         &mut elo,
     );
     let elapsed = began.elapsed().as_secs_f64();
     println!(
-        "pop={} games={} device={}: {:.1}s = {:.0} games/s",
+        "pop={} games={} device={} rollout={}: {:.1}s = {:.0} games/s",
         args.population,
         games,
         device_label,
+        rollout_label,
         elapsed,
         games as f64 / elapsed
     );
