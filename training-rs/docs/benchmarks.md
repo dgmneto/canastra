@@ -4,7 +4,7 @@ Population sweep: `opponents=4 seeds=8 max_hands=1 workers=8`, CUDA build, RTX
 5060 Ti. One generation per run via `canastra-bench`. Wall time and games/s as
 reported by the bench. Re-run after every phase that touches the rollout.
 
-## Baseline (Phase 0) — commit `665555f` (pre-instrumentation)
+## Baseline (Phase 0) — commit `9ae4df6`
 
 The pre-existing architecture: `GpuServer` + 8 worker threads, `forward_picks`
 with per-forward `index_select` weight re-slicing and CPU argmax (device sync per
