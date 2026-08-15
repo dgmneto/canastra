@@ -21,6 +21,14 @@ Three planned components:
    and seeded `rng`, registered in the `BOTS` registry. `training/` is the training harness: a PyO3
    pool over the engine (see Architecture). The encoder is single-sourced in
    `engine/crates/canastra-encode`, which both the wasm bindings and the Python harness bind.
+   **`training-rs/`** is a pure-Rust port of the Python training pipeline — no PyO3, no Python
+   runtime, `candle-core` instead of PyTorch. Validated against the Python reference with 9
+   equivalence tests (genome round-trip, forward pass, single-game replay, ELO arithmetic, elite
+   selection, mutation distribution, self-determinism, GPU-vs-CPU argmax). CUDA builds on RTX 5060
+   Ti (Blackwell sm_120, CUDA 13.3). 7 deterministic-path bugs found and fixed. GPU forward path
+   reworked for population scaling (shared GpuServer, CpuRoster, row-batching). Benchmarks: 6.6x
+   speedup at pop=96, 3.6x at pop=1000 vs CPU. See `training-rs/tests/equivalence.rs` and
+   `training-rs/tests/reference/` for the test harness and reference data.
 3. **Web app** — lets people play Canastra against each other or against a bot. **Built (MVP).**
    `server/` holds the real engine and the one global table; `web/` is two pages: the game client
    at `/` (thin — no wasm, no rules, renders what the server sends) and the engine sandbox at
@@ -142,6 +150,44 @@ cd training && .venv/bin/python -m canastra_train.train --generations N --run-di
 # `maturin develop --release` must be re-run after any change to `training/src/lib.rs`, or pytest and mypy
 # see a stale compiled extension.
 
+Rust training port (`training-rs/`) — pure Rust, no Python. CPU builds and tests run without any
+special env. CUDA builds require MSVC + CUDA env flags (see below). All commands run from
+`training-rs/`.
+
+```bash
+cargo test --test equivalence -- --nocapture
+```
+
+```bash
+cargo build --release && cargo clippy --all-targets -- -D warnings && cargo fmt --check
+```
+
+CUDA build (RTX 5060 Ti / Blackwell sm_120 / CUDA 13.3 — requires `vcvars64.bat` for `cl.exe`):
+
+```bash
+cmd /c '"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1 && set NVCC_PREPEND_FLAGS=-Xcompiler /Zc:preprocessor && set CUDA_COMPUTE_CAP=120 && cargo build --release --features cuda'
+```
+
+Benchmark one generation (GPU or CPU):
+
+```bash
+target\release\canastra-bench.exe --population 96 --device cuda
+target\release\canastra-bench.exe --population 1000 --device cpu
+```
+
+Train (smoke run):
+
+```bash
+target\release\canastra-train.exe --generations 2 --population 8 --opponents 2 --seeds 2 --workers 8 --device cuda
+```
+
+Regenerate Python reference data (requires `training/.venv`):
+
+```bash
+& "training\.venv\Scripts\python.exe" "training-rs\tests\reference\dump_reference.py"
+& "training\.venv\Scripts\python.exe" "training-rs\tests\reference\dump_generation.py"
+```
+
 ## Architecture
 
 `engine/` is a self-contained Cargo workspace. `crates/canastra-engine` is the rules core and has no
@@ -204,6 +250,22 @@ size. On top sit the GA (`ga.py`: elitism, tournaments, Gaussian
 mutation, hall of fame, bit-identical checkpoints), the self-play league (`league.py`: batched
 pairings over duplicate-deal differentials), and the `train.py` CLI that drives one run of
 generations — see [training/README.md](training/README.md).
+
+`training-rs/` is a pure-Rust port of the Python pipeline — no PyO3, no Python runtime,
+`candle-core` (0.11) instead of PyTorch. It reuses `canastra-engine` and `canastra-encode`
+directly. The forward pass has three paths: `forward_scores` (chunked, for `WeightStack`),
+`forward_scores_roster` (lazy per-chunk uploads for `CpuRoster`), and `forward_picks` (row-batched,
+for the shared GpuServer fast path). The GpuServer is one thread, one cached weight stack, shared
+by all workers via `Arc<Mutex<Sender>>` — eliminates the 4x GPU memory duplication of the
+per-worker design. Argmax is done on CPU after downloading scores to guarantee first-max
+tie-breaking (matching numpy) on both CPU and GPU. `CpuRoster` keeps genomes on CPU and builds
+small GPU chunks per forward for populations >2000. Validated against the Python reference with 9
+equivalence tests (`tests/equivalence.rs`): genome round-trip (byte-identical), forward pass
+(argmax 100%, logit diff 1.9e-5), single-game replay (100/100 plies exact), ELO arithmetic
+(max-abs-diff 2.3e-13), elite selection (exact), mutation distribution (KS test), self-determinism
+(0 diff across thread counts), and GPU-vs-CPU argmax (100%). 7 deterministic-path bugs found and
+fixed. Benchmarks (8 workers): pop=96 GPU 257 games/s (6.6x vs CPU), pop=1000 GPU 105 games/s
+(3.6x vs CPU).
 
 **The engine is a pure function.** `apply(&GameState, Seat, &Action) -> Result<GameState, RuleViolation>`
 never mutates its input. This is load-bearing, not stylistic: §6 requires a partnership's opening melds
