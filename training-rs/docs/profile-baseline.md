@@ -87,3 +87,90 @@ cmd /c '"...\vcvars64.bat" ... && set CUDA_COMPUTE_CAP=120 && \
   cargo build --release --features "cuda,profile"'
 target\release\canastra-bench.exe --population 500 --device cuda
 ```
+
+---
+
+# Phase 1 findings (lockstep rewrite) — below the 10x gate, stopped to report
+
+Phase 1 deleted `GpuServer`/channels/workers and replaced them with a single
+`Pool` driving all games in lockstep: one forward per ply, weights read once
+per present genome, GPU argmax (deterministic first-max via an index penalty),
+bf16 on CUDA, fp32 on CPU, genome-chunked to bound activation memory. The
+per-forward `index_select` weight re-slicing and the per-batch CPU-argmax sync
+(the Phase-0 bottleneck) are gone. All correctness tests pass (CPU exact, GPU
+bf16 ≥98% argmax agreement, self-determinism across rayon thread counts).
+
+But the **realised speedup is well below the brief's 10x gate**, and pop=1000
+**regressed** below baseline:
+
+| Pop | Baseline games/s | Phase-1 games/s | Ratio |
+|----:|----------------:|----------------:|------:|
+| 96  | 259              | 253             | 0.98x |
+| 500 | 124              | 198             | 1.60x |
+| 1000| 105              | >1500s (timeout)| <0.07x (regression) |
+
+Scaling did **not** flatten (253 → 198 → timeout); the primary acceptance
+criterion (`games/s at pop=1000 ≥ games/s at pop=96`) is **not met**.
+
+## Why — three things the brief's diagnosis did not account for
+
+1. **candle's batched matmul is inefficient for the grouped small-M shapes.**
+   The lockstep grouped bmm is `[G, n_max, obs] × [G, obs, hidden]` with
+   batch=G, **M=n_max=64** (games per genome). cuBLAS with M=64 is severely
+   underutilised: the forward runs at ~350 GFLOP/s ≈ **1.5% of fp32 peak**
+   (measured via the argmax sync absorbing async matmul time; the async matmul
+   spans report ~0.5s but the real execution fills ~117s of the argmax wait at
+   pop=500/2GB-chunks). bf16 is faster than fp32 but both are slow — this is a
+   candle-backend small-M issue, not a precision issue. The trunk.0 input
+   layer (2002×512, 85% of params, M=64) is the worst offender.
+
+2. **The `acts` tensor dominates data movement and the PCIe link is slow.**
+   `acts` is `[N, width, ACT_DIM]` = `[64K, 200, 101]` f32 = **5.2 GB/ply at
+   pop=1000**, uploaded every ply. Measured host→device throughput is ~3.7 GB/s
+   (likely a limited PCIe link on this laptop GPU — RTX 5060 Ti mobile often
+   runs x4). That is a **311 s floor at pop=1000** before any compute. bf16
+   upload would halve the bandwidth, but the CPU-side cast path in candle
+   (`from_vec(f32, Cpu).to_dtype(BF16).to_device`) adds copies that made it
+   *slower* (146 s vs 88 s at pop=500) — a fused/async bf16 upload is needed.
+
+3. **The lockstep sacrifices encode/apply overlap.** The old coalesced design
+   had 8 workers with separate game sets: while the GPU forwarded one worker's
+   batch, the others encoded/applied in parallel — encode+apply hid behind the
+   449 s GPU bottleneck. The single-Pool lockstep is strictly sequential per ply
+   (encode→upload→forward→apply), so encode (30 s) + apply (13 s) at pop=1000
+   land on the critical path with no overlap. The old design was GPU-bound; the
+   new one is H2D+encode-bound, and at pop=1000 the H2D floor alone (311 s)
+   approaches the old total (608 s).
+
+## What would actually unlock the speedup
+
+- **Embedding-bag input layer (Phase 1d) — now load-bearing, not optional.**
+  The obs is 100% binary (verified: one-hot/thermometer/census, no continuous
+  features). Replacing the trunk.0 dense `[G, 64, 2002]×[G, 2002, 512]` (M=64,
+  the inefficient matmul) with a sparse gather+sum over active features makes it
+  a big-M=N op and removes the dominant inefficient matmul. This is the single
+  highest-leverage change, but needs a fused gather+segment-sum candle doesn't
+  cleanly expose (a `[N, active, hidden]` materialisation is too large).
+- **Reduce `acts` volume:** upload bf16 via a fused path, and/or stop padding to
+  the global max width (encode in genome-grouped grid layout so the gather is a
+  no-op reshape). The 5.2 GB/ply at pop=1000 is the floor.
+- **Overlap H2D / encode with GPU** via CUDA streams (candle's sync `from_vec`
+  blocks; needs stream-aware upload or a double-buffered pipeline).
+
+## Recommendation
+
+The lockstep architecture is correct and the per-forward overhead is genuinely
+eliminated (GPU forward dropped 3.6x at pop=500: 186 s → 52 s). But without 1d
+(embedding-bag), fused bf16 H2D, and stream overlap, the lockstep **regresses
+pop=1000** because it trades a GPU-bound pipeline for an H2D+encode-bound one on
+hardware with a slow PCIe link. Three options:
+
+1. **Implement 1d + fused bf16 H2D + stream overlap** before committing Phase 1
+   (deeper candle work; targets the real bottlenecks).
+2. **Keep the old coalesced design** and only port the GPU argmax + bf16 +
+   smaller chunks (incremental, lower risk, ~1.5-2x, no regression).
+3. **Accept Phase 1 as-is for pop ≤ 500** (1.6x) and move to Phases 2–3
+   (variance/anchoring), returning to throughput later.
+
+Awaiting direction.
+

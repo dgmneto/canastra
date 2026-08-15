@@ -9,10 +9,11 @@
 //! - `seedstream` — deterministic seed streams (SplitMix64, same as Python)
 //! - `elo` — ELO rating tracker
 //! - `genome` — flat genome ↔ weights JSON, arch definitions
-//! - `policy` — batched forward pass via candle (WeightStack, CpuRoster, forward_picks)
+//! - `policy` — lockstep grouped-matmul forward via candle (WeightStack,
+//!   forward_picks/forward_scores; bf16 on CUDA, fp32 on CPU; GPU argmax)
 //! - `ga` — GA core (elitism, tournaments, mutation, HOF, checkpoints)
 //! - `pool` — batched game stepping (owns N engines, encode/apply per ply)
-//! - `league` — self-play pairings, shared GpuServer, drive loop
+//! - `league` — self-play pairings and the lockstep ply driver
 //! - `evaluate` — duplicate-deal paired evaluation
 //! - `bin/train` — CLI driver
 //! - `bin/bench` — benchmark one generation

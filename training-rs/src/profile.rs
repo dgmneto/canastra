@@ -20,6 +20,14 @@ pub static WKR_APPLY_NS: AtomicU64 = AtomicU64::new(0); // pool.apply()
 pub static WKR_FWD_NS: AtomicU64 = AtomicU64::new(0); // gpu.forward() wall (mutex+channel+gpu)
 pub static WKR_PLIES: AtomicU64 = AtomicU64::new(0); // ply iterations
 
+// Forward-stage breakdown (within SRV_GPU_NS). Coarse per-chunk spans.
+pub static FWD_GATHER_NS: AtomicU64 = AtomicU64::new(0);
+pub static FWD_TRUNK_NS: AtomicU64 = AtomicU64::new(0);
+pub static FWD_HEAD_NS: AtomicU64 = AtomicU64::new(0);
+pub static FWD_MASK_NS: AtomicU64 = AtomicU64::new(0);
+pub static FWD_ARGMAX_NS: AtomicU64 = AtomicU64::new(0);
+pub static FWD_CHUNKS: AtomicU64 = AtomicU64::new(0);
+
 pub static GEN_WALL_NS: AtomicU64 = AtomicU64::new(0); // whole-generation wall
 
 pub fn reset() {
@@ -32,6 +40,12 @@ pub fn reset() {
     WKR_APPLY_NS.store(0, Ordering::Relaxed);
     WKR_FWD_NS.store(0, Ordering::Relaxed);
     WKR_PLIES.store(0, Ordering::Relaxed);
+    FWD_GATHER_NS.store(0, Ordering::Relaxed);
+    FWD_TRUNK_NS.store(0, Ordering::Relaxed);
+    FWD_HEAD_NS.store(0, Ordering::Relaxed);
+    FWD_MASK_NS.store(0, Ordering::Relaxed);
+    FWD_ARGMAX_NS.store(0, Ordering::Relaxed);
+    FWD_CHUNKS.store(0, Ordering::Relaxed);
     GEN_WALL_NS.store(0, Ordering::Relaxed);
 }
 
@@ -127,5 +141,19 @@ pub fn report(games: usize) {
         sec(wkr_fwd),
         pct(wkr_fwd)
     );
+    let fg = FWD_GATHER_NS.load(Ordering::Relaxed);
+    let ft = FWD_TRUNK_NS.load(Ordering::Relaxed);
+    let fh = FWD_HEAD_NS.load(Ordering::Relaxed);
+    let fm = FWD_MASK_NS.load(Ordering::Relaxed);
+    let fa = FWD_ARGMAX_NS.load(Ordering::Relaxed);
+    let fc = FWD_CHUNKS.load(Ordering::Relaxed);
+    if fc > 0 {
+        eprintln!("│ ── forward stages (within GPU, {} chunks) ──", fc);
+        eprintln!("│   gather      {:>10.3}s  {:>5.1}%", sec(fg), pct(fg));
+        eprintln!("│   trunk       {:>10.3}s  {:>5.1}%", sec(ft), pct(ft));
+        eprintln!("│   head        {:>10.3}s  {:>5.1}%", sec(fh), pct(fh));
+        eprintln!("│   mask        {:>10.3}s  {:>5.1}%", sec(fm), pct(fm));
+        eprintln!("│   argmax      {:>10.3}s  {:>5.1}%", sec(fa), pct(fa));
+    }
     eprintln!("└──────────────────────────────────────────────────────────────");
 }
