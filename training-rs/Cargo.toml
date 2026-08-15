@@ -47,3 +47,7 @@ anyhow = "1"
 
 [features]
 cuda = ["candle-core/cuda"]
+# Coarse per-generation timing breakdown (Phase 0 profiling). Throwaway —
+# Phase 1 rewrites the rollout and drops this. Adds a small cost via Instant
+# spans and atomic counters; do not enable for production runs.
+profile = []

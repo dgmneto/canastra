@@ -26,4 +26,7 @@ pub mod policy;
 pub mod pool;
 pub mod seedstream;
 
+#[cfg(feature = "profile")]
+pub mod profile;
+
 pub use genome::Arch;

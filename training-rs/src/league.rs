@@ -13,6 +13,9 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+#[cfg(feature = "profile")]
+use crate::profile;
+
 type Pairing = (usize, usize);
 type GameMeta = (usize, usize, usize);
 
@@ -106,13 +109,31 @@ impl GpuServer {
                 None
             };
 
-            while let Ok(req) = rx.recv() {
+            loop {
+                #[cfg(feature = "profile")]
+                let _idle = profile::Span::new(&profile::SRV_IDLE_NS);
+                let req = match rx.recv() {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                #[cfg(feature = "profile")]
+                drop(_idle);
+
                 let n_rows = req.obs.len() / obs_dim;
                 if n_rows == 0 {
                     let _ = req.response_tx.send(Vec::new());
                     continue;
                 }
 
+                #[cfg(feature = "profile")]
+                {
+                    profile::SRV_REQS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    profile::SRV_ROWS
+                        .fetch_add(n_rows as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                #[cfg(feature = "profile")]
+                let _h2d = profile::Span::new(&profile::SRV_H2D_NS);
                 let obs = Tensor::from_vec(req.obs, (n_rows, obs_dim), &device)
                     .unwrap_or_else(|e| panic!("obs tensor: {e}"));
                 let acts = Tensor::from_vec(req.acts, (n_rows, req.width, act_dim), &device)
@@ -126,13 +147,19 @@ impl GpuServer {
                     &device,
                 )
                 .unwrap_or_else(|e| panic!("mask tensor: {e}"));
+                #[cfg(feature = "profile")]
+                drop(_h2d);
 
+                #[cfg(feature = "profile")]
+                let _gpu = profile::Span::new(&profile::SRV_GPU_NS);
                 let picks = if let Some(ref stack) = cached_stack {
                     forward_picks(stack, &obs, &acts, &mask, &req.genome_idx)
                 } else {
                     forward_scores_roster(&roster, &obs, &acts, &mask, &req.genome_idx, &device)
                         .picks
                 };
+                #[cfg(feature = "profile")]
+                drop(_gpu);
                 let _ = req.response_tx.send(picks);
             }
         });
@@ -189,7 +216,15 @@ pub fn drive_worker(
     let mut pool = Pool::new(game_seeds, None, max_hands);
 
     while pool.has_live() {
+        #[cfg(feature = "profile")]
+        profile::WKR_PLIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        #[cfg(feature = "profile")]
+        let _enc = profile::Span::new(&profile::WKR_ENCODE_NS);
         let encoded = pool.encode();
+        #[cfg(feature = "profile")]
+        drop(_enc);
+
         let genome_idx: Vec<usize> = encoded
             .rows
             .iter()
@@ -202,8 +237,17 @@ pub fn drive_worker(
                 }
             })
             .collect();
+        #[cfg(feature = "profile")]
+        let _fwd = profile::Span::new(&profile::WKR_FWD_NS);
         let picks = gpu.forward(encoded, genome_idx);
+        #[cfg(feature = "profile")]
+        drop(_fwd);
+
+        #[cfg(feature = "profile")]
+        let _app = profile::Span::new(&profile::WKR_APPLY_NS);
         let _ = pool.apply(&picks);
+        #[cfg(feature = "profile")]
+        drop(_app);
     }
 
     pool.results()
@@ -275,6 +319,10 @@ pub struct EvalInputs<'a> {
 
 /// Evaluate one generation: play all pairings, compute ELO updates.
 pub fn evaluate_generation(inputs: &EvalInputs<'_>, elo: &mut EloTracker) {
+    #[cfg(feature = "profile")]
+    {
+        profile::reset();
+    }
     let EvalInputs {
         pop,
         hof,
@@ -286,6 +334,9 @@ pub fn evaluate_generation(inputs: &EvalInputs<'_>, elo: &mut EloTracker) {
         n_workers,
     } = *inputs;
     let (roster, game_seeds, meta) = batch_layout(pop, hof, pairings, seeds);
+
+    #[cfg(feature = "profile")]
+    let _gen_wall = profile::Span::new(&profile::GEN_WALL_NS);
 
     // Build a CPU roster — genomes stay on CPU, GPU only holds small chunks
     // per forward pass. This bounds GPU memory to ~300 MB regardless of
@@ -302,6 +353,13 @@ pub fn evaluate_generation(inputs: &EvalInputs<'_>, elo: &mut EloTracker) {
         arch.obs,
         arch.act,
     );
+
+    #[cfg(feature = "profile")]
+    {
+        drop(_gen_wall);
+        let games = results.len();
+        profile::report(games);
+    }
 
     // Compute ELO updates.
     let per_game = 2 * seeds.len();
