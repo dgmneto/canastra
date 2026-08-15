@@ -38,12 +38,30 @@ impl EloTracker {
         }
     }
 
-    pub fn grow(&mut self, n_new: usize) {
-        self.ratings
-            .extend(std::iter::repeat(self.base).take(n_new));
+    pub fn grow(&mut self, n_new: usize, parent_indices: Option<&[usize]>) {
+        match parent_indices {
+            Some(parents) => {
+                let inherited: Vec<f64> = parents
+                    .iter()
+                    .map(|&p| {
+                        if p < self.ratings.len() {
+                            self.ratings[p]
+                        } else {
+                            self.base
+                        }
+                    })
+                    .collect();
+                self.ratings.extend(inherited);
+            }
+            None => self.ratings.extend(std::iter::repeat_n(self.base, n_new)),
+        }
     }
 
     pub fn len(&self) -> usize {
         self.ratings.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ratings.is_empty()
     }
 }

@@ -3,37 +3,86 @@ use canastra_train::ga::{self, GAConfig};
 use canastra_train::genome::TRAINING_ARCH;
 use canastra_train::league;
 use candle_core::Device;
+use clap::Parser;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use std::time::Instant;
 
+#[derive(Parser)]
+#[command(name = "canastra-bench")]
+#[command(about = "Benchmark one GA generation")]
+struct Args {
+    /// Population size.
+    #[arg(long, default_value = "96")]
+    population: usize,
+
+    /// Opponents per genome.
+    #[arg(long, default_value = "4")]
+    opponents: usize,
+
+    /// Seeds per opponent pairing.
+    #[arg(long, default_value = "8")]
+    seeds: usize,
+
+    /// Worker threads.
+    #[arg(long, default_value = "8")]
+    workers: usize,
+
+    /// Device: "cuda" or "cpu".
+    #[arg(long, default_value = "cuda")]
+    device: String,
+}
+
 fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
     let arch = &TRAINING_ARCH;
-    let pop = ga::initial_population(arch, &GAConfig::default(), 7);
+    let cfg = GAConfig {
+        population: args.population,
+        ..Default::default()
+    };
+    let pop = ga::initial_population(arch, &cfg, 7);
     let hof = ga::HallOfFame::new();
     let mut rng = StdRng::seed_from_u64(7);
-    let pairings = league::schedule_pairings(96, 4, &hof, &mut rng);
-    let seeds: Vec<u64> = (11..19).map(|i| i as u64).collect();
+    let pairings = league::schedule_pairings(args.population, args.opponents, &hof, &mut rng);
+    let seeds: Vec<u64> = (11..11 + args.seeds).map(|i| i as u64).collect();
+    let games = pairings.len() * 2 * seeds.len();
 
-    let device = Device::new_cuda(0).unwrap_or(Device::Cpu);
-    let mut elo = EloTracker::new(96);
+    let device = match args.device.as_str() {
+        "cuda" => Device::new_cuda(0).unwrap_or(Device::Cpu),
+        _ => Device::Cpu,
+    };
+    let device_label = if matches!(device, Device::Cuda(_)) {
+        "cuda"
+    } else {
+        "cpu"
+    };
+    let mut elo = EloTracker::new(args.population);
+
+    eprintln!(
+        "pop={} opponents={} seeds={} games={} workers={} device={}",
+        args.population, args.opponents, args.seeds, games, args.workers, device_label
+    );
 
     let began = Instant::now();
     league::evaluate_generation(
-        &pop,
-        &hof,
-        &pairings,
-        arch,
-        &seeds,
-        Some(1),
-        &device,
+        &league::EvalInputs {
+            pop: &pop,
+            hof: &hof,
+            pairings: &pairings,
+            arch,
+            seeds: &seeds,
+            max_hands: Some(1),
+            device: &device,
+            n_workers: args.workers,
+        },
         &mut elo,
-        4,
     );
     let elapsed = began.elapsed().as_secs_f64();
-    let games = pairings.len() * 2 * seeds.len();
     println!(
-        "1 generation in {:.1}s = {:.0} games/s",
+        "pop={} games={} device={}: {:.1}s = {:.0} games/s",
+        args.population,
+        games,
+        device_label,
         elapsed,
         games as f64 / elapsed
     );

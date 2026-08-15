@@ -63,15 +63,6 @@ impl Game {
             .collect()
     }
 
-    fn apply_selected(
-        &mut self,
-        action: &Action,
-        max_actions_per_game: Option<u64>,
-    ) -> Result<(), RuleViolation> {
-        let next_state = apply(&self.state, self.state.turn, action);
-        self.commit_selected(action, next_state, max_actions_per_game)
-    }
-
     fn commit_selected(
         &mut self,
         action: &Action,
@@ -139,7 +130,6 @@ pub struct Pool {
     pending: Vec<usize>,
     menus: Vec<Vec<Action>>,
     max_actions_per_game: Option<u64>,
-    max_hands: Option<u32>,
 }
 
 impl Pool {
@@ -149,7 +139,6 @@ impl Pool {
             pending: Vec::new(),
             menus: Vec::new(),
             max_actions_per_game,
-            max_hands,
         }
     }
 
@@ -200,7 +189,6 @@ impl Pool {
         let mut obs = vec![0.0f32; n_rows * OBS_DIM];
         let mut acts = vec![0.0f32; n_rows * width * ACT_DIM];
         let mut mask = vec![false; n_rows * width];
-        let mut rows = Vec::with_capacity(n_rows);
 
         // Encode in parallel (no GIL!).
         let pending = self.pending.clone();
@@ -239,7 +227,7 @@ impl Pool {
             .collect();
 
         self.menus = menus;
-        rows = row_data;
+        let rows = row_data;
 
         EncodedPly {
             obs,
@@ -268,7 +256,6 @@ impl Pool {
         }
 
         // Parallel apply (no GIL!).
-        let games: &[Game] = &self.games;
         let selected_ref = &selected;
         let mut applied: Vec<(usize, Result<GameState, RuleViolation>)> = self
             .games

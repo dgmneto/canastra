@@ -1,6 +1,6 @@
 use canastra_train::elo::EloTracker;
 use canastra_train::ga::{self, GAConfig, HallOfFame};
-use canastra_train::genome::{self, Arch, TRAINING_ARCH};
+use canastra_train::genome::{self, TRAINING_ARCH};
 use canastra_train::league;
 use canastra_train::seedstream;
 use candle_core::Device;
@@ -59,7 +59,7 @@ struct Args {
     hof_interval: u32,
 
     /// Worker threads (coalesced GPU server count).
-    #[arg(long, default_value = "4")]
+    #[arg(long, default_value = "8")]
     workers: usize,
 
     /// Device: "cuda" or "cpu".
@@ -107,15 +107,17 @@ fn main() -> anyhow::Result<()> {
             None
         };
         league::evaluate_generation(
-            &pop,
-            &hof,
-            &pairings,
-            arch,
-            &gen_seeds,
-            max_hands,
-            &device,
+            &league::EvalInputs {
+                pop: &pop,
+                hof: &hof,
+                pairings: &pairings,
+                arch,
+                seeds: &gen_seeds,
+                max_hands,
+                device: &device,
+                n_workers: args.workers,
+            },
             &mut elo,
-            args.workers,
         );
 
         let champion = elo.ratings[..args.population]
@@ -155,8 +157,8 @@ fn main() -> anyhow::Result<()> {
         // HOF.
         if generation % cfg.hof_interval == 0 {
             hof.archive(&pop[champion], elo_best, generation);
-            elo.grow(1);
-            elo.ratings.push(elo_best);
+            elo.grow(1, None);
+            *elo.ratings.last_mut().unwrap() = elo_best;
         }
 
         // Evolve.

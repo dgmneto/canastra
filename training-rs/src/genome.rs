@@ -3,9 +3,7 @@
 //! Mirrors `training/python/canastra_train/genome.py` exactly: the same
 //! `canastra-weights@1` format, the same layer ordering, the same random init.
 
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::collections::HashMap;
+use serde_json::Map;
 
 pub const FORMAT: &str = "canastra-weights@1";
 
@@ -28,19 +26,19 @@ pub struct Arch {
 }
 
 /// (name, out, in) for every layer, in genome order.
-pub fn layer_shapes(arch: &Arch) -> Vec<(&'static str, usize, usize)> {
-    let mut result: Vec<(&'static str, usize, usize)> = Vec::new();
+pub fn layer_shapes(arch: &Arch) -> Vec<(String, usize, usize)> {
+    let mut result: Vec<(String, usize, usize)> = Vec::new();
     let mut prev = arch.obs;
     for (i, &width) in arch.trunk.iter().enumerate() {
-        result.push(("trunk", width, prev));
+        result.push((format!("trunk.{}", i), width, prev));
         prev = width;
     }
     prev += arch.act;
     for (i, &width) in arch.head.iter().enumerate() {
-        result.push(("head", width, prev));
+        result.push((format!("head.{}", i), width, prev));
         prev = width;
     }
-    result.push(("head.out", 1, prev));
+    result.push(("head.out".to_string(), 1, prev));
     result
 }
 
@@ -77,36 +75,39 @@ pub fn random_genome(arch: &Arch, seed: u64) -> Genome {
     g
 }
 
+/// Round to 6 decimals matching Python's `np.round(f32, 6).tolist()`.
+///
+/// Python: rounds in f64, casts result to f32, then `.tolist()` converts back
+/// to f64 (giving the full f64 representation of the f32). We replicate: round
+/// in f64, cast to f32, cast back to f64. This makes the JSON values
+/// byte-for-byte the same as Python's output.
+pub fn round6_f32(v: f32) -> f64 {
+    let rounded_f64 = (v as f64 * 1e6).round_ties_even() / 1e6;
+    rounded_f64 as f32 as f64
+}
+
+/// Round to 6 decimals using round-half-to-even (banker's rounding), matching
+/// numpy's `np.round(x, 6)` semantics for f64 inputs.
+pub fn round6(v: f64) -> f64 {
+    (v * 1e6).round_ties_even() / 1e6
+}
+
 /// Save genome as `canastra-weights@1` JSON.
 pub fn save_json(path: &str, arch: &Arch, vec: &[f32]) -> anyhow::Result<()> {
     let shapes = layer_shapes(arch);
-    let mut params = HashMap::new();
+    let mut params = Map::new();
     let mut offset = 0usize;
 
-    // Build named layers.
-    let mut named: Vec<(String, usize, usize)> = Vec::new();
-    let mut prev = arch.obs;
-    for (i, &width) in arch.trunk.iter().enumerate() {
-        named.push((format!("trunk.{}", i), width, prev));
-        prev = width;
-    }
-    prev += arch.act;
-    for (i, &width) in arch.head.iter().enumerate() {
-        named.push((format!("head.{}", i), width, prev));
-        prev = width;
-    }
-    named.push(("head.out".to_string(), 1, prev));
-
-    for (name, out, inn) in &named {
+    for (name, out, inn) in &shapes {
         let w_size = out * inn;
         let w_data: Vec<f64> = vec[offset..offset + w_size]
             .iter()
-            .map(|&v| ((v as f64) * 1e6).round() / 1e6)
+            .map(|&v| round6_f32(v))
             .collect();
         offset += w_size;
         let b_data: Vec<f64> = vec[offset..offset + out]
             .iter()
-            .map(|&v| ((v as f64) * 1e6).round() / 1e6)
+            .map(|&v| round6_f32(v))
             .collect();
         offset += out;
         params.insert(
@@ -131,6 +132,78 @@ pub fn save_json(path: &str, arch: &Arch, vec: &[f32]) -> anyhow::Result<()> {
         "params": params,
     });
 
-    std::fs::write(path, serde_json::to_string_pretty(&payload)?)?;
+    // Match Python's `json.dump` formatting: compact with `, ` and `: ` separators.
+    // serde_json::to_string gives `,` and `:` (no spaces). The string values in
+    // the payload (format, activation, param keys) contain no `,` or `:`, so a
+    // global replace is safe.
+    let compact = serde_json::to_string(&payload)?;
+    let python_formatted = compact.replace(',', ", ").replace(':', ": ");
+    std::fs::write(path, python_formatted)?;
     Ok(())
+}
+
+/// Load a `canastra-weights@1` JSON file into a flat genome.
+///
+/// Mirrors Python `genome.load_json`: validates format/activation, checks
+/// every shape and length, and fills the flat vector in genome (layer) order.
+pub fn load_json(path: &str) -> anyhow::Result<(Arch, Genome)> {
+    let payload: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+    if payload.get("format").and_then(|v| v.as_str()) != Some(FORMAT) {
+        anyhow::bail!("unsupported weights format: {:?}", payload.get("format"));
+    }
+    let arch = payload
+        .get("arch")
+        .ok_or_else(|| anyhow::anyhow!("missing arch"))?;
+    if arch.get("activation").and_then(|v| v.as_str()) != Some("tanh") {
+        anyhow::bail!("only tanh weights are supported");
+    }
+    let trunk: Vec<usize> = serde_json::from_value(arch.get("trunk").cloned().unwrap())?;
+    let head: Vec<usize> = serde_json::from_value(arch.get("head").cloned().unwrap())?;
+    let obs = arch.get("obs").and_then(|v| v.as_u64()).unwrap() as usize;
+    let act = arch.get("act").and_then(|v| v.as_u64()).unwrap() as usize;
+    // `Arch` holds static slices; clone the parsed vecs into leaked boxes so the
+    // returned `Arch` owns them. Callers use the const `TRAINING_ARCH` in
+    // practice; this path exists for arbitrary files (validation/evaluation).
+    let trunk_box = trunk.leak();
+    let head_box = head.leak();
+    let arch = Arch {
+        obs,
+        act,
+        trunk: trunk_box,
+        head: head_box,
+    };
+
+    let size = genome_size(&arch);
+    let mut vec = Genome::with_capacity(size);
+    let mut offset = 0usize;
+    for (name, out, inn) in &layer_shapes(&arch) {
+        for (key, size_len) in [
+            (format!("{}.weight", name), out * inn),
+            (format!("{}.bias", name), *out),
+        ] {
+            let entry = payload["params"]
+                .get(&key)
+                .ok_or_else(|| anyhow::anyhow!("missing key: {}", key))?;
+            let want_shape = if key.ends_with(".weight") {
+                vec![*out as i64, *inn as i64]
+            } else {
+                vec![*out as i64]
+            };
+            let got_shape: Vec<i64> = serde_json::from_value(entry.get("shape").cloned().unwrap())?;
+            if got_shape != want_shape {
+                anyhow::bail!("{}: shape {:?} does not match the arch", key, got_shape);
+            }
+            let data: Vec<f32> = serde_json::from_value(entry.get("data").cloned().unwrap())?;
+            if data.len() != size_len {
+                anyhow::bail!("{}: {} values, expected {}", key, data.len(), size_len);
+            }
+            vec.extend_from_slice(&data);
+            offset += size_len;
+        }
+    }
+    assert_eq!(
+        offset, size,
+        "load_json consumed {offset} but genome_size is {size}"
+    );
+    Ok((arch, vec))
 }

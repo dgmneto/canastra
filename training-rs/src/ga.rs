@@ -100,13 +100,13 @@ pub fn next_generation(
         let parent = tournament(elo_ratings, cfg.tournament, rng);
         let mut child = pop[parent].clone();
         // Gaussian mutation
-        for i in 0..child.len() {
+        for gene in child.iter_mut() {
             let u1 = (rng.gen::<u32>() as f64 / u32::MAX as f64).max(1e-10);
             let u2 = rng.gen::<u32>() as f64 / u32::MAX as f64;
             let r = (-2.0 * u1.ln()).sqrt();
             let theta = 2.0 * std::f64::consts::PI * u2;
             let noise = r * theta.cos() * sigma;
-            child[i] += noise as f32;
+            *gene += noise as f32;
         }
         next_elo.push(elo_ratings[parent]);
         next_pop.push(child);
@@ -119,6 +119,12 @@ pub struct HallOfFame {
     pub genomes: Vec<Genome>,
     pub elo_ratings: Vec<f64>,
     pub generations: Vec<u32>,
+}
+
+impl Default for HallOfFame {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HallOfFame {
@@ -138,6 +144,10 @@ impl HallOfFame {
 
     pub fn len(&self) -> usize {
         self.genomes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.genomes.is_empty()
     }
 
     pub fn sample(&self, rng: &mut StdRng) -> &Genome {
@@ -219,9 +229,10 @@ pub fn save_checkpoint(
     Ok(())
 }
 
-pub fn load_checkpoint(
-    dir: &Path,
-) -> anyhow::Result<(u32, Vec<Genome>, Vec<f64>, Vec<u64>, HallOfFame)> {
+/// Loaded checkpoint: (generation, population, elo ratings, seeds, hall of fame).
+pub type Checkpoint = (u32, Vec<Genome>, Vec<f64>, Vec<u64>, HallOfFame);
+
+pub fn load_checkpoint(dir: &Path) -> anyhow::Result<Checkpoint> {
     let mut checkpoints: Vec<_> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok())
         .filter(|e| e.file_name().to_string_lossy().starts_with("gen-"))
