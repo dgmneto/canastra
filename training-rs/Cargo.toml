@@ -26,6 +26,10 @@ required-features = ["cuda"]
 name = "canastra-sparsity"
 path = "src/bin/sparsity.rs"
 
+[[bin]]
+name = "canastra-ksweep"
+path = "src/bin/ksweep.rs"
+
 [workspace]
 
 [dependencies]
