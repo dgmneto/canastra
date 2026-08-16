@@ -20,6 +20,7 @@
 
 pub mod anchors;
 pub mod elo;
+pub mod es;
 pub mod evaluate;
 pub mod ga;
 pub mod genome;

@@ -1,5 +1,6 @@
 use canastra_train::anchors::AnchorSet;
 use canastra_train::elo::EloTracker;
+use canastra_train::es::{self, ESConfig, ESState};
 use canastra_train::ga::{self, GAConfig, HallOfFame};
 use canastra_train::genome::{self, TRAINING_ARCH};
 use canastra_train::league::{self, Rollout};
@@ -112,6 +113,22 @@ struct Args {
     /// Add the champion as a new anchor every N generations (frozen champions).
     #[arg(long, default_value = "50")]
     anchor_freeze_interval: u32,
+
+    /// Optimiser: "ga" (genetic algorithm) or "es" (evolution strategies).
+    #[arg(long, default_value = "ga")]
+    optimiser: String,
+
+    /// ES: number of perturbation pairs (population = 2 × this). Ignored for GA.
+    #[arg(long, default_value = "48")]
+    n_perturbations: usize,
+
+    /// ES: Adam learning rate. Ignored for GA.
+    #[arg(long, default_value = "0.01")]
+    lr: f64,
+
+    /// ES: weight decay (L2). Ignored for GA.
+    #[arg(long, default_value = "0.0")]
+    weight_decay: f64,
 }
 
 /// Write one JSON record per generation to `<run_dir>/generations.jsonl`.
@@ -169,6 +186,11 @@ fn main() -> anyhow::Result<()> {
     };
 
     std::fs::create_dir_all(&args.run_dir)?;
+
+    // Branch: ES vs GA.
+    if args.optimiser == "es" {
+        return run_es(args, arch, device, rollout);
+    }
 
     // Resume or fresh start.
     let (start_gen, mut pop, mut hof, mut elo, mut best_ever) = if let Some(ref resume_dir) =
@@ -367,6 +389,198 @@ fn main() -> anyhow::Result<()> {
     let path = args.run_dir.join("champion-final.json");
     let _ = genome::save_json(path.to_str().unwrap(), arch, &pop[final_champ]);
 
+    println!("done: {}", args.run_dir.display());
+    Ok(())
+}
+
+/// ES training loop. Mirrors the GA loop but uses seed-based perturbations
+/// instead of independent genomes, and Adam instead of tournament selection.
+fn run_es(
+    args: Args,
+    arch: &'static crate::genome::Arch,
+    device: Device,
+    rollout: Rollout,
+) -> anyhow::Result<()> {
+    let es_cfg = ESConfig {
+        n_perturbations: args.n_perturbations,
+        sigma: args.sigma,
+        sigma_decay: args.sigma_decay,
+        sigma_floor: args.sigma_floor,
+        lr: args.lr,
+        beta1: 0.9,
+        beta2: 0.999,
+        weight_decay: args.weight_decay,
+        eps: 1e-8,
+        hof_interval: args.hof_interval,
+    };
+    let pop_size = es_cfg.n_perturbations * 2;
+
+    let max_width = if args.max_width == 0 {
+        usize::MAX
+    } else {
+        args.max_width
+    };
+    let max_hands = if args.max_hands > 0 {
+        Some(args.max_hands)
+    } else {
+        None
+    };
+
+    // Resume or fresh start.
+    let (start_gen, mut es_state, mut hof, mut best_ever) =
+        if let Some(ref resume_dir) = args.resume {
+            let (gen, state, _elo, _seeds, loaded_hof) = es::load_es_checkpoint(resume_dir)?;
+            let next_gen = gen + 1;
+            eprintln!("ES: resumed from gen {gen}, continuing at gen {next_gen}");
+            (next_gen, state, loaded_hof, f64::NEG_INFINITY)
+        } else {
+            let base = crate::genome::random_genome(arch, args.run_seed);
+            let state = ESState::new(base, &es_cfg, args.run_seed);
+            (0u32, state, HallOfFame::new(), f64::NEG_INFINITY)
+        };
+
+    let mut anchors = AnchorSet::new(arch);
+    let anchor_seeds: Vec<u64> = (1000..1000 + args.anchor_seeds as u64).collect();
+
+    for generation in start_gen..(start_gen + args.generations) {
+        let began = Instant::now();
+        es_state.sigma_for_generation(&es_cfg, generation);
+
+        // Materialise population: 2 × n_perturbations genomes (mirrored pairs).
+        let pop = es_state.materialise_population(arch);
+
+        // Self-play evaluation (same league as GA).
+        let mut gen_rng =
+            StdRng::seed_from_u64(seedstream::splitmix64(args.run_seed + generation as u64));
+        let gen_seeds = seedstream::generation_seeds(args.run_seed, generation, args.seeds);
+        let pairings = league::schedule_pairings(pop_size, args.opponents, &hof, &mut gen_rng);
+        let mut elo = EloTracker::new(pop_size);
+
+        league::evaluate_generation(
+            &league::EvalInputs {
+                pop: &pop,
+                hof: &hof,
+                pairings: &pairings,
+                arch,
+                seeds: &gen_seeds,
+                max_hands,
+                device: &device,
+                n_workers: args.workers,
+                rollout,
+                max_width,
+            },
+            &mut elo,
+        );
+
+        // Extract fitness from ELO ratings.
+        let fitness: Vec<f64> = elo.ratings[..pop_size].to_vec();
+
+        // Find champion (highest ELO).
+        let champion = fitness
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let elo_best = fitness[champion];
+        let elo_mean = fitness.iter().sum::<f64>() / pop_size as f64;
+        let sigma = es_state.sigma;
+
+        let improved = elo_best > best_ever;
+        if improved {
+            best_ever = elo_best;
+        }
+
+        // ES update: rank-normalised fitness → gradient estimate → Adam.
+        es_state.update(&fitness, &es_cfg);
+
+        let wall = began.elapsed().as_secs_f64();
+        println!(
+            "gen {}: best {:.1} mean {:.1} sigma {:.4} ({:.1}s){}",
+            generation,
+            elo_best,
+            elo_mean,
+            sigma,
+            wall,
+            if improved { "  new best-ever" } else { "" }
+        );
+
+        // Log to generations.jsonl.
+        let games = pop_size * args.opponents * args.seeds * 2;
+
+        // Anchored evaluation.
+        let anchor_report = if args.anchor_interval > 0 && generation % args.anchor_interval == 0 {
+            let report = anchors.evaluate(
+                &pop[champion],
+                arch,
+                &anchor_seeds,
+                &device,
+                rollout,
+                max_width,
+                max_hands,
+            );
+            eprintln!("  anchor ELO: {:.1}", report.champion_rating);
+            Some(report.to_json())
+        } else {
+            None
+        };
+
+        // Freeze champion.
+        if args.anchor_freeze_interval > 0
+            && generation > 0
+            && generation % args.anchor_freeze_interval == 0
+        {
+            anchors.add_champion(&pop[champion], elo_best, generation);
+        }
+
+        let record = serde_json::json!({
+            "gen": generation,
+            "wall_s": wall,
+            "games": games,
+            "games_s": games as f64 / wall,
+            "decisions_s": games as f64 * 200.0 / wall,
+            "fitness": fitness_stats(&fitness),
+            "elo_best": elo_best,
+            "elo_mean": elo_mean,
+            "sigma": sigma,
+            "improved": improved,
+            "best_ever": best_ever,
+            "optimiser": "es",
+            "anchor": anchor_report,
+        });
+        log_generation(&args.run_dir, &record);
+
+        // Export champion (the base policy, not a perturbation).
+        if improved || generation % es_cfg.hof_interval == 0 {
+            let path = args
+                .run_dir
+                .join(format!("champion-gen{:05}.json", generation));
+            let _ = genome::save_json(path.to_str().unwrap(), arch, &es_state.base_params);
+        }
+
+        // HOF.
+        if generation % es_cfg.hof_interval == 0 {
+            hof.archive(&es_state.base_params, elo_best, generation);
+        }
+
+        // Checkpoint.
+        if generation % args.checkpoint_interval == 0
+            || generation == start_gen + args.generations - 1
+        {
+            let _ = es::save_es_checkpoint(
+                &args.run_dir,
+                generation,
+                &es_state,
+                &EloTracker::new(0),
+                &hof,
+                &gen_seeds,
+            );
+        }
+    }
+
+    // Final champion = base params.
+    let path = args.run_dir.join("champion-final.json");
+    let _ = genome::save_json(path.to_str().unwrap(), arch, &es_state.base_params);
     println!("done: {}", args.run_dir.display());
     Ok(())
 }

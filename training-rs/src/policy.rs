@@ -750,16 +750,16 @@ mod tests {
 
     #[test]
     fn argmax_first_max_breaks_ties_to_lowest_index() {
-        // Hand-constructed tied logits: the first index must win.
+        // Hand-constructed tied logits: the first (lowest) index must win.
         let device = Device::Cpu;
         // [G=1, k=2, width=4]
         let logits = vec![
-            5.0f32, 5.0, 1.0, 5.0, // row 0: indices 1,3 tie at 5.0 → pick 1
+            5.0f32, 5.0, 1.0, 5.0, // row 0: indices 0,1,3 tie at 5.0 → pick 0
             -1e9, 0.0, -1e9, 0.0, // row 1: indices 1,3 tie at 0.0 → pick 1
         ];
         let scores = Tensor::from_vec(logits, (1, 2, 4), &device).unwrap();
         let (picks, _) = argmax_first_max(&scores, 1, 2, 4, &device);
-        assert_eq!(picks[0], 1, "row 0: lowest of tied indices {{1,3}} is 1");
+        assert_eq!(picks[0], 0, "row 0: lowest of tied indices {{0,1,3}} is 0");
         assert_eq!(picks[1], 1, "row 1: lowest of tied indices {{1,3}} is 1");
     }
 
