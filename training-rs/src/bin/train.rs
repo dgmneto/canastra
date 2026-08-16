@@ -1,3 +1,4 @@
+use canastra_train::anchors::AnchorSet;
 use canastra_train::elo::EloTracker;
 use canastra_train::ga::{self, GAConfig, HallOfFame};
 use canastra_train::genome::{self, TRAINING_ARCH};
@@ -7,6 +8,7 @@ use candle_core::Device;
 use clap::Parser;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -73,6 +75,73 @@ struct Args {
     /// Max legal actions per row (menu width cap). 0 = no cap.
     #[arg(long, default_value = "64")]
     max_width: usize,
+
+    /// Resume from a checkpoint in this directory. Loads the latest checkpoint
+    /// and continues from the next generation.
+    #[arg(long)]
+    resume: Option<PathBuf>,
+
+    /// Checkpoint every N generations.
+    #[arg(long, default_value = "5")]
+    checkpoint_interval: u32,
+
+    /// Number of recent checkpoints to keep (rotation).
+    #[arg(long, default_value = "10")]
+    keep_recent: usize,
+
+    /// Keep every Nth checkpoint as a milestone (rotation).
+    #[arg(long, default_value = "50")]
+    keep_every: u32,
+
+    /// Sigma decay per generation.
+    #[arg(long, default_value = "0.995")]
+    sigma_decay: f64,
+
+    /// Minimum sigma (floor).
+    #[arg(long, default_value = "0.002")]
+    sigma_floor: f64,
+
+    /// Anchor evaluation interval (generations). 0 = disabled.
+    #[arg(long, default_value = "1")]
+    anchor_interval: u32,
+
+    /// Seeds for anchor evaluation games.
+    #[arg(long, default_value = "8")]
+    anchor_seeds: usize,
+
+    /// Add the champion as a new anchor every N generations (frozen champions).
+    #[arg(long, default_value = "50")]
+    anchor_freeze_interval: u32,
+}
+
+/// Write one JSON record per generation to `<run_dir>/generations.jsonl`.
+fn log_generation(run_dir: &std::path::Path, record: &serde_json::Value) {
+    let path = run_dir.join("generations.jsonl");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let line = serde_json::to_string(record).unwrap_or_default();
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// Compute fitness distribution stats from ELO ratings.
+fn fitness_stats(ratings: &[f64]) -> serde_json::Value {
+    let mut sorted: Vec<f64> = ratings.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = sorted.len();
+    let pct = |p: usize| sorted[(p * n / 100).min(n - 1)];
+    serde_json::json!({
+        "min": sorted[0],
+        "p25": pct(25),
+        "median": pct(50),
+        "p75": pct(75),
+        "p95": pct(95),
+        "max": sorted[n - 1],
+        "mean": sorted.iter().sum::<f64>() / n as f64,
+    })
 }
 
 fn main() -> anyhow::Result<()> {
@@ -83,8 +152,8 @@ fn main() -> anyhow::Result<()> {
         elites: args.elites,
         tournament: args.tournament,
         sigma: args.sigma,
-        sigma_decay: 0.995,
-        sigma_floor: 0.002,
+        sigma_decay: args.sigma_decay,
+        sigma_floor: args.sigma_floor,
         hof_interval: args.hof_interval,
     };
 
@@ -101,12 +170,47 @@ fn main() -> anyhow::Result<()> {
 
     std::fs::create_dir_all(&args.run_dir)?;
 
-    let mut pop = ga::initial_population(arch, &cfg, args.run_seed);
-    let mut hof = HallOfFame::new();
-    let mut elo = EloTracker::new(args.population);
-    let mut best_ever = f64::NEG_INFINITY;
+    // Resume or fresh start.
+    let (start_gen, mut pop, mut hof, mut elo, mut best_ever) = if let Some(ref resume_dir) =
+        args.resume
+    {
+        let (gen, loaded_pop, loaded_elo, _seeds, loaded_hof) = ga::load_checkpoint(resume_dir)?;
+        let next_gen = gen + 1;
+        eprintln!("resumed from gen {gen}, continuing at gen {next_gen}");
+        let best = loaded_elo[..args.population]
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        (
+            next_gen,
+            loaded_pop,
+            loaded_hof,
+            EloTracker::from_ratings(loaded_elo),
+            best,
+        )
+    } else {
+        let pop = ga::initial_population(arch, &cfg, args.run_seed);
+        let hof = HallOfFame::new();
+        let elo = EloTracker::new(args.population);
+        (0u32, pop, hof, elo, f64::NEG_INFINITY)
+    };
 
-    for generation in 0..args.generations {
+    let max_width = if args.max_width == 0 {
+        usize::MAX
+    } else {
+        args.max_width
+    };
+    let max_hands = if args.max_hands > 0 {
+        Some(args.max_hands)
+    } else {
+        None
+    };
+
+    // Anchored evaluation: fixed-reference genomes with frozen ratings.
+    let mut anchors = AnchorSet::new(arch);
+    let anchor_seeds: Vec<u64> = (1000..1000 + args.anchor_seeds as u64).collect();
+
+    for generation in start_gen..(start_gen + args.generations) {
         let began = Instant::now();
         let mut gen_rng =
             StdRng::seed_from_u64(seedstream::splitmix64(args.run_seed + generation as u64));
@@ -114,11 +218,6 @@ fn main() -> anyhow::Result<()> {
         let pairings =
             league::schedule_pairings(args.population, args.opponents, &hof, &mut gen_rng);
 
-        let max_hands = if args.max_hands > 0 {
-            Some(args.max_hands)
-        } else {
-            None
-        };
         league::evaluate_generation(
             &league::EvalInputs {
                 pop: &pop,
@@ -130,11 +229,7 @@ fn main() -> anyhow::Result<()> {
                 device: &device,
                 n_workers: args.workers,
                 rollout,
-                max_width: if args.max_width == 0 {
-                    usize::MAX
-                } else {
-                    args.max_width
-                },
+                max_width,
             },
             &mut elo,
         );
@@ -165,6 +260,60 @@ fn main() -> anyhow::Result<()> {
             if improved { "  new best-ever" } else { "" }
         );
 
+        // Log to generations.jsonl.
+        let games = args.population * args.opponents * args.seeds * 2;
+
+        // Anchored evaluation: play champion vs fixed anchors.
+        let anchor_report = if args.anchor_interval > 0 && generation % args.anchor_interval == 0 {
+            let report = anchors.evaluate(
+                &pop[champion],
+                arch,
+                &anchor_seeds,
+                &device,
+                rollout,
+                max_width,
+                max_hands,
+            );
+            eprintln!(
+                "  anchor ELO: {:.1} (vs {})",
+                report.champion_rating,
+                report
+                    .results
+                    .iter()
+                    .map(|r| format!("{}={:.0}", r.name, r.champ_score_mean))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            Some(report.to_json())
+        } else {
+            None
+        };
+
+        // Add champion as a frozen anchor every N generations.
+        if args.anchor_freeze_interval > 0
+            && generation > 0
+            && generation % args.anchor_freeze_interval == 0
+        {
+            anchors.add_champion(&pop[champion], elo_best, generation);
+            eprintln!("  frozen champion from gen {} added to anchors", generation);
+        }
+
+        let record = serde_json::json!({
+            "gen": generation,
+            "wall_s": wall,
+            "games": games,
+            "games_s": games as f64 / wall,
+            "decisions_s": games as f64 * 200.0 / wall,
+            "fitness": fitness_stats(&elo.ratings[..args.population]),
+            "elo_best": elo_best,
+            "elo_mean": elo_mean,
+            "sigma": sigma,
+            "improved": improved,
+            "best_ever": best_ever,
+            "anchor": anchor_report,
+        });
+        log_generation(&args.run_dir, &record);
+
         // Export champion.
         if improved || generation % cfg.hof_interval == 0 {
             let path = args
@@ -191,9 +340,20 @@ fn main() -> anyhow::Result<()> {
         pop = next_pop;
         elo.ratings[..args.population].copy_from_slice(&next_elo);
 
-        // Checkpoint.
-        if generation % 5 == 0 || generation == args.generations - 1 {
-            let _ = ga::save_checkpoint(&args.run_dir, generation, &pop, &elo, &hof, &gen_seeds);
+        // Checkpoint (atomic, with rotation).
+        if generation % args.checkpoint_interval == 0
+            || generation == start_gen + args.generations - 1
+        {
+            let _ = ga::save_checkpoint_with_rotation(
+                &args.run_dir,
+                generation,
+                &pop,
+                &elo,
+                &hof,
+                &gen_seeds,
+                args.keep_recent,
+                args.keep_every,
+            );
         }
     }
 

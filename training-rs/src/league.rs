@@ -103,6 +103,36 @@ pub fn batch_layout(
     (roster, game_seeds, meta)
 }
 
+/// Public wrapper for the lockstep rollout (used by anchored evaluation).
+pub fn rollout_lockstep_public(
+    roster: &[Genome],
+    arch: &Arch,
+    game_seeds: Vec<u64>,
+    meta: &[GameMeta],
+    max_hands: Option<u32>,
+    device: &Device,
+    max_width: usize,
+) -> Vec<MatchResult> {
+    rollout_lockstep(roster, arch, game_seeds, meta, max_hands, device, max_width)
+}
+
+/// Public wrapper for the coalesced rollout (used by anchored evaluation).
+#[allow(clippy::too_many_arguments)]
+pub fn rollout_coalesced_public(
+    roster: &[Genome],
+    arch: &Arch,
+    game_seeds: Vec<u64>,
+    meta: Vec<GameMeta>,
+    max_hands: Option<u32>,
+    device: &Device,
+    n_workers: usize,
+    max_width: usize,
+) -> Vec<MatchResult> {
+    rollout_coalesced(
+        roster, arch, game_seeds, meta, max_hands, device, n_workers, max_width,
+    )
+}
+
 /// Drive all games in lockstep with a single `Pool`. One forward per ply.
 fn rollout_lockstep(
     roster: &[Genome],

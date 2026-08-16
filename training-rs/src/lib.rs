@@ -18,6 +18,7 @@
 //! - `bin/train` — CLI driver
 //! - `bin/bench` — benchmark one generation
 
+pub mod anchors;
 pub mod elo;
 pub mod evaluate;
 pub mod ga;

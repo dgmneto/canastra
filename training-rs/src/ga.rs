@@ -158,6 +158,11 @@ impl HallOfFame {
 
 /// Save a checkpoint as a simple binary format (not .npz — Python compatibility
 /// is not needed since this is a standalone Rust project).
+///
+/// Atomic: writes to a `.tmp` file, then renames — a crash mid-write does not
+/// corrupt the latest checkpoint. Rotation: keeps the last `keep_recent`
+/// checkpoints plus every `keep_every`-th (so both recent and milestone
+/// checkpoints survive pruning).
 pub fn save_checkpoint(
     dir: &Path,
     generation: u32,
@@ -166,8 +171,25 @@ pub fn save_checkpoint(
     hof: &HallOfFame,
     seeds: &[u64],
 ) -> anyhow::Result<()> {
+    save_checkpoint_with_rotation(dir, generation, pop, elo, hof, seeds, 10, 50)
+}
+
+/// Save with configurable rotation: keep the last `keep_recent` plus every
+/// `keep_every`-th checkpoint.
+#[allow(clippy::too_many_arguments)]
+pub fn save_checkpoint_with_rotation(
+    dir: &Path,
+    generation: u32,
+    pop: &[Genome],
+    elo: &EloTracker,
+    hof: &HallOfFame,
+    seeds: &[u64],
+    keep_recent: usize,
+    keep_every: u32,
+) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join(format!("gen-{:05}.bin", generation));
+    let tmp = dir.join(format!("gen-{:05}.bin.tmp", generation));
 
     // Simple binary format: generation, pop_size, genome_size, then flat data.
     let genome_size = if pop.is_empty() { 0 } else { pop[0].len() };
@@ -212,17 +234,46 @@ pub fn save_checkpoint(
         data.extend_from_slice(&gen.to_le_bytes());
     }
 
-    std::fs::write(&path, &data)?;
+    // Atomic write: write to temp, then rename.
+    std::fs::write(&tmp, &data)?;
+    std::fs::rename(&tmp, &path)?;
 
-    // Prune old checkpoints (keep last 10).
+    // Prune: keep last `keep_recent` plus every `keep_every`-th.
     let mut checkpoints: Vec<_> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().starts_with("gen-"))
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("gen-") && name.ends_with(".bin") && !name.ends_with(".tmp")
+        })
         .collect();
     checkpoints.sort_by_key(|e| e.file_name());
-    while checkpoints.len() > 10 {
-        let oldest = checkpoints.remove(0);
-        let _ = std::fs::remove_file(oldest.path());
+    let total = checkpoints.len();
+    if total > keep_recent {
+        let mut to_remove = Vec::new();
+        for (idx, entry) in checkpoints.iter().enumerate() {
+            // Keep the last `keep_recent`.
+            if idx >= total - keep_recent {
+                continue;
+            }
+            // Keep every `keep_every`-th (milestone).
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(num_str) = name
+                .strip_prefix("gen-")
+                .and_then(|s| s.strip_suffix(".bin"))
+            {
+                if let Ok(gen) = num_str.parse::<u32>() {
+                    if gen % keep_every == 0 {
+                        continue;
+                    }
+                }
+            }
+            to_remove.push(entry.path());
+        }
+        for path in to_remove {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     Ok(())

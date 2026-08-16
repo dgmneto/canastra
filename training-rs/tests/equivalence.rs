@@ -886,3 +886,185 @@ fn width_cap_preserves_discard_or_end_turn() {
     // (This is a soft check — log the count. The hard check is game completion
     // in the test above.)
 }
+
+// ─── Resume test: checkpoint round-trip is bit-identical ──────────────────
+//
+// Run 4 generations; run 2 + save checkpoint + resume + 2; assert the final
+// population and ELO are bit-identical. This verifies that the checkpoint
+// format captures everything needed for a deterministic resume.
+
+#[test]
+fn checkpoint_resume_produces_identical_results() {
+    let population = 8usize;
+    let opponents = 2usize;
+    let n_seeds = 2usize;
+    let run_seed = 7u64;
+    let cfg = GAConfig {
+        population,
+        elites: 2,
+        tournament: 4,
+        sigma: 0.02,
+        sigma_decay: 0.995,
+        sigma_floor: 0.002,
+        hof_interval: 5,
+    };
+    let device = Device::Cpu;
+    let gen_seeds = |gen: u32| seedstream::generation_seeds(run_seed, gen, n_seeds);
+
+    let run = |gens: std::ops::Range<u32>,
+               pop: Vec<Vec<f32>>,
+               hof: HallOfFame,
+               elo_ratings: Vec<f64>|
+     -> (Vec<Vec<f32>>, Vec<f64>, HallOfFame) {
+        let mut pop = pop;
+        let mut hof = hof;
+        let mut elo = EloTracker::from_ratings(elo_ratings);
+        for generation in gens {
+            let mut gen_rng =
+                StdRng::seed_from_u64(seedstream::splitmix64(run_seed + generation as u64));
+            let pairings = league::schedule_pairings(population, opponents, &hof, &mut gen_rng);
+            league::evaluate_generation(
+                &league::EvalInputs {
+                    pop: &pop,
+                    hof: &hof,
+                    pairings: &pairings,
+                    arch: &TRAINING_ARCH,
+                    seeds: &gen_seeds(generation),
+                    max_hands: Some(1),
+                    device: &device,
+                    n_workers: 1,
+                    rollout: Rollout::Lockstep,
+                    max_width: usize::MAX,
+                },
+                &mut elo,
+            );
+            let champ = elo.ratings[..population]
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            if generation % cfg.hof_interval == 0 {
+                hof.archive(&pop[champ], elo.ratings[champ], generation);
+                elo.grow(1, None);
+                *elo.ratings.last_mut().unwrap() = elo.ratings[champ];
+            }
+            let (next_pop, next_elo) = ga::next_generation(
+                &pop,
+                &elo.ratings[..population],
+                &cfg,
+                generation,
+                &mut gen_rng,
+            );
+            pop = next_pop;
+            elo.ratings[..population].copy_from_slice(&next_elo);
+        }
+        (pop, elo.ratings, hof)
+    };
+
+    // Full run: 4 generations from scratch.
+    let pop0 = ga::initial_population(&TRAINING_ARCH, &cfg, run_seed);
+    let elo0 = vec![1200.0f64; population];
+    let (full_pop, full_elo, _full_hof) = run(0..4, pop0.clone(), HallOfFame::new(), elo0.clone());
+
+    // Partial run: 2 generations, then checkpoint.
+    let (part_pop, part_elo, part_hof) = run(0..2, pop0, HallOfFame::new(), elo0);
+    let tmp = std::env::temp_dir().join("canastra_resume_test");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let _ = ga::save_checkpoint(
+        &tmp,
+        1,
+        &part_pop,
+        &EloTracker::from_ratings(part_elo.clone()),
+        &part_hof,
+        &gen_seeds(1),
+    );
+
+    // Resume: load checkpoint, run 2 more.
+    let (_gen, loaded_pop, loaded_elo, _seeds, loaded_hof) = ga::load_checkpoint(&tmp).unwrap();
+    let (resume_pop, resume_elo, _resume_hof) = run(2..4, loaded_pop, loaded_hof, loaded_elo);
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    // Compare — must be bit-identical.
+    let mut elo_max_diff = 0.0f64;
+    for (a, b) in full_elo.iter().zip(resume_elo.iter()) {
+        elo_max_diff = elo_max_diff.max((a - b).abs());
+    }
+    println!("resume test: ELO max-abs-diff = {elo_max_diff:e}");
+    assert_eq!(full_elo, resume_elo, "ELO ratings differ after resume");
+
+    let mut pop_max_diff = 0.0f32;
+    let mut mismatches = 0usize;
+    for (a, b) in full_pop.iter().zip(resume_pop.iter()) {
+        for (va, vb) in a.iter().zip(b.iter()) {
+            let d = (va - vb).abs();
+            if d > pop_max_diff {
+                pop_max_diff = d;
+            }
+            if d != 0.0 {
+                mismatches += 1;
+            }
+        }
+    }
+    println!("resume test: pop max-abs-diff = {pop_max_diff:e}, {mismatches} mismatches");
+    assert_eq!(full_pop, resume_pop, "population differs after resume");
+}
+
+// ─── Smoke test: anchored evaluation produces a report ────────────────────
+
+#[test]
+fn anchored_evaluation_produces_report() {
+    use canastra_train::anchors::AnchorSet;
+    use canastra_train::genome::TRAINING_ARCH;
+
+    let mut anchors = AnchorSet::new(&TRAINING_ARCH);
+    let champion = canastra_train::genome::random_genome(&TRAINING_ARCH, 42);
+    let seeds = vec![1001u64, 1002, 1003];
+    let device = Device::Cpu;
+
+    let report = anchors.evaluate(
+        &champion,
+        &TRAINING_ARCH,
+        &seeds,
+        &device,
+        Rollout::Lockstep,
+        usize::MAX,
+        Some(1),
+    );
+
+    // Must have at least the random-bot anchor.
+    assert!(!report.results.is_empty(), "no anchor results");
+    assert_eq!(
+        report.results[0].name, "random",
+        "first anchor should be random"
+    );
+
+    // Champion rating must have moved from the initial 1200.
+    let total_games = report
+        .results
+        .iter()
+        .map(|r| r.wins + r.losses + r.draws)
+        .sum::<usize>();
+    assert!(total_games > 0, "no games played");
+    println!(
+        "anchor smoke: champion_rating={:.1}, games={}, random={:?}",
+        report.champion_rating, total_games, report.results[0]
+    );
+
+    // Add a frozen champion and re-evaluate.
+    anchors.add_champion(&champion, 1300.0, 10);
+    let report2 = anchors.evaluate(
+        &champion,
+        &TRAINING_ARCH,
+        &seeds,
+        &device,
+        Rollout::Lockstep,
+        usize::MAX,
+        Some(1),
+    );
+    assert_eq!(report2.results.len(), 2, "should have 2 anchors now");
+    assert_eq!(
+        report2.results[1].name, "gen-10",
+        "second anchor should be gen-10"
+    );
+}

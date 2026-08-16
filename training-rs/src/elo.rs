@@ -14,6 +14,15 @@ impl EloTracker {
         Self::with_params(size, 32.0, 1200.0)
     }
 
+    /// Reconstruct an EloTracker from saved ratings (for --resume).
+    pub fn from_ratings(ratings: Vec<f64>) -> Self {
+        Self {
+            ratings,
+            k_factor: 32.0,
+            base: 1200.0,
+        }
+    }
+
     pub fn with_params(size: usize, k_factor: f64, base: f64) -> Self {
         Self {
             ratings: vec![base; size],
