@@ -111,6 +111,7 @@ fn rollout_lockstep(
     meta: &[GameMeta],
     max_hands: Option<u32>,
     device: &Device,
+    max_width: usize,
 ) -> Vec<MatchResult> {
     let dtype = match device {
         Device::Cuda(_) => DType::BF16,
@@ -121,7 +122,7 @@ fn rollout_lockstep(
     let obs_dim = arch.obs;
     let act_dim = arch.act;
 
-    let mut pool = Pool::new(game_seeds, None, max_hands);
+    let mut pool = Pool::with_max_width(game_seeds, None, max_hands, max_width);
 
     while pool.has_live() {
         #[cfg(feature = "profile")]
@@ -336,8 +337,9 @@ fn drive_worker(
     game_seeds: Vec<u64>,
     meta: Vec<GameMeta>,
     max_hands: Option<u32>,
+    max_width: usize,
 ) -> Vec<MatchResult> {
-    let mut pool = Pool::new(game_seeds, None, max_hands);
+    let mut pool = Pool::with_max_width(game_seeds, None, max_hands, max_width);
 
     while pool.has_live() {
         #[cfg(feature = "profile")]
@@ -380,6 +382,7 @@ fn drive_worker(
 
 /// The coalesced driver: ONE GpuServer, N worker threads. Results are returned
 /// in **global game order** (index 0..n_games).
+#[allow(clippy::too_many_arguments)]
 fn rollout_coalesced(
     roster: &[Genome],
     arch: &Arch,
@@ -388,6 +391,7 @@ fn rollout_coalesced(
     max_hands: Option<u32>,
     device: &Device,
     n_workers: usize,
+    max_width: usize,
 ) -> Vec<MatchResult> {
     let n_games = game_seeds.len();
     let n_workers = n_workers.min(n_games);
@@ -412,7 +416,7 @@ fn rollout_coalesced(
     for (seeds, meta_slice, indices) in worker_data {
         let gpu = gpu.clone();
         let handle = thread::spawn(move || {
-            let results = drive_worker(gpu, seeds, meta_slice, max_hands);
+            let results = drive_worker(gpu, seeds, meta_slice, max_hands, max_width);
             (indices, results)
         });
         handles.push(handle);
@@ -443,6 +447,9 @@ pub struct EvalInputs<'a> {
     pub device: &'a Device,
     pub n_workers: usize,
     pub rollout: Rollout,
+    /// Cap on legal actions per row (menu width). usize::MAX = no cap.
+    /// Cuts the acts tensor transfer volume at peak plies.
+    pub max_width: usize,
 }
 
 /// Evaluate one generation: play all pairings, compute ELO updates.
@@ -461,6 +468,7 @@ pub fn evaluate_generation(inputs: &EvalInputs<'_>, elo: &mut EloTracker) {
         device,
         n_workers,
         rollout,
+        max_width,
     } = inputs;
     let (roster, game_seeds, meta) = batch_layout(pop, hof, pairings, seeds);
 
@@ -468,9 +476,11 @@ pub fn evaluate_generation(inputs: &EvalInputs<'_>, elo: &mut EloTracker) {
     let _gen_wall = profile::Span::new(&profile::GEN_WALL_NS);
 
     let results = match rollout {
-        Rollout::Lockstep => rollout_lockstep(&roster, arch, game_seeds, &meta, *max_hands, device),
+        Rollout::Lockstep => rollout_lockstep(
+            &roster, arch, game_seeds, &meta, *max_hands, device, *max_width,
+        ),
         Rollout::Coalesced => rollout_coalesced(
-            &roster, arch, game_seeds, meta, *max_hands, device, *n_workers,
+            &roster, arch, game_seeds, meta, *max_hands, device, *n_workers, *max_width,
         ),
     };
 

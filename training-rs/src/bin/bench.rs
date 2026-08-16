@@ -35,6 +35,10 @@ struct Args {
     /// Rollout path: "auto", "lockstep", or "coalesced".
     #[arg(long, default_value = "auto")]
     rollout: String,
+
+    /// Max legal actions per row (menu width cap). 0 = no cap.
+    #[arg(long, default_value = "64")]
+    max_width: usize,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -94,6 +98,11 @@ fn main() -> anyhow::Result<()> {
             device: &device,
             n_workers: args.workers,
             rollout,
+            max_width: if args.max_width == 0 {
+                usize::MAX
+            } else {
+                args.max_width
+            },
         },
         &mut elo,
     );

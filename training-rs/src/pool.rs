@@ -130,15 +130,30 @@ pub struct Pool {
     pending: Vec<usize>,
     menus: Vec<Vec<Action>>,
     max_actions_per_game: Option<u64>,
+    max_width: usize,
 }
 
 impl Pool {
     pub fn new(seeds: Vec<u64>, max_actions_per_game: Option<u64>, max_hands: Option<u32>) -> Self {
+        Self::with_max_width(seeds, max_actions_per_game, max_hands, usize::MAX)
+    }
+
+    /// Create a pool with a cap on the menu width (max legal actions per row).
+    /// Menus longer than `max_width` are truncated — the bot picks from the
+    /// first `max_width` actions. This cuts the `acts` tensor transfer volume
+    /// at peak plies (where width can reach 250 but mean is ~15).
+    pub fn with_max_width(
+        seeds: Vec<u64>,
+        max_actions_per_game: Option<u64>,
+        max_hands: Option<u32>,
+        max_width: usize,
+    ) -> Self {
         Pool {
             games: seeds.into_iter().map(|s| Game::new(s, max_hands)).collect(),
             pending: Vec::new(),
             menus: Vec::new(),
             max_actions_per_game,
+            max_width,
         }
     }
 
@@ -180,6 +195,17 @@ impl Pool {
                 g.safe = true;
                 menus[row] = g.menu();
                 debug_assert!(!menus[row].is_empty(), "even the safe retry dead-ended");
+            }
+        }
+
+        // Cap menu width: truncate menus longer than max_width. The bot picks
+        // from the first max_width actions. Cuts acts tensor volume at peak
+        // plies (width can reach 250 but mean is ~15).
+        if self.max_width < usize::MAX {
+            for menu in &mut menus {
+                if menu.len() > self.max_width {
+                    menu.truncate(self.max_width);
+                }
             }
         }
 

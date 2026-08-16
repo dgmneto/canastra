@@ -156,9 +156,8 @@ impl HallOfFame {
     }
 }
 
-/// Save a checkpoint as .npz (compatible with the Python version's format).
-/// Actually, save as a simple binary format for now — the Python checkpoint
-/// compatibility is not needed since this is a standalone Rust project.
+/// Save a checkpoint as a simple binary format (not .npz — Python compatibility
+/// is not needed since this is a standalone Rust project).
 pub fn save_checkpoint(
     dir: &Path,
     generation: u32,

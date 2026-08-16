@@ -146,19 +146,18 @@ impl CpuRoster {
     }
 
     /// Build a `WeightStack` on `device` for genomes at indices `which`.
-    /// dtype is f32 — the coalesced path used fp32 throughout.
+    /// dtype is bf16 on CUDA (half VRAM, tensor cores), f32 on CPU (exact).
     pub fn build_chunk(
         &self,
         which: &[usize],
         device: &Device,
     ) -> candle_core::Result<WeightStack> {
+        let dtype = match device {
+            Device::Cuda(_) => DType::BF16,
+            _ => DType::F32,
+        };
         let refs: Vec<&Genome> = which.iter().map(|&i| &self.genomes[i]).collect();
-        Ok(WeightStack::from_roster(
-            &refs,
-            &self.arch,
-            device,
-            DType::F32,
-        ))
+        Ok(WeightStack::from_roster(&refs, &self.arch, device, dtype))
     }
 }
 
@@ -250,7 +249,7 @@ pub fn forward_scores(
     let mut scores_flat = vec![-1e9f32; n_rows * width];
 
     for chunk in grid.chunks() {
-        let out = forward_chunk(ply_stack.as_ref(), &grid, &chunk, width, act_dim);
+        let out = forward_chunk(ply_stack.as_ref(), &grid, &chunk, width, act_dim, true);
         scatter(
             &grid,
             &chunk,
@@ -290,7 +289,7 @@ pub fn forward_picks(
     let mut picks = vec![0usize; n_rows];
 
     for chunk in grid.chunks() {
-        let out = forward_chunk(ply_stack.as_ref(), &grid, &chunk, width, act_dim);
+        let out = forward_chunk(ply_stack.as_ref(), &grid, &chunk, width, act_dim, false);
         scatter_picks(&grid, &chunk, &out.picks, &mut picks);
     }
 
@@ -431,13 +430,19 @@ struct Chunk {
 
 /// Forward one genome-chunk: slice the present-stack to these `g_count`
 /// genomes, gather `[g_count, n_max, ...]` rows, grouped bmm, mask, argmax.
-/// Returns picks `[g_count*n_max]` and scores `[g_count*n_max, width]`.
+/// Returns picks `[g_count*n_max]` and optionally scores `[g_count*n_max, width]`.
+///
+/// When `need_scores` is false (the `forward_picks` hot path), the full score
+/// matrix D2H download is skipped — only the argmax picks are downloaded. This
+/// avoids paying for a `[g_count*n_max, width]` transfer that `scatter_picks`
+/// would throw away.
 fn forward_chunk(
     present_stack: &WeightStack,
     grid: &Grid,
     chunk: &Chunk,
     width: usize,
     act_dim: usize,
+    need_scores: bool,
 ) -> ChunkOutput {
     let g_count = chunk.g_count;
     let n_max = grid.n_max;
@@ -515,14 +520,18 @@ fn forward_chunk(
     #[cfg(feature = "profile")]
     let _a = profile::Span::new(&profile::FWD_ARGMAX_NS);
     let (picks, _gpu) = argmax_first_max(&scores_f32, g_count, n_max, width, &stack.device);
+    #[cfg(feature = "profile")]
+    drop(_a);
 
-    // Download scores (fp32) — only on the test path (forward_scores).
-    let scores_host: Vec<f32> = scores_f32.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    // Only download the full score matrix on the test path (forward_scores).
+    // The hot path (forward_picks) skips this — scatter_picks only needs picks.
+    let scores_flat = if need_scores {
+        scores_f32.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    } else {
+        Vec::new()
+    };
 
-    ChunkOutput {
-        picks,
-        scores_flat: scores_host,
-    }
+    ChunkOutput { picks, scores_flat }
 }
 
 struct ChunkOutput {
