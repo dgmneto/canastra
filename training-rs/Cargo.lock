@@ -166,6 +166,7 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "clap",
+ "cudarc 0.19.9",
  "rand 0.8.7",
  "rayon",
  "serde",

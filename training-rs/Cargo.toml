@@ -17,6 +17,11 @@ path = "src/bin/train.rs"
 name = "canastra-bench"
 path = "src/bin/bench.rs"
 
+[[bin]]
+name = "canastra-h2d-bench"
+path = "src/bin/h2d_bench.rs"
+required-features = ["cuda"]
+
 [workspace]
 
 [dependencies]
@@ -45,8 +50,11 @@ rand = { version = "0.8", features = ["std_rng"] }
 # Misc
 anyhow = "1"
 
+# Pinned-memory H2D microbenchmark (cuda-only). Same version candle pulls in.
+cudarc = { version = "0.19", optional = true }
+
 [features]
-cuda = ["candle-core/cuda"]
+cuda = ["candle-core/cuda", "dep:cudarc"]
 # Coarse per-generation timing breakdown (Phase 0 profiling). Throwaway —
 # Phase 1 rewrites the rollout and drops this. Adds a small cost via Instant
 # spans and atomic counters; do not enable for production runs.

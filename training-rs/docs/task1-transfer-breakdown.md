@@ -113,3 +113,84 @@ GB/s (Gen 1 PCIe) is the real wall. Three fixes, in priority order:
 
 The transfer is **not** irreducible — 90%+ is reducible with known techniques.
 Proceeding to Task 2 (pinned memory + PCIe link fix).
+
+---
+
+# Revision — per-tensor timing reveals the real bottleneck
+
+After the microbenchmark (all approaches at 7 GB/s, no pinning/stream benefit)
+and per-tensor H2D timing in the training pipeline, the picture changed again:
+
+## PCIe link is fine
+
+- **Gen 1 at idle is normal** — the link negotiates to **Gen 3 x8 under load**
+  (confirmed by polling `nvidia-smi -l 1` during the microbenchmark). No
+  configuration issue.
+- **Max is Gen 3 x8** — the platform (motherboard/slot) caps at Gen 3 despite
+  the Blackwell GPU being natively Gen 5. This permanently limits the ceiling
+  to ~8 GB/s. The brief's 15 GB/s acceptance criterion is **not achievable on
+  this hardware**.
+- **Pinned = pageable = pre-alloc = transfer-stream: all 7.1 GB/s** for 256 MB
+  transfers. No approach improves raw bandwidth. `has_async_alloc: true`.
+
+## The `acts` tensor is the real wall — 94% padding
+
+Per-tensor timing at pop=500 (32,000 rows/ply):
+
+| Ply | obs (MB) | obs time | acts (MB) | acts time | mask (MB) | width |
+|----:|---------:|---------:|----------:|----------:|----------:|------:|
+| 1   | 256      | 43 ms    | 12        | 2 ms      | 0         | 1     |
+| 51  | 255      | 44 ms    | **1833**  | **604 ms**| 18        | ~142  |
+| 101 | 206      | 36 ms    | **3237**  | **859 ms**| 32        | ~250  |
+| 151 | 9        | 2 ms     | 151       | 38 ms     | 1         | ~12   |
+
+`width` is the **global max menu size** across all 32,000 rows. It grows from
+1 (draw phase) to **250** (mid-game melding phase) as players accumulate cards
+and meld options. With a mean menu of ~15 actions, width=250 means **94% of the
+acts tensor is padding zeros**. At ply 101, the acts tensor is **3.2 GB** — a
+single tensor upload taking 859 ms (3.8 GB/s, half the link speed due to the
+massive allocation).
+
+The `acts` bandwidth (3.0-3.8 GB/s) is lower than `obs` bandwidth (5.8-6.0
+GB/s) despite larger transfers — likely because `cuMemAllocAsync` for 1.8-3.2
+GB triggers memory pool pressure or fragmentation.
+
+## Revised breakdown
+
+The original 23 KB/row estimate was wrong because it used the early-game width
+(37). At mid-game, the per-row transfer is:
+
+| Tensor | Per-row (width=250) | Per-row (width=15, mean) |
+|--------|-------------------:|-------------------------:|
+| obs    | 8.0 KB             | 8.0 KB                   |
+| acts   | **101 KB**         | 6.1 KB                   |
+| mask   | 1.0 KB             | 0.06 KB                  |
+| Total  | **110 KB**         | 14.2 KB                  |
+
+At width=250, the acts tensor dominates (92% of transfer volume). The obs is
+only 7% — making the sparse input layer (Task 3) a secondary concern compared
+to acts width de-padding.
+
+## Revised reducibility
+
+1. **Width de-padding (17x on acts)**: upload only each row's actual menu
+   entries, not the global-max-padded dense tensor. This is the single biggest
+   cut — from 3.2 GB to ~0.2 GB per peak ply. Requires a jagged layout or
+   per-row encoding.
+2. **u8 for binary features (4x on everything)**: both obs and acts are 100%
+   binary. Upload as u8, cast device-side. Free, no precision loss.
+3. **Sparse input layer (85x on obs)**: obs is 100% binary and sparse (~2%
+   density). Embedding-bag cuts obs from 256 MB to ~3 MB. Secondary to acts.
+4. **Pinned memory + streams**: no benefit measured (7.1 GB/s either way). The
+   link is at Gen 3 x8 ceiling. Skip.
+
+## Revised irreducible minimum
+
+With width de-padding + u8 + sparse obs:
+- obs: 3 MB/ply (sparse indices, u16)
+- acts: ~0.2 GB/ply (mean 15 actions × 101 features × u8 = 1.5 KB/row × 32K = 48 MB)
+- Total: ~51 MB/ply, ~11 GB total. At 7 GB/s: **1.6s**. Not the bottleneck.
+
+The brief's 15 GB/s criterion is not achievable (Gen 3 x8 caps at 8 GB/s), but
+with the data volume cuts, the H2D drops from 88s to <2s regardless. Proceeding
+to Task 3a (sparsity measurement) ahead of u8, as instructed.
