@@ -22,6 +22,10 @@ name = "canastra-h2d-bench"
 path = "src/bin/h2d_bench.rs"
 required-features = ["cuda"]
 
+[[bin]]
+name = "canastra-sparsity"
+path = "src/bin/sparsity.rs"
+
 [workspace]
 
 [dependencies]

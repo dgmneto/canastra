@@ -46,7 +46,7 @@ fn main() {
 
     // ── Pre-allocated + memcpy (no per-iter alloc) ──
     let mut dev_pre = stream.alloc_zeros::<f32>(n).expect("pre-alloc");
-    let _ = stream
+    stream
         .memcpy_htod(&pinned, &mut dev_pre)
         .expect("warmup memcpy");
     stream.synchronize().expect("sync");
@@ -63,7 +63,7 @@ fn main() {
     // ── Transfer stream (non-default) + pre-alloc ──
     let xfer_stream = ctx.new_stream().expect("transfer stream");
     let mut dev_xfer = stream.alloc_zeros::<f32>(n).expect("pre-alloc xfer");
-    let _ = xfer_stream
+    xfer_stream
         .memcpy_htod(&pinned, &mut dev_xfer)
         .expect("warmup xfer");
     xfer_stream.synchronize().expect("sync");
