@@ -455,6 +455,11 @@ fn run_es(
         let gen_seeds = seedstream::generation_seeds(args.run_seed, generation, args.seeds);
         let pairings = league::schedule_pairings(pop_size, args.opponents, &hof, &mut gen_rng);
         let mut elo = EloTracker::new(pop_size);
+        // Grow ELO to include HOF entries (schedule_pairings may assign HOF
+        // opponents at indices ≥ pop_size).
+        if !hof.is_empty() {
+            elo.grow(hof.len(), None);
+        }
 
         league::evaluate_generation(
             &league::EvalInputs {
