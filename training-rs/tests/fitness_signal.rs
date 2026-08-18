@@ -65,6 +65,7 @@ fn small_generation(
         max_hands,
         device: &test_device(),
         max_width,
+        dtype: None,
     });
     (results, pairings, gen_seeds.len())
 }

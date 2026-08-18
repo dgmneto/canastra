@@ -192,11 +192,15 @@ target\release\canastra-bench.exe --population 96 --device cuda
 target\release\canastra-bench.exe --population 1000 --device cpu
 ```
 
-Train (smoke run):
+Train (smoke run — population is `2 × --n-perturbations`; there is no `--population` or
+`--workers` flag):
 
 ```bash
-target\release\canastra-train.exe --generations 2 --population 8 --opponents 2 --seeds 2 --workers 8 --device cuda
+target\release\canastra-train.exe --generations 2 --n-perturbations 8 --opponents 2 --seeds 2 --device cuda
 ```
+
+The measured production config, the reasoning behind each flag, and how to read a run's output
+are in [training-rs/docs/production-run.md](training-rs/docs/production-run.md).
 
 Regenerate Python reference data (requires `training/.venv`):
 
@@ -276,13 +280,15 @@ threads + `CpuRoster`) were removed after ES + lockstep won the benchmark — se
 `training-rs/docs/decision-ga-vs-es.md` for the reasoning and the historical numbers. The
 forward pass is the lockstep grouped matmul: every live row in a ply is gathered into a
 `[G, n_max, ...]` grid, one batched matmul per layer reads each genome's weights exactly once,
-and there is one sync point per ply (the argmax download). Weights are f16 on CUDA, fp32 on
+and there is one sync point per ply (the argmax download). Weights are bf16 on CUDA (overridable
+via `EvalInputs::dtype` / `canastra-bench --dtype`; f16 was measured to be within ±2% and is not
+worth its narrower exponent range — see `docs/benchmarks.md` "Phase 2 re-measured"), fp32 on
 CPU; **action masking and argmax are both done in fp32** — masking in the f16 stack dtype
 overflowed the `-1e9` sentinel to `-inf` and made every legal action's score `0 × -inf = NaN`,
 silently collapsing all GPU play to "take the first legal action" (see
 `training-rs/docs/decision-ranking-metric.md`; `policy::mask_illegal_f32` is the fix and
 `tests/fitness_signal.rs` is the regression cover). `WeightStack::from_roster` builds the
-per-layer `[G, out, in]` tensors once per generation. **Scaling wall:** a transient f32→f16 cast spike in
+per-layer `[G, out, in]` tensors once per generation. **Scaling wall:** a transient f32→bf16 cast spike in
 `from_roster` causes OOM near pop=2000 on 16 GB VRAM (see `training-rs/docs/task4-ksweep.md`
 Task 4a); the production config stays at pop=1000 (measured working). ES sidesteps the dense
 genome storage that gave GA its VRAM cliff — it stores only a base policy + `(seed, sigma)`

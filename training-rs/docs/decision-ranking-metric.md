@@ -259,11 +259,13 @@ where the remaining variance lives. It is a bigger change to the training regime
 than a metric swap (the population would no longer play each other at all), so
 it is left as a separate decision.
 
-**Re-measure the Phase 2 benchmarks.** The F16 table in `benchmarks.md` has not
-been re-run since the masking fix, so the real cost of F16-vs-BF16 is currently
-unknown. `canastra-bench` now prints the level-game percentage and mean
-|differential| next to games/s, so a degenerate forward can no longer be
-recorded as a speedup.
+**~~Re-measure the Phase 2 benchmarks.~~ Done** — see `benchmarks.md`, "Phase 2
+re-measured". F16 and BF16 came out within ±2% of each other, so the dtype
+switch that introduced the masking bug bought nothing; **BF16 is now the
+default** (`league::default_dtype`) because it carries f32's exponent range and
+cannot reproduce that class of overflow. `canastra-bench` prints the level-game
+percentage and mean |differential| next to games/s, so a degenerate forward can
+no longer be recorded as a speedup.
 
 **Consider whether `max_hands=1` is the right training unit.** With a one-hand
 cap, ~5% of games end level on CPU and both partnerships frequently fail to

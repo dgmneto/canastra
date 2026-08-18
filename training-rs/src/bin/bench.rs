@@ -3,7 +3,7 @@ use canastra_train::fitness;
 use canastra_train::genome::{self, TRAINING_ARCH};
 use canastra_train::hof::HallOfFame;
 use canastra_train::league;
-use candle_core::Device;
+use candle_core::{DType, Device};
 use clap::Parser;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -32,6 +32,11 @@ struct Args {
     /// Max legal actions per row (menu width cap). 0 = no cap.
     #[arg(long, default_value = "64")]
     max_width: usize,
+
+    /// Weight-stack precision: "auto" (f16 on CUDA, f32 on CPU), "f16",
+    /// "bf16", or "f32". Masking and argmax are always f32 regardless.
+    #[arg(long, default_value = "auto")]
+    dtype: String,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -64,9 +69,21 @@ fn main() -> anyhow::Result<()> {
     } else {
         "cpu"
     };
+    let dtype = match args.dtype.as_str() {
+        "auto" => None,
+        "f16" => Some(DType::F16),
+        "bf16" => Some(DType::BF16),
+        "f32" => Some(DType::F32),
+        other => anyhow::bail!("unknown --dtype {other}; use auto, f16, bf16 or f32"),
+    };
+    let dtype_label = format!(
+        "{:?}",
+        dtype.unwrap_or_else(|| league::default_dtype(&device))
+    );
+
     eprintln!(
-        "pop={} opponents={} seeds={} games={} device={}",
-        args.population, args.opponents, args.seeds, games, device_label
+        "pop={} opponents={} seeds={} games={} device={} dtype={}",
+        args.population, args.opponents, args.seeds, games, device_label, dtype_label
     );
 
     let began = Instant::now();
@@ -83,6 +100,7 @@ fn main() -> anyhow::Result<()> {
         } else {
             args.max_width
         },
+        dtype,
     });
     let elapsed = began.elapsed().as_secs_f64();
 
@@ -96,10 +114,11 @@ fn main() -> anyhow::Result<()> {
     let level = results.iter().filter(|(_, s, ..)| s[0] == s[1]).count();
 
     println!(
-        "pop={} games={} device={}: {:.1}s = {:.0} games/s | level {:.1}% | mean |diff| {:.0} pts",
+        "pop={} games={} device={} dtype={}: {:.1}s = {:.0} games/s | level {:.1}% | mean |diff| {:.0} pts",
         args.population,
         games,
         device_label,
+        dtype_label,
         elapsed,
         games as f64 / elapsed,
         100.0 * level as f64 / results.len() as f64,

@@ -62,6 +62,13 @@ struct Args {
     #[arg(long, default_value = "5")]
     hof_interval: u32,
 
+    /// Max archived HOF genomes. Every archived genome is re-uploaded to the
+    /// GPU each generation and written into every checkpoint, so this is a
+    /// hard cost, not a soft one. Over capacity, the archive is thinned to
+    /// stay spread across training history.
+    #[arg(long, default_value = "20")]
+    hof_capacity: usize,
+
     /// Device: "cuda" or "cpu".
     #[arg(long, default_value = "cuda")]
     device: String,
@@ -160,14 +167,26 @@ fn main() -> anyhow::Result<()> {
     // Resume or fresh start.
     let (start_gen, mut es_state, mut hof, mut best_ever) =
         if let Some(ref resume_dir) = args.resume {
-            let (gen, state, _elo, _seeds, loaded_hof) = es::load_es_checkpoint(resume_dir)?;
+            let (gen, state, _elo, _seeds, mut loaded_hof) = es::load_es_checkpoint(resume_dir)?;
+            // The checkpoint carries whatever archive it was written with; the
+            // flag governs from here on, so resuming with a smaller cap thins
+            // an oversized archive rather than carrying it forever.
+            loaded_hof.capacity = args.hof_capacity.max(1);
             let next_gen = gen + 1;
-            eprintln!("ES: resumed from gen {gen}, continuing at gen {next_gen}");
+            eprintln!(
+                "ES: resumed from gen {gen}, continuing at gen {next_gen} (HOF {} entries)",
+                loaded_hof.len()
+            );
             (next_gen, state, loaded_hof, f64::NEG_INFINITY)
         } else {
             let base = genome::random_genome(arch, args.run_seed);
             let state = ESState::new(base, &es_cfg, args.run_seed);
-            (0u32, state, HallOfFame::new(), f64::NEG_INFINITY)
+            (
+                0u32,
+                state,
+                HallOfFame::with_capacity(args.hof_capacity),
+                f64::NEG_INFINITY,
+            )
         };
 
     let mut anchors = AnchorSet::new(arch);
@@ -190,6 +209,7 @@ fn main() -> anyhow::Result<()> {
         let pairings =
             league::schedule_pairings_mirrored(pop_size, args.opponents, &hof, &mut gen_rng);
 
+        let league_began = Instant::now();
         let results = league::play_generation(&league::EvalInputs {
             pop: &pop,
             hof: &hof,
@@ -199,6 +219,7 @@ fn main() -> anyhow::Result<()> {
             max_hands,
             device: &device,
             max_width,
+            dtype: None,
         });
 
         // Fitness = mean duplicate-deal score differential. Antisymmetric, so
@@ -207,9 +228,11 @@ fn main() -> anyhow::Result<()> {
             fitness::score_generation(&results, &pairings, gen_seeds.len(), pop_size + hof.len());
         let fitness: Vec<f64> = report.fitness[..pop_size].to_vec();
 
-        // Throughput is the league's, not the whole generation's — the anchor
-        // evaluation below plays its own games, which `games` does not count.
-        let league_wall = began.elapsed().as_secs_f64();
+        // Throughput is the league's alone. `wall` additionally covers
+        // materialising the population, the anchor evaluation (which plays its
+        // own games, uncounted by `games`) and the Adam step — so dividing
+        // `games` by it would understate games/s by ~40% at pop=1000.
+        let league_wall = league_began.elapsed().as_secs_f64();
 
         let champion = fitness
             .iter()

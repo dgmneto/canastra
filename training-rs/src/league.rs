@@ -133,6 +133,27 @@ pub fn batch_layout(
     (roster, game_seeds, meta)
 }
 
+/// The weight-stack dtype for a device when the caller has no preference.
+///
+/// **BF16 on CUDA**, F32 on CPU for exactness.
+///
+/// BF16 over F16 because the two are within ±2% of each other on this card
+/// (measured both ways across pop 96/500/1000 — `docs/benchmarks.md`, "Phase 2
+/// re-measured"), while BF16 carries f32's exponent range. The earlier switch
+/// to F16 was made for a "~2.5x speedup" that turned out to be the masking bug
+/// it introduced: `-1e9` is finite in BF16 but overflows to `-inf` in F16, and
+/// F16 was the only dtype where that mattered. Same speed, one fewer way to
+/// silently break — and BF16 is what the GPU equivalence test already covers.
+///
+/// Masking and argmax are done in f32 regardless of this choice — see
+/// `policy::mask_illegal_f32` and `docs/decision-ranking-metric.md`.
+pub fn default_dtype(device: &Device) -> DType {
+    match device {
+        Device::Cuda(_) => DType::BF16,
+        _ => DType::F32,
+    }
+}
+
 /// Public wrapper for the lockstep rollout (used by anchored evaluation).
 pub fn rollout_lockstep_public(
     roster: &[Genome],
@@ -143,10 +164,16 @@ pub fn rollout_lockstep_public(
     device: &Device,
     max_width: usize,
 ) -> Vec<MatchResult> {
-    rollout_lockstep(roster, arch, game_seeds, meta, max_hands, device, max_width)
+    rollout_lockstep(
+        roster, arch, game_seeds, meta, max_hands, device, max_width, None,
+    )
 }
 
 /// Drive all games in lockstep with a single `Pool`. One forward per ply.
+///
+/// `dtype` overrides the weight-stack precision; `None` takes
+/// [`default_dtype`].
+#[allow(clippy::too_many_arguments)]
 fn rollout_lockstep(
     roster: &[Genome],
     arch: &Arch,
@@ -155,11 +182,9 @@ fn rollout_lockstep(
     max_hands: Option<u32>,
     device: &Device,
     max_width: usize,
+    dtype: Option<DType>,
 ) -> Vec<MatchResult> {
-    let dtype = match device {
-        Device::Cuda(_) => DType::F16,
-        _ => DType::F32,
-    };
+    let dtype = dtype.unwrap_or_else(|| default_dtype(device));
     let roster_refs: Vec<&Genome> = roster.iter().collect();
     let stack = WeightStack::from_roster(&roster_refs, arch, device, dtype);
     let obs_dim = arch.obs;
@@ -252,6 +277,11 @@ pub struct EvalInputs<'a> {
     /// Cap on legal actions per row (menu width). usize::MAX = no cap.
     /// Cuts the acts tensor transfer volume at peak plies.
     pub max_width: usize,
+    /// Weight-stack precision. `None` takes [`default_dtype`] for the device.
+    /// Exposed so the benchmark can A/B F16 against BF16 — the switch between
+    /// them is what introduced the masking bug, and its actual speed benefit
+    /// had never been measured on non-degenerate games.
+    pub dtype: Option<DType>,
 }
 
 /// Play one generation: every pairing, every deal, both seatings.
@@ -273,6 +303,7 @@ pub fn play_generation(inputs: &EvalInputs<'_>) -> Vec<MatchResult> {
         max_hands,
         device,
         max_width,
+        dtype,
     } = inputs;
     let (roster, game_seeds, meta) = batch_layout(pop, hof, pairings, seeds);
     let scheduled = meta.len();
@@ -281,7 +312,7 @@ pub fn play_generation(inputs: &EvalInputs<'_>) -> Vec<MatchResult> {
     let _gen_wall = profile::Span::new(&profile::GEN_WALL_NS);
 
     let results = rollout_lockstep(
-        &roster, arch, game_seeds, &meta, *max_hands, device, *max_width,
+        &roster, arch, game_seeds, &meta, *max_hands, device, *max_width, *dtype,
     );
 
     #[cfg(feature = "profile")]

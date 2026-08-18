@@ -446,6 +446,7 @@ fn elo_arithmetic_matches_python() {
             max_hands: Some(1),
             device: &device,
             max_width: usize::MAX,
+            dtype: None,
         },
         &mut elo,
     );
@@ -632,6 +633,7 @@ fn generation_is_self_deterministic_across_thread_counts() {
                     max_hands: Some(1),
                     device: &device,
                     max_width: usize::MAX,
+                    dtype: None,
                 },
                 &mut elo,
             );

@@ -23,6 +23,7 @@
 use crate::genome::{genome_size, Arch, Genome};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use rayon::prelude::*;
 
 /// ES configuration.
 pub struct ESConfig {
@@ -104,18 +105,24 @@ impl ESState {
 
     /// Materialise the full evaluation population: 2 × n_perturbations genomes.
     /// Genome `2*i` = θ + σεᵢ, genome `2*i+1` = θ − σεᵢ (mirrored/antithetic).
+    ///
+    /// Parallel over perturbation pairs. At pop=1000 this is 500 × 1.2M
+    /// Box-Muller draws plus 1.2 GB of writes — measured at ~70 s serially,
+    /// which was a third of the whole generation. Every output element depends
+    /// on exactly one seed and nothing is summed across pairs, so the result is
+    /// **bit-identical** regardless of thread count.
     pub fn materialise_population(&self, arch: &Arch) -> Vec<Genome> {
         let size = genome_size(arch);
-        let n = self.perturbation_seeds.len();
-        let mut pop = Vec::with_capacity(2 * n);
-        for &seed in &self.perturbation_seeds {
-            let eps = generate_perturbation(seed, size);
-            let plus = perturb(&self.base_params, &eps, self.sigma as f32);
-            let minus = perturb(&self.base_params, &eps, -(self.sigma as f32));
-            pop.push(plus);
-            pop.push(minus);
-        }
-        pop
+        let sigma = self.sigma as f32;
+        self.perturbation_seeds
+            .par_iter()
+            .flat_map_iter(|&seed| {
+                let eps = generate_perturbation(seed, size);
+                let plus = perturb(&self.base_params, &eps, sigma);
+                let minus = perturb(&self.base_params, &eps, -sigma);
+                [plus, minus]
+            })
+            .collect()
     }
 
     /// The number of genomes in the materialised population.
@@ -500,6 +507,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `materialise_population` runs in parallel over perturbation pairs. It
+    /// must stay bit-identical across thread counts — training determinism is
+    /// a standing promise of this crate, and a population that differs by a
+    /// ULP changes argmax picks on near-ties and diverges whole games.
+    #[test]
+    fn materialise_population_is_bit_identical_across_thread_counts() {
+        let cfg = ESConfig {
+            n_perturbations: 8,
+            ..Default::default()
+        };
+        let state = ESState::new(vec![0.25f32; 512], &cfg, 42);
+        let arch = &crate::genome::TRAINING_ARCH;
+
+        let run = |threads: usize| -> Vec<Genome> {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| state.materialise_population(arch))
+        };
+
+        assert_eq!(
+            run(1),
+            run(8),
+            "population differs between 1 and 8 rayon threads"
+        );
     }
 
     #[test]

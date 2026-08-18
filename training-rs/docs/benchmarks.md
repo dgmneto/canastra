@@ -75,16 +75,22 @@ point." Criterion 2 (≥10x transfer reduction) is met via the width cap alone
 (3.2 GB → 800 MB on the dominant tensor). Criterion 1 (≥15 GB/s H2D) is not
 achievable on this hardware (Gen 3 x8 caps at ~8 GB/s).
 
-## Phase 2 — u8 transfer + F16 dtype — **TABLE VOID, RE-MEASURE**
+## Phase 2 — u8 transfer + F16 dtype — **ORIGINAL TABLE WAS VOID**
 
 > The F16 switch broke action masking (`-1e9` → `-inf` → `0 × -inf = NaN`), so
-> every game below ended instantly at −300 to −300. The table times degenerate
-> games. The masking is fixed (`policy::mask_illegal_f32`) and
-> `tests/fitness_signal.rs` guards it, but **these rows have not been
-> re-measured**. Note the reasoning recorded below — "the F16 path's correctness
-> is verified by the existing forward-pass test (CPU F32 vs Python) and the GPU
-> BF16 vs CPU agreement test" — names the gap exactly: neither test exercises
-> F16. The u8 transfer change is independent and unaffected.
+> every game in the original table ended instantly at −300 to −300 and the
+> numbers timed degenerate games. Masking is fixed
+> (`policy::mask_illegal_f32`), guarded by `tests/fitness_signal.rs`, and the
+> table has been **re-measured** — see "Phase 2 re-measured" below.
+>
+> The claim in point 2 below did not survive: F16 and BF16 are within noise of
+> each other on this card. The "~2.5x speedup on the grouped bmm" was the bug,
+> not the dtype. Kept here as written for the record.
+>
+> Note that the reasoning in point 2 names the gap exactly — "the F16 path's
+> correctness is verified by the existing forward-pass test (CPU F32 vs Python)
+> and the GPU BF16 vs CPU agreement test" — neither of which exercises F16. The
+> u8 transfer change is independent and unaffected.
 
 Two changes applied on top of Phase 1b:
 
@@ -127,6 +133,83 @@ the production training path.
 | 96         | 6,144  | 3.8      | 1,627   | 6.28x               | 3.61x               |
 | 500        | 32,000 | 19.0     | 1,681   | 13.56x              | 3.90x               |
 | 1,000      | 64,000 | 38.9     | 1,646   | 6.35x               | 3.90x               |
+
+## Phase 2 re-measured — after the masking fix
+
+Same config (`--max-width 64`, ES population via `ESState::materialise_population`,
+`opponents=4 seeds=8 max_hands=1`), CUDA build, RTX 5060 Ti. `canastra-bench`
+now reports the share of games that ended level and the mean |paired
+differential| alongside throughput, so a degenerate forward cannot be recorded
+as a speedup again. `level 0.7%` below is a healthy signal; the bug produced
+100%.
+
+| Population | Games  | dtype | Wall (s) | games/s | level | mean \|diff\| |
+|-----------:|-------:|:------|---------:|--------:|------:|--------------:|
+| 96         | 6,144  | F16   | 10.3     | 599     | 0.7%  | 266 pts |
+| 96         | 6,144  | BF16  | 10.1     | 606     | 0.7%  | 270 pts |
+| 500        | 32,000 | F16   | 54.8     | 584     | 0.7%  | 254 pts |
+| 500        | 32,000 | BF16  | 54.0     | 593     | 0.7%  | 256 pts |
+| 1,000      | 64,000 | F16   | 111.8    | 572     | 0.7%  | 261 pts |
+| 1,000      | 64,000 | BF16  | 113.8    | 562     | 0.7%  | 258 pts |
+
+**F16 buys nothing.** The gap to BF16 is ±2% and changes sign across
+populations — noise, not a difference. The dtype switch that introduced the
+masking bug had no throughput justification once games are real. **BF16 is the
+better default**: identical speed, but it carries f32's exponent range, so
+overflow-style bugs like the `-1e9` sentinel cannot recur in it, and it is the
+dtype the GPU equivalence test already covers. Selectable via
+`canastra-bench --dtype {auto,f16,bf16,f32}` and `EvalInputs::dtype`.
+
+**Scaling is flat** (599 → 584 → 572 across a 10x population rise), which was
+the real Phase 1b/2 win and still holds.
+
+**GPU vs CPU:** pop=96 on CPU (F32) is 220.1s = 28 games/s, `level 0.6%`, mean
+|diff| 265 pts — the same signal the GPU produces, confirming the two paths
+agree on non-degenerate games. GPU is **21x** CPU at this population.
+
+Against the honest baselines: 599 games/s at pop=96 is 2.3x the Phase 0
+baseline (259) and 1.29x Phase 1b (465, from `task4-ksweep.md`, BF16-era and
+valid). The headline 1,627 games/s was never real.
+
+### Whole-generation cost (`canastra-train`, not just the league)
+
+`canastra-bench` times the league only. A training generation also materialises
+the population, evaluates anchors and runs the Adam step. At pop=1000 that
+non-league work was **83 s** — 42% of a 198 s generation — almost all of it
+`ESState::materialise_population` building 1000 × 1.2M genomes single-threaded.
+
+Parallelising it over perturbation pairs (bit-identical: each output element
+depends on one seed and nothing is summed across pairs, pinned by
+`es::tests::materialise_population_is_bit_identical_across_thread_counts`):
+
+| | before | after |
+|---|---:|---:|
+| generation wall | 197.9 s | **114.9 s** |
+| league | 184.7 s | 104.6 s |
+| non-league | 13.2 s | 10.3 s |
+
+Measured at pop=1000, `opponents=4 seeds=8`, `--anchor-interval 1`. Both runs
+produce identical fitness (`best +301.2 pts, spread 241.8`). The league figure
+before the fix included materialisation because the timer started too early;
+104.6 s / 64,000 games = 612 games/s, consistent with the bench.
+
+**Plan on ~115 s/generation at pop=1000, K=64** — about 31 generations/hour.
+
+### Cost model for planning a run
+
+At ~580 games/s, one generation costs `pop × K / 580` seconds, where
+`K = opponents × seeds × 2`:
+
+| pop | K | games/gen | s/gen | gen/hour |
+|----:|--:|----------:|------:|---------:|
+| 500 | 64 | 32,000 | 55 | 65 |
+| 1,000 | 64 | 64,000 | 110 | 33 |
+| 1,000 | 128 | 128,000 | 221 | 16 |
+| 1,000 | 256 | 256,000 | 441 | 8 |
+
+Throughput is flat in `pop`, so the budget is spent purely on `pop × K`. The
+K-sweep (`docs/decision-ranking-metric.md`) puts the gradient-stability knee at
+K=128; below that K=64 still gives grad_ρ ≈ 0.81.
 
 Scaling is flat (1,627 → 1,681 → 1,646 across 10x population growth) — the
 lockstep architecture scales well. The 2x target (≥844 games/s at pop=1000)

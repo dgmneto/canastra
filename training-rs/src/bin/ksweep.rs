@@ -118,6 +118,7 @@ fn run_once(
         max_hands: Some(1),
         device,
         max_width,
+        dtype: None,
     });
     let wall = began.elapsed().as_secs_f64();
 
