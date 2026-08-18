@@ -343,6 +343,43 @@ const HEAD_ACTIVATION_BUDGET: usize = 200_000_000;
 /// stack. At 1 GB and n_max=64/bf16, this allows ~60 genomes per chunk.
 const SPARSE_GATHER_BUDGET: usize = 1_000_000_000;
 
+/// Mask illegal actions and return the scores in **f32**.
+///
+/// The masking must happen in f32, never in the stack dtype. On CUDA the stack
+/// dtype is `F16`, whose maximum magnitude is 65504 — the `-1e9` sentinel
+/// overflows to `-inf` on the cast. The offset is then computed as
+/// `(1 - mask) * -inf`, and for every **legal** action `(1 - mask)` is `0`, so
+/// the multiply is `0 × -inf = NaN` by IEEE-754. One NaN per legal action
+/// poisons the entire score row.
+///
+/// The downstream consequence is silent and total: `argmax` over an all-NaN row
+/// returns index 0, so every policy degenerates into "always take the first
+/// legal action". It never melds, so it never meets §6's opening minimum, so
+/// both partnerships take the flat −300 of §13.3 and *every game ends level*.
+/// Fitness is uniformly zero, ES's gradient estimate is exactly zero, and
+/// training is a no-op while the logs still look healthy.
+///
+/// This never showed up on CPU (dtype `F32`, where `-1e9` is finite and
+/// `0 × -1e9 = 0`), and never showed up in the test suite, because every test
+/// path builds its stack through `single_genome_weights`, which hard-codes
+/// `DType::F32`. `F16` is reached only from `league::rollout_lockstep` — the
+/// production training path.
+///
+/// Doing the mask in f32 also costs nothing: the caller casts to f32 for the
+/// argmax on the very next line regardless.
+fn mask_illegal_f32(scores: &Tensor, mask_g: &Tensor) -> Tensor {
+    let scores = scores.to_dtype(DType::F32).unwrap();
+    let mask = mask_g.to_dtype(DType::F32).unwrap();
+    let ones = Tensor::ones_like(&mask).unwrap();
+    let inv_mask = ones.sub(&mask).unwrap();
+    let neg = Tensor::new(-1e9f32, scores.device())
+        .unwrap()
+        .broadcast_as(mask.shape())
+        .unwrap();
+    let neg_offset = inv_mask.mul(&neg).unwrap();
+    scores.broadcast_add(&neg_offset).unwrap()
+}
+
 fn dtype_size(dt: DType) -> usize {
     match dt {
         DType::BF16 | DType::F16 => 2,
@@ -1297,18 +1334,7 @@ fn forward_pass(
     drop(_h);
     #[cfg(feature = "profile")]
     let _m = profile::Span::new(&profile::FWD_MASK_NS);
-    // Mask illegal actions: scores + (1 - mask) * (-1e9), in the stack dtype.
-    let mask_dt = mask_g.to_dtype(dtype).unwrap();
-    let ones = Tensor::ones_like(&mask_dt).unwrap();
-    let inv_mask = ones.sub(&mask_dt).unwrap();
-    let neg = Tensor::new(-1e9f32, &stack.device)
-        .unwrap()
-        .to_dtype(dtype)
-        .unwrap()
-        .broadcast_as(mask_dt.shape())
-        .unwrap();
-    let neg_offset = inv_mask.mul(&neg).unwrap();
-    scores.broadcast_add(&neg_offset).unwrap()
+    mask_illegal_f32(&scores, mask_g)
 }
 
 /// The ES grouped-GEMM forward. trunk.0 is split into:
@@ -1449,18 +1475,7 @@ fn forward_pass_es(
     drop(_h);
     #[cfg(feature = "profile")]
     let _m = profile::Span::new(&profile::FWD_MASK_NS);
-    // Mask illegal actions (same as forward_pass).
-    let mask_dt = mask_g.to_dtype(dtype).unwrap();
-    let ones = Tensor::ones_like(&mask_dt).unwrap();
-    let inv_mask = ones.sub(&mask_dt).unwrap();
-    let neg = Tensor::new(-1e9f32, &stack.device)
-        .unwrap()
-        .to_dtype(dtype)
-        .unwrap()
-        .broadcast_as(mask_dt.shape())
-        .unwrap();
-    let neg_offset = inv_mask.mul(&neg).unwrap();
-    scores.broadcast_add(&neg_offset).unwrap()
+    mask_illegal_f32(&scores, mask_g)
 }
 
 /// The sparse forward through trunk + head. trunk.0 is replaced by the
@@ -1590,18 +1605,7 @@ fn forward_pass_sparse(
     drop(_h);
     #[cfg(feature = "profile")]
     let _m = profile::Span::new(&profile::FWD_MASK_NS);
-    // Mask illegal actions (same as forward_pass).
-    let mask_dt = mask_g.to_dtype(dtype).unwrap();
-    let ones = Tensor::ones_like(&mask_dt).unwrap();
-    let inv_mask = ones.sub(&mask_dt).unwrap();
-    let neg = Tensor::new(-1e9f32, &stack.device)
-        .unwrap()
-        .to_dtype(dtype)
-        .unwrap()
-        .broadcast_as(mask_dt.shape())
-        .unwrap();
-    let neg_offset = inv_mask.mul(&neg).unwrap();
-    scores.broadcast_add(&neg_offset).unwrap()
+    mask_illegal_f32(&scores, mask_g)
 }
 ///
 /// On CPU: an exact strict-`>` loop (matches numpy/torch first-max), so the

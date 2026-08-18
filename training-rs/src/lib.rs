@@ -7,7 +7,9 @@
 //! ## Architecture
 //!
 //! - `seedstream` — deterministic seed streams (SplitMix64, same as Python)
-//! - `elo` — ELO rating tracker
+//! - `elo` — ELO rating tracker (anchored evaluation only, not selection)
+//! - `fitness` — duplicate-deal paired score differentials (the ES selection
+//!   signal; see the module docs for why ELO does not belong here)
 //! - `genome` — flat genome ↔ weights JSON, arch definitions, random init
 //! - `hof` — hall of fame (archived champions used as fixed-reference
 //!   opponents in self-play and as frozen anchors for progress tracking)
@@ -24,6 +26,7 @@ pub mod anchors;
 pub mod elo;
 pub mod es;
 pub mod evaluate;
+pub mod fitness;
 pub mod genome;
 pub mod hof;
 pub mod league;

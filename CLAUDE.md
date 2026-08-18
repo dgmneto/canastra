@@ -161,6 +161,20 @@ special env. CUDA builds require MSVC + CUDA env flags (see below). All commands
 cargo test --test equivalence -- --nocapture
 ```
 
+The fitness signal must not be degenerate — this is what catches a forward pass that has
+silently collapsed to "always pick the first legal action" (see the f16 masking bug in
+`docs/decision-ranking-metric.md`). It runs on CPU by default; point it at the GPU to cover
+the production dtype:
+
+```bash
+cargo test --test fitness_signal
+```
+
+```powershell
+$env:FITNESS_SIGNAL_DEVICE="cuda"
+cargo test --release --features cuda --test fitness_signal -- --ignored --nocapture
+```
+
 ```bash
 cargo build --release && cargo clippy --all-targets -- -D warnings && cargo fmt --check
 ```
@@ -262,10 +276,13 @@ threads + `CpuRoster`) were removed after ES + lockstep won the benchmark — se
 `training-rs/docs/decision-ga-vs-es.md` for the reasoning and the historical numbers. The
 forward pass is the lockstep grouped matmul: every live row in a ply is gathered into a
 `[G, n_max, ...]` grid, one batched matmul per layer reads each genome's weights exactly once,
-and there is one sync point per ply (the argmax download). Weights are bf16 on CUDA, fp32 on
-CPU; argmax is done in fp32 (on CPU after download for GPU, to guarantee first-max
-tie-breaking matching numpy). `WeightStack::from_roster` builds the per-layer `[G, out, in]`
-tensors once per generation. **Scaling wall:** a transient f32→bf16 cast spike in
+and there is one sync point per ply (the argmax download). Weights are f16 on CUDA, fp32 on
+CPU; **action masking and argmax are both done in fp32** — masking in the f16 stack dtype
+overflowed the `-1e9` sentinel to `-inf` and made every legal action's score `0 × -inf = NaN`,
+silently collapsing all GPU play to "take the first legal action" (see
+`training-rs/docs/decision-ranking-metric.md`; `policy::mask_illegal_f32` is the fix and
+`tests/fitness_signal.rs` is the regression cover). `WeightStack::from_roster` builds the
+per-layer `[G, out, in]` tensors once per generation. **Scaling wall:** a transient f32→f16 cast spike in
 `from_roster` causes OOM near pop=2000 on 16 GB VRAM (see `training-rs/docs/task4-ksweep.md`
 Task 4a); the production config stays at pop=1000 (measured working). ES sidesteps the dense
 genome storage that gave GA its VRAM cliff — it stores only a base policy + `(seed, sigma)`
@@ -273,8 +290,23 @@ perturbations (~4.8 MB), materialising the population on demand. Validated again
 reference with 9 equivalence tests (`tests/equivalence.rs`): genome round-trip
 (byte-identical), forward pass (argmax 100%, logit diff 1.9e-5), single-game replay (100/100
 plies exact), ELO arithmetic (max-abs-diff 2.3e-13), self-determinism (0 diff across thread
-counts), and GPU-vs-CPU argmax (100%). 7 deterministic-path bugs found and fixed. Benchmarks
-(8 workers): pop=96 GPU 257 games/s (6.6x vs CPU), pop=1000 GPU 105 games/s (3.6x vs CPU).
+counts), and GPU-vs-CPU argmax (100%). 7 deterministic-path bugs found and fixed.
+
+**Selection signal.** ES fitness is the **paired duplicate-deal score differential**
+(`training-rs/src/fitness.rs`), not ELO: each deal is played in both seatings and the two are
+subtracted so the deal's luck cancels. Mirrored twins θ±σε share an opponent list
+(`league::schedule_pairings_mirrored`) so `f⁺ − f⁻` is a like-for-like comparison — the
+antithetic cancellation ES assumes. ELO is kept only for anchored evaluation (`anchors.rs`),
+where a rating accumulates against *frozen* opponents across generations; used as a
+per-generation selection signal it was reset each generation (pinning `elo_mean` to exactly
+1200), order-dependent, and margin-discarding, and ES rank-normalises away the one thing it
+added. Measured on an ES-shaped population, ELO's rank correlation plateaus at ~0.55 while the
+differential reaches 0.79. Reasoning, numbers and the f16 masking bug found along the way are
+in `training-rs/docs/decision-ranking-metric.md`. The masking bug was introduced by the
+`BF16 → F16` switch in commit `942bbc0` and is bounded by it: the "Phase 2" table in
+`docs/benchmarks.md` and any CUDA run made between that commit and the fix are void; all
+BF16-era numbers (Baseline, Phase 1b, `task4-ksweep.md`, `runs/es-smoke`) and every CPU run
+are fine.
 
 **The engine is a pure function.** `apply(&GameState, Seat, &Action) -> Result<GameState, RuleViolation>`
 never mutates its input. This is load-bearing, not stylistic: §6 requires a partnership's opening melds

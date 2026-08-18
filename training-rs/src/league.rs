@@ -38,21 +38,78 @@ pub fn schedule_pairings(
     let mut pairings = Vec::new();
     for me in 0..pop_size {
         let others: Vec<usize> = (0..pop_size).filter(|&i| i != me).collect();
-        let n = opponents.min(others.len());
-        let mut indices: Vec<usize> = (0..others.len()).collect();
-        for i in (1..indices.len()).rev() {
-            let j = (rng.gen::<u32>() as usize) % (i + 1);
-            indices.swap(i, j);
-        }
-        let mut chosen: Vec<usize> = indices[..n].iter().map(|&i| others[i]).collect();
-        if !hof.is_empty() && n > 0 {
-            chosen[n - 1] = pop_size + (rng.gen::<u32>() as usize) % hof.len();
-        }
-        for opp in chosen {
+        for opp in draw_opponents(&others, opponents, pop_size, hof, rng) {
             pairings.push((me, opp));
         }
     }
     pairings
+}
+
+/// Schedule pairings with **common random numbers across each mirrored pair**.
+///
+/// ES's gradient estimate is `Σⱼ (f⁺ⱼ − f⁻ⱼ) εⱼ`, so its variance is driven by
+/// `Var(f⁺ − f⁻)`. Every condition the twins *share* cancels out of that
+/// difference; every condition that differs survives as noise. `es.rs` claims
+/// this cancellation ("Mirrored sampling: the difference f⁺ − f⁻ cancels the
+/// bias of the base policy's own fitness"), but plain [`schedule_pairings`]
+/// draws a fresh opponent list for every genome, so the twins are measured
+/// against different opponents and the cancellation never happens — at σ=0.02
+/// the twins are near-identical policies and the opponent draw dominates the
+/// signal entirely.
+///
+/// Here genome `2j` and genome `2j+1` get the **same** opponent list. Combined
+/// with the shared deal seeds every pairing already uses, the only difference
+/// between the twins' conditions is the sign of `εⱼ` — which is exactly the
+/// quantity the gradient is trying to measure.
+///
+/// The opponent list excludes both twins, so neither plays itself and the pair
+/// is scheduled symmetrically.
+pub fn schedule_pairings_mirrored(
+    pop_size: usize,
+    opponents: usize,
+    hof: &HallOfFame,
+    rng: &mut StdRng,
+) -> Vec<Pairing> {
+    assert!(
+        pop_size.is_multiple_of(2),
+        "mirrored scheduling needs an even population (got {pop_size})"
+    );
+    let mut pairings = Vec::new();
+    for j in 0..pop_size / 2 {
+        let (plus, minus) = (2 * j, 2 * j + 1);
+        let others: Vec<usize> = (0..pop_size).filter(|&i| i != plus && i != minus).collect();
+        let chosen = draw_opponents(&others, opponents, pop_size, hof, rng);
+        for &opp in &chosen {
+            pairings.push((plus, opp));
+        }
+        for &opp in &chosen {
+            pairings.push((minus, opp));
+        }
+    }
+    pairings
+}
+
+/// Sample `opponents` distinct entries from `others`, reserving the last slot
+/// for a random hall-of-fame entry when the HOF is non-empty. HOF entries are
+/// addressed at roster indices `pop_size + k` (see [`batch_layout`]).
+fn draw_opponents(
+    others: &[usize],
+    opponents: usize,
+    pop_size: usize,
+    hof: &HallOfFame,
+    rng: &mut StdRng,
+) -> Vec<usize> {
+    let n = opponents.min(others.len());
+    let mut indices: Vec<usize> = (0..others.len()).collect();
+    for i in (1..indices.len()).rev() {
+        let j = (rng.gen::<u32>() as usize) % (i + 1);
+        indices.swap(i, j);
+    }
+    let mut chosen: Vec<usize> = indices[..n].iter().map(|&i| others[i]).collect();
+    if !hof.is_empty() && n > 0 {
+        chosen[n - 1] = pop_size + (rng.gen::<u32>() as usize) % hof.len();
+    }
+    chosen
 }
 
 pub fn batch_layout(
@@ -197,8 +254,12 @@ pub struct EvalInputs<'a> {
     pub max_width: usize,
 }
 
-/// Evaluate one generation: play all pairings, compute ELO updates.
-pub fn evaluate_generation(inputs: &EvalInputs<'_>, elo: &mut EloTracker) {
+/// Play one generation: every pairing, every deal, both seatings.
+///
+/// Returns results index-aligned with [`batch_layout`]'s game order
+/// (pairing-major, then seed, then seating), which is the alignment both
+/// [`crate::fitness::score_generation`] and [`elo_updates`] rely on.
+pub fn play_generation(inputs: &EvalInputs<'_>) -> Vec<MatchResult> {
     #[cfg(feature = "profile")]
     {
         profile::reset();
@@ -214,6 +275,7 @@ pub fn evaluate_generation(inputs: &EvalInputs<'_>, elo: &mut EloTracker) {
         max_width,
     } = inputs;
     let (roster, game_seeds, meta) = batch_layout(pop, hof, pairings, seeds);
+    let scheduled = meta.len();
 
     #[cfg(feature = "profile")]
     let _gen_wall = profile::Span::new(&profile::GEN_WALL_NS);
@@ -229,21 +291,57 @@ pub fn evaluate_generation(inputs: &EvalInputs<'_>, elo: &mut EloTracker) {
         profile::report(games);
     }
 
-    // Compute ELO updates.
-    let per_game = 2 * seeds.len();
-    let mut elo_results = Vec::new();
-    for (gidx, (_seed, scores, _winner, _hands, _unfinished)) in results.iter().enumerate() {
-        let pairing_idx = gidx / per_game;
-        let seating = gidx % 2;
-        let (ga_idx, gb_idx) = pairings[pairing_idx];
-        let result = if scores[0] == scores[1] {
-            0.5
-        } else if (scores[0] > scores[1]) == (seating == 0) {
-            1.0
-        } else {
-            0.0
-        };
-        elo_results.push((ga_idx, gb_idx, result));
-    }
-    elo.batch_update(&elo_results);
+    // `Pool::results` drops games that never finished, which would shift every
+    // downstream index by one and silently misattribute the rest of the
+    // generation. Every game is meant to terminate (match over, `max_hands`
+    // reached, or the action cap), so a short vector is a bug, not a case to
+    // absorb.
+    assert_eq!(
+        results.len(),
+        scheduled,
+        "rollout returned {} results for {scheduled} scheduled games; game→pairing \
+         attribution would be silently wrong",
+        results.len()
+    );
+
+    results
+}
+
+/// Fold one generation's results into ELO updates.
+///
+/// Retained for anchored evaluation and for the Python-equivalence tests, which
+/// pin this exact arithmetic and update order. **Not** the selection signal for
+/// ES — see [`crate::fitness`] for why, and for what replaced it.
+pub fn elo_updates(
+    results: &[MatchResult],
+    pairings: &[Pairing],
+    seeds_per_pairing: usize,
+) -> Vec<(usize, usize, f64)> {
+    let per_pairing = 2 * seeds_per_pairing;
+    results
+        .iter()
+        .enumerate()
+        .map(|(gidx, (_seed, scores, _winner, _hands, _unfinished))| {
+            let (ga_idx, gb_idx) = pairings[gidx / per_pairing];
+            let seating = gidx % 2;
+            let result = if scores[0] == scores[1] {
+                0.5
+            } else if (scores[0] > scores[1]) == (seating == 0) {
+                1.0
+            } else {
+                0.0
+            };
+            (ga_idx, gb_idx, result)
+        })
+        .collect()
+}
+
+/// Evaluate one generation and apply ELO updates.
+///
+/// Kept as the Python-equivalence entry point (`tests/equivalence.rs` pins its
+/// output against `gen_elo_after.json`). Training uses [`play_generation`] plus
+/// [`crate::fitness::score_generation`].
+pub fn evaluate_generation(inputs: &EvalInputs<'_>, elo: &mut EloTracker) {
+    let results = play_generation(inputs);
+    elo.batch_update(&elo_updates(&results, inputs.pairings, inputs.seeds.len()));
 }

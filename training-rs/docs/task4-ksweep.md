@@ -1,5 +1,24 @@
 # Task 4 — K sweep + rank correlation
 
+> **Superseded in part — see [decision-ranking-metric.md](decision-ranking-metric.md).**
+>
+> **The recommendation to keep ELO was measured in the wrong regime.** This
+> sweep ranked a population of *independent random genomes*, where ρ≈0.85 and
+> the choice of metric barely matters. Training ranks an ES population, where
+> every genome is θ±σε off one base and therefore near-identical. Re-measured
+> there, ELO's ρ falls to 0.39–0.56 and plateaus at ~0.55 regardless of K, while
+> the paired duplicate-deal differential reaches 0.79 and is still climbing.
+>
+> The caveat at the end of "Recommendation" — that this "may change as genomes
+> differentiate" — was right to hedge but pointed the wrong way: ES *converges*
+> genomes by construction, and near-identical genomes are the hard case for a
+> ranking signal, not the easy one.
+>
+> The measurements themselves stand. They were taken with BF16 on CUDA, before
+> the F16 switch that introduced the masking bug described in
+> `decision-ranking-metric.md`, so this page's throughput figures and the Task 4a
+> VRAM diagnosis are unaffected.
+
 ## Method
 
 `canastra-ksweep` bin: runs the same population three times with different deal

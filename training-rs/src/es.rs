@@ -132,6 +132,14 @@ impl ESState {
     ///
     /// Mirrored sampling: the difference f⁺ − f⁻ cancels the bias of the
     /// base policy's own fitness, leaving only the directional derivative.
+    ///
+    /// That cancellation is only real if the twins were *measured under the
+    /// same conditions* — anything that differs between their evaluations
+    /// survives into the difference as noise. Schedule them with
+    /// [`crate::league::schedule_pairings_mirrored`], which gives pair `j` a
+    /// single opponent list shared by both twins; plain `schedule_pairings`
+    /// draws opponents independently per genome and leaves the opponent draw
+    /// dominating the signal at small σ.
     pub fn update(&mut self, fitness: &[f64], cfg: &ESConfig) {
         let n = self.perturbation_seeds.len();
         assert_eq!(

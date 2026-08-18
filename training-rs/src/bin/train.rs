@@ -1,6 +1,7 @@
 use canastra_train::anchors::AnchorSet;
 use canastra_train::elo::EloTracker;
 use canastra_train::es::{self, ESConfig, ESState};
+use canastra_train::fitness;
 use canastra_train::genome::{self, TRAINING_ARCH};
 use canastra_train::hof::HallOfFame;
 use canastra_train::league;
@@ -120,23 +121,6 @@ fn log_generation(run_dir: &std::path::Path, record: &serde_json::Value) {
     }
 }
 
-/// Compute fitness distribution stats from ELO ratings.
-fn fitness_stats(ratings: &[f64]) -> serde_json::Value {
-    let mut sorted: Vec<f64> = ratings.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let n = sorted.len();
-    let pct = |p: usize| sorted[(p * n / 100).min(n - 1)];
-    serde_json::json!({
-        "min": sorted[0],
-        "p25": pct(25),
-        "median": pct(50),
-        "p75": pct(75),
-        "p95": pct(95),
-        "max": sorted[n - 1],
-        "mean": sorted.iter().sum::<f64>() / n as f64,
-    })
-}
-
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let arch = &TRAINING_ARCH;
@@ -200,68 +184,63 @@ fn main() -> anyhow::Result<()> {
         let mut gen_rng =
             StdRng::seed_from_u64(seedstream::splitmix64(args.run_seed + generation as u64));
         let gen_seeds = seedstream::generation_seeds(args.run_seed, generation, args.seeds);
-        let pairings = league::schedule_pairings(pop_size, args.opponents, &hof, &mut gen_rng);
-        let mut elo = EloTracker::new(pop_size);
-        // Grow ELO to include HOF entries (schedule_pairings may assign HOF
-        // opponents at indices ≥ pop_size).
-        if !hof.is_empty() {
-            elo.grow(hof.len(), None);
-        }
+        // Mirrored twins share an opponent list, so `f⁺ − f⁻` compares θ+σε and
+        // θ−σε under identical conditions — the antithetic cancellation ES
+        // assumes. See `league::schedule_pairings_mirrored`.
+        let pairings =
+            league::schedule_pairings_mirrored(pop_size, args.opponents, &hof, &mut gen_rng);
 
-        league::evaluate_generation(
-            &league::EvalInputs {
-                pop: &pop,
-                hof: &hof,
-                pairings: &pairings,
-                arch,
-                seeds: &gen_seeds,
-                max_hands,
-                device: &device,
-                max_width,
-            },
-            &mut elo,
-        );
+        let results = league::play_generation(&league::EvalInputs {
+            pop: &pop,
+            hof: &hof,
+            pairings: &pairings,
+            arch,
+            seeds: &gen_seeds,
+            max_hands,
+            device: &device,
+            max_width,
+        });
 
-        // Extract fitness from ELO ratings.
-        let fitness: Vec<f64> = elo.ratings[..pop_size].to_vec();
+        // Fitness = mean duplicate-deal score differential. Antisymmetric, so
+        // the population mean sits near zero by construction.
+        let report =
+            fitness::score_generation(&results, &pairings, gen_seeds.len(), pop_size + hof.len());
+        let fitness: Vec<f64> = report.fitness[..pop_size].to_vec();
 
-        // Find champion (highest ELO).
+        // Throughput is the league's, not the whole generation's — the anchor
+        // evaluation below plays its own games, which `games` does not count.
+        let league_wall = began.elapsed().as_secs_f64();
+
         let champion = fitness
             .iter()
             .enumerate()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
             .map(|(i, _)| i)
             .unwrap_or(0);
-        let elo_best = fitness[champion];
-        let elo_mean = fitness.iter().sum::<f64>() / pop_size as f64;
+        let fit_best = fitness[champion];
+        let fit_mean = fitness.iter().sum::<f64>() / pop_size as f64;
+        let win_best = report.win_rate[champion];
         let sigma = es_state.sigma;
 
-        let improved = elo_best > best_ever;
-        if improved {
-            best_ever = elo_best;
-        }
-
-        // ES update: rank-normalised fitness → gradient estimate → Adam.
-        es_state.update(&fitness, &es_cfg);
-
-        let wall = began.elapsed().as_secs_f64();
-        println!(
-            "gen {}: best {:.1} mean {:.1} sigma {:.4} ({:.1}s){}",
-            generation,
-            elo_best,
-            elo_mean,
-            sigma,
-            wall,
-            if improved { "  new best-ever" } else { "" }
-        );
-
-        // Log to generations.jsonl.
-        let games = pop_size * args.opponents * args.seeds * 2;
-
-        // Anchored evaluation.
+        // Anchored evaluation — the *only* cross-generation progress metric.
+        // Within-generation fitness cannot play that role: it is antisymmetric
+        // (its population mean is zero by construction) and re-measured against
+        // a fresh population each generation, so it tracks how much the twins
+        // differ, not how strong they are. The old `elo_best` had exactly the
+        // same defect.
+        //
+        // Rated on the base policy θ, not on `pop[champion]`. θ is the policy
+        // actually being trained; the highest-fitness perturbation is an
+        // ephemeral probe whose lead is mostly noise, and rating a different
+        // random perturbation every generation would inject that noise straight
+        // into the one clean signal. This is the same reasoning the freeze site
+        // below already applied — the two now agree.
+        //
+        // Run *before* `es_state.update`, so "generation N's anchor rating" is
+        // the θ that produced generation N's population.
         let anchor_report = if args.anchor_interval > 0 && generation % args.anchor_interval == 0 {
             let report = anchors.evaluate(
-                &pop[champion],
+                &es_state.base_params,
                 arch,
                 &anchor_seeds,
                 &device,
@@ -274,28 +253,67 @@ fn main() -> anyhow::Result<()> {
             None
         };
 
-        // Freeze the base policy as an anchor (NOT the perturbed champion).
-        // For ES, the base policy θ is the actual policy being trained; the
-        // "champion" (highest-ELO perturbation) is an ephemeral probe whose
-        // advantage is mostly noise. Freezing it would pollute the anchor set
-        // with random perturbations rather than tracking real progress.
+        // "Improved" means the anchor rating reached a new high — a claim about
+        // absolute strength. Generations without an anchor evaluation make no
+        // claim either way.
+        let improved = anchor_report.is_some() && anchors.champion_rating > best_ever;
+        if improved {
+            best_ever = anchors.champion_rating;
+        }
+
+        // ES update: rank-normalised fitness → gradient estimate → Adam.
+        es_state.update(&fitness, &es_cfg);
+
+        let wall = began.elapsed().as_secs_f64();
+        println!(
+            "gen {}: best {:+.1} pts (win {:.0}%) spread {:.1} sigma {:.4} ({:.1}s){}",
+            generation,
+            fit_best,
+            win_best * 100.0,
+            report.mean_abs_diff,
+            sigma,
+            wall,
+            if improved { "  new best-ever" } else { "" }
+        );
+
+        // Log to generations.jsonl.
+        let games = pop_size * args.opponents * args.seeds * 2;
+
+        // Freeze the base policy as an anchor. A frozen anchor's rating must be
+        // on the *anchor* scale, so later champions rated against it inherit a
+        // comparable number; the old code froze it at the internal self-play
+        // ELO, a scale that reset every generation.
         if args.anchor_freeze_interval > 0
             && generation > 0
             && generation % args.anchor_freeze_interval == 0
         {
-            anchors.add_champion(&es_state.base_params, elo_best, generation);
+            let frozen_at = anchors.champion_rating;
+            anchors.add_champion(&es_state.base_params, frozen_at, generation);
         }
 
         let record = serde_json::json!({
             "gen": generation,
             "wall_s": wall,
             "games": games,
-            "games_s": games as f64 / wall,
-            "decisions_s": games as f64 * 200.0 / wall,
-            "fitness": fitness_stats(&fitness),
-            "elo_best": elo_best,
-            "elo_mean": elo_mean,
+            // League games only, over the league's own wall time — `wall`
+            // additionally covers the anchor evaluation and the Adam step.
+            "league_wall_s": league_wall,
+            "games_s": games as f64 / league_wall,
+            // Not measured: a fixed 200 plies/game assumption, so this is
+            // games_s × 200 and carries no information games_s doesn't. Kept
+            // only because existing logs have the field.
+            "decisions_s": games as f64 * 200.0 / league_wall,
+            // Fitness is the mean duplicate-deal score differential, in points.
+            "fitness": fitness::fitness_stats(&fitness),
+            "fitness_best": fit_best,
+            "fitness_mean": fit_mean,
+            "win_rate_best": win_best,
+            // Mean |paired differential| — the scale of the signal. Collapsing
+            // toward zero means the population has stopped differentiating.
+            "signal_spread": report.mean_abs_diff,
             "sigma": sigma,
+            // `improved` / `best_ever` are on the anchor rating scale, the only
+            // one comparable across generations.
             "improved": improved,
             "best_ever": best_ever,
             "optimiser": "es",
@@ -311,9 +329,10 @@ fn main() -> anyhow::Result<()> {
             let _ = genome::save_json(path.to_str().unwrap(), arch, &es_state.base_params);
         }
 
-        // HOF.
+        // HOF. Archived with the anchor rating, which is the only figure on a
+        // scale that stays comparable across generations.
         if generation % es_cfg.hof_interval == 0 {
-            hof.archive(&es_state.base_params, elo_best, generation);
+            hof.archive(&es_state.base_params, anchors.champion_rating, generation);
         }
 
         // Checkpoint (atomic, with rotation).

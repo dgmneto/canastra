@@ -1,5 +1,22 @@
 # Benchmarks
 
+> **The "Phase 2 — u8 transfer + F16 dtype" table below is void.** Its speedups
+> are the f16 masking bug, not work done. See
+> [decision-ranking-metric.md](decision-ranking-metric.md).
+>
+> Switching `DType::BF16` → `DType::F16` also changed what the `-1e9` masking
+> sentinel does. BF16 carries f32's exponent range, so `-1e9` is finite there
+> and `(1 - mask) * -1e9` is `0` for legal actions. F16 tops out at 65504, so
+> the sentinel overflows to `-inf` and the offset becomes `0 × -inf = NaN` for
+> every *legal* action. Every score row went NaN, argmax returned index 0, and
+> every policy collapsed to "take the first legal action": no melds, no opening,
+> both partnerships at §13.3's flat −300, every hand over almost immediately.
+> The 3.6–3.9x "speedup" is games ending instantly.
+>
+> **Earlier sections are unaffected** — Baseline and Phase 1b were measured with
+> BF16, before the switch, as were `task4-ksweep.md` and `runs/es-smoke`. CPU
+> figures were never affected (dtype `F32`).
+
 Population sweep: `opponents=4 seeds=8 max_hands=1 workers=8`, CUDA build, RTX
 5060 Ti. One generation per run via `canastra-bench`. Wall time and games/s as
 reported by the bench. Re-run after every phase that touches the rollout.
@@ -58,7 +75,16 @@ point." Criterion 2 (≥10x transfer reduction) is met via the width cap alone
 (3.2 GB → 800 MB on the dominant tensor). Criterion 1 (≥15 GB/s H2D) is not
 achievable on this hardware (Gen 3 x8 caps at ~8 GB/s).
 
-## Phase 2 — u8 transfer + F16 dtype (uncommitted)
+## Phase 2 — u8 transfer + F16 dtype — **TABLE VOID, RE-MEASURE**
+
+> The F16 switch broke action masking (`-1e9` → `-inf` → `0 × -inf = NaN`), so
+> every game below ended instantly at −300 to −300. The table times degenerate
+> games. The masking is fixed (`policy::mask_illegal_f32`) and
+> `tests/fitness_signal.rs` guards it, but **these rows have not been
+> re-measured**. Note the reasoning recorded below — "the F16 path's correctness
+> is verified by the existing forward-pass test (CPU F32 vs Python) and the GPU
+> BF16 vs CPU agreement test" — names the gap exactly: neither test exercises
+> F16. The u8 transfer change is independent and unaffected.
 
 Two changes applied on top of Phase 1b:
 

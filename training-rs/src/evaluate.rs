@@ -1,4 +1,14 @@
-//! Duplicate-deal paired evaluation.
+//! Duplicate-deal paired evaluation: play two genomes head to head over a set
+//! of deals, each deal in both seatings, and report the mean point differential
+//! with a 95% CI.
+//!
+//! **Currently unused.** It computes the same paired differential that
+//! [`crate::fitness`] now uses as the ES selection signal — the idea was
+//! already here in Rust while the training loop was ranking on ELO. The two are
+//! kept separate because they have different shapes: this owns a rollout and is
+//! an A/B tool for two specific genomes; `fitness` is a pure fold over a whole
+//! generation's results. `mean_diff` here and `fitness` there are in the same
+//! unit (mean points per game), so they can be read against each other.
 
 use crate::genome::{Arch, Genome};
 use crate::policy::{forward_picks, WeightStack};
