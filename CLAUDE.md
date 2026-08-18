@@ -23,12 +23,15 @@ Three planned components:
    `engine/crates/canastra-encode`, which both the wasm bindings and the Python harness bind.
    **`training-rs/`** is a pure-Rust port of the Python training pipeline — no PyO3, no Python
    runtime, `candle-core` instead of PyTorch. Validated against the Python reference with 9
-   equivalence tests (genome round-trip, forward pass, single-game replay, ELO arithmetic, elite
-   selection, mutation distribution, self-determinism, GPU-vs-CPU argmax). CUDA builds on RTX 5060
-   Ti (Blackwell sm_120, CUDA 13.3). 7 deterministic-path bugs found and fixed. GPU forward path
-   reworked for population scaling (shared GpuServer, CpuRoster, row-batching). Benchmarks: 6.6x
-   speedup at pop=96, 3.6x at pop=1000 vs CPU. See `training-rs/tests/equivalence.rs` and
-   `training-rs/tests/reference/` for the test harness and reference data.
+   equivalence tests (genome round-trip, forward pass, single-game replay, ELO arithmetic,
+   self-determinism, GPU-vs-CPU argmax). CUDA builds on RTX 5060 Ti (Blackwell sm_120, CUDA
+   13.3). 7 deterministic-path bugs found and fixed. **Productionized to a single path: ES
+   optimiser + lockstep rollout** (the GA optimiser and coalesced rollout were removed after
+   ES/lockstep won the benchmark — see `training-rs/docs/decision-ga-vs-es.md`). The lockstep
+   forward is measured to pop=1000 (422 games/s on this card); a documented VRAM spike in
+   `WeightStack::from_roster` near pop=2000 is the scaling wall a future larger run would hit.
+   See `training-rs/tests/equivalence.rs` and `training-rs/tests/reference/` for the test
+   harness and reference data.
 3. **Web app** — lets people play Canastra against each other or against a bot. **Built (MVP).**
    `server/` holds the real engine and the one global table; `web/` is two pages: the game client
    at `/` (thin — no wasm, no rules, renders what the server sends) and the engine sandbox at
@@ -253,19 +256,25 @@ generations — see [training/README.md](training/README.md).
 
 `training-rs/` is a pure-Rust port of the Python pipeline — no PyO3, no Python runtime,
 `candle-core` (0.11) instead of PyTorch. It reuses `canastra-engine` and `canastra-encode`
-directly. The forward pass has three paths: `forward_scores` (chunked, for `WeightStack`),
-`forward_scores_roster` (lazy per-chunk uploads for `CpuRoster`), and `forward_picks` (row-batched,
-for the shared GpuServer fast path). The GpuServer is one thread, one cached weight stack, shared
-by all workers via `Arc<Mutex<Sender>>` — eliminates the 4x GPU memory duplication of the
-per-worker design. Argmax is done on CPU after downloading scores to guarantee first-max
-tie-breaking (matching numpy) on both CPU and GPU. `CpuRoster` keeps genomes on CPU and builds
-small GPU chunks per forward for populations >2000. Validated against the Python reference with 9
-equivalence tests (`tests/equivalence.rs`): genome round-trip (byte-identical), forward pass
-(argmax 100%, logit diff 1.9e-5), single-game replay (100/100 plies exact), ELO arithmetic
-(max-abs-diff 2.3e-13), elite selection (exact), mutation distribution (KS test), self-determinism
-(0 diff across thread counts), and GPU-vs-CPU argmax (100%). 7 deterministic-path bugs found and
-fixed. Benchmarks (8 workers): pop=96 GPU 257 games/s (6.6x vs CPU), pop=1000 GPU 105 games/s
-(3.6x vs CPU).
+directly. **Productionized to a single path: ES optimiser + lockstep rollout.** The GA
+optimiser (elitism/tournament/mutation) and the coalesced rollout (`GpuServer` + N worker
+threads + `CpuRoster`) were removed after ES + lockstep won the benchmark — see
+`training-rs/docs/decision-ga-vs-es.md` for the reasoning and the historical numbers. The
+forward pass is the lockstep grouped matmul: every live row in a ply is gathered into a
+`[G, n_max, ...]` grid, one batched matmul per layer reads each genome's weights exactly once,
+and there is one sync point per ply (the argmax download). Weights are bf16 on CUDA, fp32 on
+CPU; argmax is done in fp32 (on CPU after download for GPU, to guarantee first-max
+tie-breaking matching numpy). `WeightStack::from_roster` builds the per-layer `[G, out, in]`
+tensors once per generation. **Scaling wall:** a transient f32→bf16 cast spike in
+`from_roster` causes OOM near pop=2000 on 16 GB VRAM (see `training-rs/docs/task4-ksweep.md`
+Task 4a); the production config stays at pop=1000 (measured working). ES sidesteps the dense
+genome storage that gave GA its VRAM cliff — it stores only a base policy + `(seed, sigma)`
+perturbations (~4.8 MB), materialising the population on demand. Validated against the Python
+reference with 9 equivalence tests (`tests/equivalence.rs`): genome round-trip
+(byte-identical), forward pass (argmax 100%, logit diff 1.9e-5), single-game replay (100/100
+plies exact), ELO arithmetic (max-abs-diff 2.3e-13), self-determinism (0 diff across thread
+counts), and GPU-vs-CPU argmax (100%). 7 deterministic-path bugs found and fixed. Benchmarks
+(8 workers): pop=96 GPU 257 games/s (6.6x vs CPU), pop=1000 GPU 105 games/s (3.6x vs CPU).
 
 **The engine is a pure function.** `apply(&GameState, Seat, &Action) -> Result<GameState, RuleViolation>`
 never mutates its input. This is load-bearing, not stylistic: §6 requires a partnership's opening melds

@@ -115,13 +115,26 @@ impl Game {
 }
 
 /// One batched ply's encode output: observation/action/mask/row arrays.
+/// The legal actions per row are held by `Pool::menus` (read by `apply`),
+/// not duplicated here — cloning them every ply was pure waste (at pop=500
+/// the menus are ~11 MB/ply, ~2.3 GB of allocation churn per generation).
+///
+/// Both `obs` and `acts` are **100% binary** (one-hot/thermometer/bits —
+/// verified in `task3a-sparsity.md`). Storing as u8 cuts H2D transfer volume
+/// 4x with zero precision loss; the forward path casts device-side via
+/// `to_dtype` (u8→bf16 on CUDA, u8→f32 on CPU).
+///
+/// In addition to the full `obs` (kept for the dense test path), the sparse
+/// split (`obs_sparse_idx` + `obs_dense`) is produced for the embedding-bag
+/// training path — see `src/sparse.rs`.
 pub struct EncodedPly {
-    pub obs: Vec<f32>,             // [N, OBS_DIM] row-major
-    pub acts: Vec<f32>,            // [N, width, ACT_DIM] row-major
+    pub obs: Vec<u8>,              // [N, OBS_DIM] row-major, binary (dense path)
+    pub obs_sparse_idx: Vec<u32>,  // [N, MAX_NNZ] sparse local indices, padded with 1925
+    pub obs_dense: Vec<u8>,        // [N, DENSE_WIDTH] dense feature values, binary
+    pub acts: Vec<u8>,             // [N, width, ACT_DIM] row-major, binary
     pub mask: Vec<bool>,           // [N, width]
     pub rows: Vec<(usize, usize)>, // (game_index, seat) per row
     pub width: usize,
-    pub menus: Vec<Vec<Action>>, // the legal actions per row (for apply)
 }
 
 /// The batched game pool — owns N engines, drives them a ply at a time.
@@ -212,11 +225,14 @@ impl Pool {
         let n_rows = self.pending.len();
         let width = self.menus_iter_max(&menus).max().unwrap_or(1).max(1);
 
-        let mut obs = vec![0.0f32; n_rows * OBS_DIM];
-        let mut acts = vec![0.0f32; n_rows * width * ACT_DIM];
+        let mut obs = vec![0u8; n_rows * OBS_DIM];
+        let mut acts = vec![0u8; n_rows * width * ACT_DIM];
         let mut mask = vec![false; n_rows * width];
 
-        // Encode in parallel (no GIL!).
+        // Encode in parallel (no GIL!). Each thread reuses an f32 scratch
+        // buffer (the encoder API requires &mut [f32]); the binary result is
+        // cast to u8 into the big buffers, keeping the H2D transfer at 1 byte
+        // per feature instead of 4.
         let pending = self.pending.clone();
         let menus_ref = &menus;
         let games: &[Game] = &self.games;
@@ -228,28 +244,44 @@ impl Pool {
             .par_iter()
             .enumerate()
             .zip(menus_ref.par_iter())
-            .map(|((row, &game), menu)| {
-                let view = observe(&games[game].state, games[game].state.turn);
-                // SAFETY: each row's range is unique to this closure.
-                unsafe {
-                    let obs_row = std::slice::from_raw_parts_mut(
-                        (obs_ptr as *mut f32).add(row * OBS_DIM),
-                        OBS_DIM,
-                    );
-                    let acts_row = std::slice::from_raw_parts_mut(
-                        (acts_ptr as *mut f32).add(row * width * ACT_DIM),
-                        width * ACT_DIM,
-                    );
-                    let mask_row = std::slice::from_raw_parts_mut(
-                        (mask_ptr as *mut bool).add(row * width),
-                        width,
-                    );
-                    encode_observation(&view, obs_row);
-                    encode_actions(&view, menu, &mut acts_row[..menu.len() * ACT_DIM]);
-                    mask_row[..menu.len()].fill(true);
-                }
-                (game, games[game].state.turn.index())
-            })
+            .map_with(
+                (
+                    Vec::<f32>::with_capacity(OBS_DIM),
+                    Vec::<f32>::with_capacity(64 * ACT_DIM),
+                ),
+                |(obs_f32, acts_f32), ((row, &game), menu)| {
+                    let view = observe(&games[game].state, games[game].state.turn);
+                    obs_f32.clear();
+                    obs_f32.resize(OBS_DIM, 0.0);
+                    acts_f32.clear();
+                    acts_f32.resize(menu.len() * ACT_DIM, 0.0);
+                    encode_observation(&view, obs_f32);
+                    encode_actions(&view, menu, acts_f32);
+                    // SAFETY: each row's range is unique to this closure.
+                    unsafe {
+                        let obs_row = std::slice::from_raw_parts_mut(
+                            (obs_ptr as *mut u8).add(row * OBS_DIM),
+                            OBS_DIM,
+                        );
+                        for (i, &v) in obs_f32.iter().enumerate() {
+                            obs_row[i] = v as u8;
+                        }
+                        let acts_row = std::slice::from_raw_parts_mut(
+                            (acts_ptr as *mut u8).add(row * width * ACT_DIM),
+                            width * ACT_DIM,
+                        );
+                        for (i, &v) in acts_f32.iter().enumerate() {
+                            acts_row[i] = v as u8;
+                        }
+                        let mask_row = std::slice::from_raw_parts_mut(
+                            (mask_ptr as *mut bool).add(row * width),
+                            width,
+                        );
+                        mask_row[..menu.len()].fill(true);
+                    }
+                    (game, games[game].state.turn.index())
+                },
+            )
             .collect();
 
         self.menus = menus;
@@ -257,11 +289,12 @@ impl Pool {
 
         EncodedPly {
             obs,
+            obs_sparse_idx: Vec::new(),
+            obs_dense: Vec::new(),
             acts,
             mask,
             rows,
             width,
-            menus: self.menus.clone(),
         }
     }
 
@@ -303,6 +336,13 @@ impl Pool {
 
     pub fn results(&self) -> Vec<MatchResult> {
         self.games.iter().filter_map(|g| g.result).collect()
+    }
+
+    /// The legal actions per row from the last `encode()` call. Read-only
+    /// accessor for tests that need to inspect the menu (e.g. width-cap
+    /// diversity checks). `apply()` consumes these by index.
+    pub fn menus(&self) -> &[Vec<Action>] {
+        &self.menus
     }
 
     fn menus_iter_max<'a>(&self, menus: &'a [Vec<Action>]) -> impl Iterator<Item = usize> + 'a {

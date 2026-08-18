@@ -1,60 +1,33 @@
-//! Self-play league: batched pairings and the ply driver.
+//! Self-play league: batched pairings and the lockstep ply driver.
 //!
-//! Two rollout paths:
+//! One rollout path: **lockstep**. A single `Pool` drives all games in
+//! lockstep — one forward per ply, weights read once per present genome, one
+//! sync point per ply. No channels, no mutex, no worker threads. The coalesced
+//! GpuServer+workers path was removed (it lost the benchmark at the production
+//! population; see `docs/decision-ga-vs-es.md`).
 //!
-//! - **lockstep** (default for pop ≤ 500): a single `Pool` drives all games in
-//!   lockstep. One forward per ply, weights read once per present genome, one
-//!   sync point per ply. No channels, no mutex, no worker threads. Best when the
-//!   per-ply batch fits comfortably in VRAM and the grouped matmul is efficient.
-//!
-//! - **coalesced** (default for pop > 500): a `GpuServer` thread caches the full
-//!   weight stack on the device; N worker threads each drive a slice of games,
-//!   submitting forward requests through a channel. Encode/apply overlaps with
-//!   GPU computation. Best when the population is large enough that the lockstep
-//!   per-ply transfer volume dominates.
-//!
-//! Both paths share the same `forward_picks`, `schedule_pairings`, `batch_layout`,
-//! and ELO computation.
+//! **Scaling note:** lockstep was measured up to pop=1000 (422 games/s,
+//! `docs/benchmarks.md`). A transient f32→bf16 cast spike in
+//! `WeightStack::from_roster` causes OOM near pop=2000 on 16 GB VRAM
+//! (`docs/task4-ksweep.md` Task 4a). The production config stays at pop=1000;
+//! a future run targeting pop>2000 would need a coalesced/stream-overlap path
+//! restored (or the f32→bf16 upload de-spiked) — see
+//! `docs/decision-ga-vs-es.md`.
 
 use crate::elo::EloTracker;
-use crate::ga::HallOfFame;
 use crate::genome::{Arch, Genome};
-use crate::policy::{forward_picks, CpuRoster, WeightStack};
-use crate::pool::{EncodedPly, MatchResult, Pool};
+use crate::hof::HallOfFame;
+use crate::policy::{forward_picks, WeightStack};
+use crate::pool::{MatchResult, Pool};
 use candle_core::{DType, Device, Tensor};
 use rand::rngs::StdRng;
 use rand::Rng;
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
-use std::thread;
 
 #[cfg(feature = "profile")]
 use crate::profile;
 
 type Pairing = (usize, usize);
 type GameMeta = (usize, usize, usize);
-
-/// Which rollout path to use.
-#[derive(Clone, Copy, Debug)]
-pub enum Rollout {
-    Lockstep,
-    Coalesced,
-}
-
-impl Rollout {
-    /// Default selection per population size: lockstep for small populations
-    /// (where the per-ply batch is small), coalesced for large (where the
-    /// lockstep's transfer volume and lost encode/apply overlap dominate).
-    /// This heuristic is temporary — once one path dominates everywhere, the
-    /// flag goes away.
-    pub fn default_for(pop: usize) -> Self {
-        if pop <= 500 {
-            Rollout::Lockstep
-        } else {
-            Rollout::Coalesced
-        }
-    }
-}
 
 pub fn schedule_pairings(
     pop_size: usize,
@@ -116,23 +89,6 @@ pub fn rollout_lockstep_public(
     rollout_lockstep(roster, arch, game_seeds, meta, max_hands, device, max_width)
 }
 
-/// Public wrapper for the coalesced rollout (used by anchored evaluation).
-#[allow(clippy::too_many_arguments)]
-pub fn rollout_coalesced_public(
-    roster: &[Genome],
-    arch: &Arch,
-    game_seeds: Vec<u64>,
-    meta: Vec<GameMeta>,
-    max_hands: Option<u32>,
-    device: &Device,
-    n_workers: usize,
-    max_width: usize,
-) -> Vec<MatchResult> {
-    rollout_coalesced(
-        roster, arch, game_seeds, meta, max_hands, device, n_workers, max_width,
-    )
-}
-
 /// Drive all games in lockstep with a single `Pool`. One forward per ply.
 fn rollout_lockstep(
     roster: &[Genome],
@@ -144,7 +100,7 @@ fn rollout_lockstep(
     max_width: usize,
 ) -> Vec<MatchResult> {
     let dtype = match device {
-        Device::Cuda(_) => DType::BF16,
+        Device::Cuda(_) => DType::F16,
         _ => DType::F32,
     };
     let roster_refs: Vec<&Genome> = roster.iter().collect();
@@ -184,15 +140,19 @@ fn rollout_lockstep(
 
         #[cfg(feature = "profile")]
         let _h2d = profile::Span::new(&profile::SRV_H2D_NS);
+        // Both obs and acts are 100% binary (verified in `task3a-sparsity.md`).
+        // Upload as u8 (1 byte/feature) and cast device-side via `to_dtype` in
+        // the forward — 4x transfer-volume cut with zero precision loss.
         let obs = Tensor::from_vec(encoded.obs, (n_rows, obs_dim), device)
             .unwrap_or_else(|e| panic!("obs tensor: {e}"));
         let acts = Tensor::from_vec(encoded.acts, (n_rows, encoded.width, act_dim), device)
             .unwrap_or_else(|e| panic!("acts tensor: {e}"));
+        // Mask is also binary — upload as u8, cast device-side.
         let mask = Tensor::from_vec(
             encoded
                 .mask
                 .iter()
-                .map(|&v| if v { 1u32 } else { 0u32 })
+                .map(|&v| if v { 1u8 } else { 0u8 })
                 .collect::<Vec<_>>(),
             (n_rows, encoded.width),
             device,
@@ -223,249 +183,6 @@ fn rollout_lockstep(
     pool.results()
 }
 
-// ── Coalesced rollout: GpuServer + N worker threads ──────────────────────
-
-/// One forward request from a worker to the GPU server.
-struct GpuRequest {
-    obs: Vec<f32>,
-    acts: Vec<f32>,
-    mask: Vec<bool>,
-    width: usize,
-    genome_idx: Vec<usize>,
-    response_tx: mpsc::Sender<Vec<usize>>,
-}
-
-/// The coalesced GPU server: ONE thread, ONE cached weight stack, shared by
-/// all workers via `Arc<GpuServer>`. Workers submit forward requests through
-/// a `Mutex<Sender>` and block on a per-request response channel — the GPU
-/// processes them serially in one CUDA context.
-pub struct GpuServer {
-    tx: Arc<Mutex<Option<mpsc::Sender<GpuRequest>>>>,
-    _handle: Option<thread::JoinHandle<()>>,
-}
-
-impl GpuServer {
-    pub fn new(roster: Arc<CpuRoster>, device: Device, obs_dim: usize, act_dim: usize) -> Self {
-        let (tx, rx) = mpsc::channel::<GpuRequest>();
-        let tx = Arc::new(Mutex::new(Some(tx)));
-        let tx_clone = tx.clone();
-        let handle = thread::spawn(move || {
-            let n_genomes = roster.n_genomes();
-            let cached_stack: Option<WeightStack> = if n_genomes <= 2000 {
-                let all: Vec<usize> = (0..n_genomes).collect();
-                roster.build_chunk(&all, &device).ok()
-            } else {
-                None
-            };
-
-            loop {
-                #[cfg(feature = "profile")]
-                let _idle = profile::Span::new(&profile::SRV_IDLE_NS);
-                let req = match rx.recv() {
-                    Ok(r) => r,
-                    Err(_) => break,
-                };
-                #[cfg(feature = "profile")]
-                drop(_idle);
-
-                let n_rows = req.obs.len() / obs_dim;
-                if n_rows == 0 {
-                    let _ = req.response_tx.send(Vec::new());
-                    continue;
-                }
-
-                #[cfg(feature = "profile")]
-                {
-                    profile::SRV_REQS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    profile::SRV_ROWS
-                        .fetch_add(n_rows as u64, std::sync::atomic::Ordering::Relaxed);
-                }
-
-                #[cfg(feature = "profile")]
-                let _h2d = profile::Span::new(&profile::SRV_H2D_NS);
-                let obs = Tensor::from_vec(req.obs, (n_rows, obs_dim), &device)
-                    .unwrap_or_else(|e| panic!("obs tensor: {e}"));
-                let acts = Tensor::from_vec(req.acts, (n_rows, req.width, act_dim), &device)
-                    .unwrap_or_else(|e| panic!("acts tensor: {e}"));
-                let mask = Tensor::from_vec(
-                    req.mask
-                        .iter()
-                        .map(|&v| if v { 1u32 } else { 0u32 })
-                        .collect::<Vec<_>>(),
-                    (n_rows, req.width),
-                    &device,
-                )
-                .unwrap_or_else(|e| panic!("mask tensor: {e}"));
-                #[cfg(feature = "profile")]
-                drop(_h2d);
-
-                #[cfg(feature = "profile")]
-                let _gpu = profile::Span::new(&profile::SRV_GPU_NS);
-                let picks = if let Some(ref stack) = cached_stack {
-                    forward_picks(stack, &obs, &acts, &mask, &req.genome_idx)
-                } else {
-                    // Fallback: build a chunk from the roster for present genomes.
-                    let mut present_set = vec![false; n_genomes];
-                    for &g in &req.genome_idx {
-                        present_set[g] = true;
-                    }
-                    let present: Vec<usize> = (0..n_genomes).filter(|&g| present_set[g]).collect();
-                    let stack = roster.build_chunk(&present, &device).unwrap();
-                    forward_picks(&stack, &obs, &acts, &mask, &req.genome_idx)
-                };
-                #[cfg(feature = "profile")]
-                drop(_gpu);
-                let _ = req.response_tx.send(picks);
-            }
-        });
-        GpuServer {
-            tx: tx_clone,
-            _handle: Some(handle),
-        }
-    }
-
-    pub fn forward(&self, encoded: EncodedPly, genome_idx: Vec<usize>) -> Vec<usize> {
-        let (r_tx, r_rx) = mpsc::channel();
-        let req = GpuRequest {
-            obs: encoded.obs,
-            acts: encoded.acts,
-            mask: encoded.mask,
-            width: encoded.width,
-            genome_idx,
-            response_tx: r_tx,
-        };
-        let guard = self.tx.lock().unwrap();
-        guard
-            .as_ref()
-            .expect("forward after shutdown")
-            .send(req)
-            .unwrap();
-        drop(guard);
-        r_rx.recv().unwrap()
-    }
-
-    pub fn shutdown(&self) {
-        self.tx.lock().unwrap().take();
-    }
-}
-
-impl Drop for GpuServer {
-    fn drop(&mut self) {
-        self.tx.lock().unwrap().take();
-        if let Some(h) = self._handle.take() {
-            let _ = h.join();
-        }
-    }
-}
-
-/// Drive a pool with a shared GpuServer. Each worker runs: encode → submit to
-/// GPU → apply, in a loop. The GpuServer processes forward requests serially
-/// in one CUDA context; workers overlap encode/apply (pure CPU) with the GPU
-/// forward.
-fn drive_worker(
-    gpu: Arc<GpuServer>,
-    game_seeds: Vec<u64>,
-    meta: Vec<GameMeta>,
-    max_hands: Option<u32>,
-    max_width: usize,
-) -> Vec<MatchResult> {
-    let mut pool = Pool::with_max_width(game_seeds, None, max_hands, max_width);
-
-    while pool.has_live() {
-        #[cfg(feature = "profile")]
-        profile::WKR_PLIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        #[cfg(feature = "profile")]
-        let _enc = profile::Span::new(&profile::WKR_ENCODE_NS);
-        let encoded = pool.encode();
-        #[cfg(feature = "profile")]
-        drop(_enc);
-
-        let genome_idx: Vec<usize> = encoded
-            .rows
-            .iter()
-            .map(|&(game_idx, seat)| {
-                let (a, b, seating) = meta[game_idx];
-                if (seat % 2 == 0) == (seating == 0) {
-                    a
-                } else {
-                    b
-                }
-            })
-            .collect();
-
-        #[cfg(feature = "profile")]
-        let _fwd = profile::Span::new(&profile::WKR_FWD_NS);
-        let picks = gpu.forward(encoded, genome_idx);
-        #[cfg(feature = "profile")]
-        drop(_fwd);
-
-        #[cfg(feature = "profile")]
-        let _app = profile::Span::new(&profile::WKR_APPLY_NS);
-        let _ = pool.apply(&picks);
-        #[cfg(feature = "profile")]
-        drop(_app);
-    }
-
-    pool.results()
-}
-
-/// The coalesced driver: ONE GpuServer, N worker threads. Results are returned
-/// in **global game order** (index 0..n_games).
-#[allow(clippy::too_many_arguments)]
-fn rollout_coalesced(
-    roster: &[Genome],
-    arch: &Arch,
-    game_seeds: Vec<u64>,
-    meta: Vec<GameMeta>,
-    max_hands: Option<u32>,
-    device: &Device,
-    n_workers: usize,
-    max_width: usize,
-) -> Vec<MatchResult> {
-    let n_games = game_seeds.len();
-    let n_workers = n_workers.min(n_games);
-
-    let cpu_roster = Arc::new(CpuRoster::new(roster.to_vec(), arch.clone()));
-    let gpu = Arc::new(GpuServer::new(
-        cpu_roster,
-        device.clone(),
-        arch.obs,
-        arch.act,
-    ));
-
-    let mut worker_data: Vec<(Vec<u64>, Vec<GameMeta>, Vec<usize>)> = Vec::new();
-    for wid in 0..n_workers {
-        let indices: Vec<usize> = (wid..n_games).step_by(n_workers).collect();
-        let seeds: Vec<u64> = indices.iter().map(|&i| game_seeds[i]).collect();
-        let meta_slice: Vec<GameMeta> = indices.iter().map(|&i| meta[i]).collect();
-        worker_data.push((seeds, meta_slice, indices));
-    }
-
-    let mut handles = Vec::new();
-    for (seeds, meta_slice, indices) in worker_data {
-        let gpu = gpu.clone();
-        let handle = thread::spawn(move || {
-            let results = drive_worker(gpu, seeds, meta_slice, max_hands, max_width);
-            (indices, results)
-        });
-        handles.push(handle);
-    }
-
-    let mut by_global: Vec<Option<MatchResult>> = vec![None; n_games];
-    for h in handles {
-        let (indices, results) = h.join().expect("worker panicked");
-        for (local_i, &global_i) in indices.iter().enumerate() {
-            by_global[global_i] = Some(results[local_i]);
-        }
-    }
-
-    by_global
-        .into_iter()
-        .map(|opt| opt.expect("coalesced driver lost a game"))
-        .collect()
-}
-
 /// Immutable inputs to one generation's evaluation.
 pub struct EvalInputs<'a> {
     pub pop: &'a [Genome],
@@ -475,8 +192,6 @@ pub struct EvalInputs<'a> {
     pub seeds: &'a [u64],
     pub max_hands: Option<u32>,
     pub device: &'a Device,
-    pub n_workers: usize,
-    pub rollout: Rollout,
     /// Cap on legal actions per row (menu width). usize::MAX = no cap.
     /// Cuts the acts tensor transfer volume at peak plies.
     pub max_width: usize,
@@ -496,8 +211,6 @@ pub fn evaluate_generation(inputs: &EvalInputs<'_>, elo: &mut EloTracker) {
         seeds,
         max_hands,
         device,
-        n_workers,
-        rollout,
         max_width,
     } = inputs;
     let (roster, game_seeds, meta) = batch_layout(pop, hof, pairings, seeds);
@@ -505,14 +218,9 @@ pub fn evaluate_generation(inputs: &EvalInputs<'_>, elo: &mut EloTracker) {
     #[cfg(feature = "profile")]
     let _gen_wall = profile::Span::new(&profile::GEN_WALL_NS);
 
-    let results = match rollout {
-        Rollout::Lockstep => rollout_lockstep(
-            &roster, arch, game_seeds, &meta, *max_hands, device, *max_width,
-        ),
-        Rollout::Coalesced => rollout_coalesced(
-            &roster, arch, game_seeds, meta, *max_hands, device, *n_workers, *max_width,
-        ),
-    };
+    let results = rollout_lockstep(
+        &roster, arch, game_seeds, &meta, *max_hands, device, *max_width,
+    );
 
     #[cfg(feature = "profile")]
     {

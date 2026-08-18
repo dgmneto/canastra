@@ -10,9 +10,9 @@
 //! Run: `cargo test --test equivalence -- --nocapture`
 
 use canastra_train::elo::EloTracker;
-use canastra_train::ga::{self, GAConfig, HallOfFame};
 use canastra_train::genome::{self, TRAINING_ARCH};
-use canastra_train::league::{self, Rollout};
+use canastra_train::hof::HallOfFame;
+use canastra_train::league;
 use canastra_train::policy::{forward_scores, single_genome_weights};
 use canastra_train::pool::Pool;
 use canastra_train::seedstream;
@@ -445,8 +445,6 @@ fn elo_arithmetic_matches_python() {
             seeds: &gen_seeds,
             max_hands: Some(1),
             device: &device,
-            n_workers: 1,
-            rollout: Rollout::Lockstep,
             max_width: usize::MAX,
         },
         &mut elo,
@@ -472,114 +470,11 @@ fn elo_arithmetic_matches_python() {
     );
 }
 
-// ─── Test 5: Elite selection (Standard 1 — EXACT) ──────────────────────────
-//
-// Elitism is deterministic: sort by ELO descending, take the top N. Both
-// Python (np.argsort[::-1]) and Rust (sort_by partial_cmp) must agree.
-
-#[test]
-fn elite_selection_matches_python() {
-    let ref_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(REF_DIR);
-    let population = 8usize;
-    let elites = 2usize;
-
-    let py_elo_after: Vec<f64> =
-        serde_json::from_str(&fs::read_to_string(ref_dir.join("gen_elo_after.json")).unwrap())
-            .unwrap();
-    let py_elites: Vec<usize> =
-        serde_json::from_str(&fs::read_to_string(ref_dir.join("gen_elites.json")).unwrap())
-            .unwrap();
-
-    // Replicate Python's np.argsort(elo)[::-1][:elites] in Rust.
-    let mut order: Vec<usize> = (0..population).collect();
-    order.sort_by(|&a, &b| py_elo_after[b].partial_cmp(&py_elo_after[a]).unwrap());
-    let rust_elites: Vec<usize> = order[..elites].to_vec();
-
-    println!("elites: rust={:?} py={:?}", rust_elites, py_elites);
-    assert_eq!(
-        rust_elites, py_elites,
-        "elite selection diverged (Standard 1, EXACT required)"
-    );
-}
-
-// ─── Test 6: Mutation distribution (Standard 3 — STATISTICAL) ─────────────
-//
-// Draw 100k+ mutation deltas from Rust's Gaussian mutation code. Check:
-// - mean ~ 0
-// - stddev == configured sigma
-// - KS test against Normal(0, sigma)
-//
-// We do NOT match Python's exact samples (numpy uses a different RNG).
-// What matters is the distribution and parameters.
-
-#[test]
-fn mutation_distribution_matches_normal() {
-    let sigma = 0.02f64;
-    let n = 100_000usize;
-    let mut rng = StdRng::seed_from_u64(999);
-
-    // Replicate the mutation code from ga.rs::next_generation.
-    let mut deltas = Vec::with_capacity(n);
-    for _ in 0..n {
-        let u1 = (rng.gen::<u32>() as f64 / u32::MAX as f64).max(1e-10);
-        let u2 = rng.gen::<u32>() as f64 / u32::MAX as f64;
-        let r = (-2.0 * u1.ln()).sqrt();
-        let theta = 2.0 * std::f64::consts::PI * u2;
-        let noise = r * theta.cos() * sigma;
-        deltas.push(noise);
-    }
-
-    // Mean ~ 0 (within 3*sigma/sqrt(n) = 3*0.02/sqrt(100k) ≈ 0.00019)
-    let mean = deltas.iter().sum::<f64>() / n as f64;
-    let mean_se = sigma / (n as f64).sqrt();
-    println!("mutation: mean = {mean:e} (expected 0, SE = {mean_se:e})");
-    assert!(
-        mean.abs() < 5.0 * mean_se,
-        "mutation mean {mean:e} is > 5 SE from 0"
-    );
-
-    // Stddev == sigma (within ~0.5% for 100k samples)
-    let variance: f64 = deltas.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / (n - 1) as f64;
-    let stddev = variance.sqrt();
-    println!("mutation: stddev = {stddev:.6} (expected {sigma:.6})");
-    assert!(
-        (stddev - sigma).abs() / sigma < 0.01,
-        "mutation stddev {stddev:.6} deviates from sigma {sigma:.6} by > 1%"
-    );
-
-    // KS test against Normal(0, sigma): sort, compare to theoretical CDF.
-    deltas.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let mut max_ks = 0.0f64;
-    for (i, &d) in deltas.iter().enumerate() {
-        let empirical = (i as f64 + 1.0) / n as f64;
-        // Normal CDF: 0.5 * (1 + erf(d / (sigma * sqrt(2))))
-        let z = d / (sigma * 2.0f64.sqrt());
-        let theoretical = 0.5 * (1.0 + erf_approx(z));
-        max_ks = max_ks.max((empirical - theoretical).abs());
-    }
-    // KS critical value for alpha=0.01, n=100k: 1.628/sqrt(n) ≈ 0.00515
-    let ks_crit = 1.628 / (n as f64).sqrt();
-    println!("mutation: KS statistic = {max_ks:.6} (critical at 0.01 = {ks_crit:.6})");
-    assert!(
-        max_ks < ks_crit,
-        "mutation KS statistic {max_ks:.6} exceeds 0.01 critical value {ks_crit:.6}"
-    );
-}
-
-/// Abramowitz and Stegun approximation of erf (7.1.26), accurate to ~1e-7.
-fn erf_approx(x: f64) -> f64 {
-    let sign = if x < 0.0 { -1.0 } else { 1.0 };
-    let x = x.abs();
-    let a1 = 0.254829592;
-    let a2 = -0.284496736;
-    let a3 = 1.421413741;
-    let a4 = -1.453152027;
-    let a5 = 1.061405429;
-    let p = 0.3275911;
-    let t = 1.0 / (1.0 + p * x);
-    let y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * (-x * x).exp();
-    sign * y
-}
+// GA-specific tests (elite selection, mutation distribution, GA checkpoint
+// resume) were removed when the GA optimiser was deleted (see
+// `docs/decision-ga-vs-es.md`). The ES checkpoint round-trip is covered by
+// `es_checkpoint_round_trips` in `src/es.rs`. The mutation distribution is
+// exercised end-to-end by the ES perturbation tests there.
 
 // ─── Test 8 (CUDA only): GPU forward pass matches CPU ─────────────────────
 //
@@ -685,8 +580,12 @@ fn gpu_forward_pass_matches_cpu_argmax() {
 }
 //
 // Run the same generation twice with different RAYON_NUM_THREADS and diff
-// every output: match results, ELO ratings, evolved population. Must be
-// identical regardless of thread count.
+// Run the same generation twice with different RAYON_NUM_THREADS and diff
+// every output: ELO ratings must be identical regardless of thread count.
+// (The GA version diffed the evolved population too; with GA gone, the
+// league evaluation + ELO is the only state worth checking for thread-count
+// determinism. ES determinism is covered by `es_checkpoint_round_trips` in
+// `src/es.rs`.)
 
 #[test]
 fn generation_is_self_deterministic_across_thread_counts() {
@@ -695,15 +594,6 @@ fn generation_is_self_deterministic_across_thread_counts() {
     let opponents = 2usize;
     let n_seeds = 2usize;
     let run_seed = 7u64;
-    let cfg = GAConfig {
-        population,
-        elites: 2,
-        tournament: 4,
-        sigma: 0.02,
-        sigma_decay: 0.995,
-        sigma_floor: 0.002,
-        hof_interval: 5,
-    };
 
     // Load the initial population from Python's dump (fixed reference).
     let pop_np = read_npy(&ref_dir.join("gen_pop.npy"));
@@ -716,11 +606,11 @@ fn generation_is_self_deterministic_across_thread_counts() {
     let device = Device::Cpu;
     let gen_seeds = seedstream::generation_seeds(run_seed, 0, n_seeds);
 
-    // The worker/channel architecture is gone: a single `Pool` drives all games
-    // in lockstep with rayon-parallel encode/apply. Self-determinism now means
-    // the same run is identical regardless of the *rayon* thread count, so we
-    // install a custom thread pool per run and verify bit-identical output.
-    let run = |n_threads: usize| -> (Vec<Vec<f32>>, Vec<f64>) {
+    // A single `Pool` drives all games in lockstep with rayon-parallel
+    // encode/apply. Self-determinism means the same run is identical
+    // regardless of the rayon thread count, so we install a custom thread pool
+    // per run and verify bit-identical ELO output.
+    let run = |n_threads: usize| -> Vec<f64> {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(n_threads)
             .build()
@@ -741,21 +631,17 @@ fn generation_is_self_deterministic_across_thread_counts() {
                     seeds: &gen_seeds,
                     max_hands: Some(1),
                     device: &device,
-                    n_workers: n_threads,
-                    rollout: Rollout::Lockstep,
                     max_width: usize::MAX,
                 },
                 &mut elo,
             );
 
-            let (next_pop, next_elo) =
-                ga::next_generation(&pop, &elo.ratings[..population], &cfg, 0, &mut gen_rng);
-            (next_pop, next_elo)
+            elo.ratings[..population].to_vec()
         })
     };
 
-    let (pop1, elo1) = run(1);
-    let (pop8, elo8) = run(8);
+    let elo1 = run(1);
+    let elo8 = run(8);
 
     // Diff ELO ratings.
     let mut elo_max_diff = 0.0f64;
@@ -764,28 +650,6 @@ fn generation_is_self_deterministic_across_thread_counts() {
     }
     println!("self-determinism: ELO max-abs-diff (1 vs 8 rayon threads) = {elo_max_diff:e}");
     assert_eq!(elo1, elo8, "ELO ratings differ across thread counts");
-
-    // Diff evolved population (bit-identical f32).
-    let mut pop_max_diff = 0.0f32;
-    let mut mismatches = 0usize;
-    for (a, b) in pop1.iter().zip(pop8.iter()) {
-        for (va, vb) in a.iter().zip(b.iter()) {
-            let d = (va - vb).abs();
-            if d > pop_max_diff {
-                pop_max_diff = d;
-            }
-            if d != 0.0 {
-                mismatches += 1;
-            }
-        }
-    }
-    println!(
-        "self-determinism: pop max-abs-diff (1 vs 8 rayon threads) = {pop_max_diff:e}, {mismatches} mismatches"
-    );
-    assert_eq!(
-        pop1, pop8,
-        "evolved population differs across thread counts"
-    );
 }
 
 // ─── Width cap property test ───────────────────────────────────────────────
@@ -814,9 +678,9 @@ fn width_cap_does_not_break_game_completion() {
                 break;
             }
             // Pick a random action from the (possibly truncated) menu.
-            let pick =
-                (rng.gen::<u32>() as usize) % encoded.width.min(encoded.menus[0].len().max(1));
-            let _ = pool.apply(&[pick.min(encoded.menus[0].len().saturating_sub(1))]);
+            let menus = pool.menus();
+            let pick = (rng.gen::<u32>() as usize) % encoded.width.min(menus[0].len().max(1));
+            let _ = pool.apply(&[pick.min(menus[0].len().saturating_sub(1))]);
         }
         let results = pool.results();
         if results.is_empty() {
@@ -859,7 +723,7 @@ fn width_cap_preserves_discard_or_end_turn() {
             }
             // Check: if the menu was truncated (original would be > 8),
             // it must still contain a Discard or EndTurnWithoutDiscard.
-            let menu = &encoded.menus[0];
+            let menu = &pool.menus()[0];
             if menu.len() == 8 {
                 // Might have been truncated — check for Discard/EndTurn.
                 let has_discard = menu.iter().any(|a| matches!(a, Action::Discard { .. }));
@@ -887,128 +751,11 @@ fn width_cap_preserves_discard_or_end_turn() {
     // in the test above.)
 }
 
-// ─── Resume test: checkpoint round-trip is bit-identical ──────────────────
-//
-// Run 4 generations; run 2 + save checkpoint + resume + 2; assert the final
-// population and ELO are bit-identical. This verifies that the checkpoint
-// format captures everything needed for a deterministic resume.
-
-#[test]
-fn checkpoint_resume_produces_identical_results() {
-    let population = 8usize;
-    let opponents = 2usize;
-    let n_seeds = 2usize;
-    let run_seed = 7u64;
-    let cfg = GAConfig {
-        population,
-        elites: 2,
-        tournament: 4,
-        sigma: 0.02,
-        sigma_decay: 0.995,
-        sigma_floor: 0.002,
-        hof_interval: 5,
-    };
-    let device = Device::Cpu;
-    let gen_seeds = |gen: u32| seedstream::generation_seeds(run_seed, gen, n_seeds);
-
-    let run = |gens: std::ops::Range<u32>,
-               pop: Vec<Vec<f32>>,
-               hof: HallOfFame,
-               elo_ratings: Vec<f64>|
-     -> (Vec<Vec<f32>>, Vec<f64>, HallOfFame) {
-        let mut pop = pop;
-        let mut hof = hof;
-        let mut elo = EloTracker::from_ratings(elo_ratings);
-        for generation in gens {
-            let mut gen_rng =
-                StdRng::seed_from_u64(seedstream::splitmix64(run_seed + generation as u64));
-            let pairings = league::schedule_pairings(population, opponents, &hof, &mut gen_rng);
-            league::evaluate_generation(
-                &league::EvalInputs {
-                    pop: &pop,
-                    hof: &hof,
-                    pairings: &pairings,
-                    arch: &TRAINING_ARCH,
-                    seeds: &gen_seeds(generation),
-                    max_hands: Some(1),
-                    device: &device,
-                    n_workers: 1,
-                    rollout: Rollout::Lockstep,
-                    max_width: usize::MAX,
-                },
-                &mut elo,
-            );
-            let champ = elo.ratings[..population]
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-            if generation % cfg.hof_interval == 0 {
-                hof.archive(&pop[champ], elo.ratings[champ], generation);
-                elo.grow(1, None);
-                *elo.ratings.last_mut().unwrap() = elo.ratings[champ];
-            }
-            let (next_pop, next_elo) = ga::next_generation(
-                &pop,
-                &elo.ratings[..population],
-                &cfg,
-                generation,
-                &mut gen_rng,
-            );
-            pop = next_pop;
-            elo.ratings[..population].copy_from_slice(&next_elo);
-        }
-        (pop, elo.ratings, hof)
-    };
-
-    // Full run: 4 generations from scratch.
-    let pop0 = ga::initial_population(&TRAINING_ARCH, &cfg, run_seed);
-    let elo0 = vec![1200.0f64; population];
-    let (full_pop, full_elo, _full_hof) = run(0..4, pop0.clone(), HallOfFame::new(), elo0.clone());
-
-    // Partial run: 2 generations, then checkpoint.
-    let (part_pop, part_elo, part_hof) = run(0..2, pop0, HallOfFame::new(), elo0);
-    let tmp = std::env::temp_dir().join("canastra_resume_test");
-    let _ = std::fs::remove_dir_all(&tmp);
-    let _ = ga::save_checkpoint(
-        &tmp,
-        1,
-        &part_pop,
-        &EloTracker::from_ratings(part_elo.clone()),
-        &part_hof,
-        &gen_seeds(1),
-    );
-
-    // Resume: load checkpoint, run 2 more.
-    let (_gen, loaded_pop, loaded_elo, _seeds, loaded_hof) = ga::load_checkpoint(&tmp).unwrap();
-    let (resume_pop, resume_elo, _resume_hof) = run(2..4, loaded_pop, loaded_hof, loaded_elo);
-    let _ = std::fs::remove_dir_all(&tmp);
-
-    // Compare — must be bit-identical.
-    let mut elo_max_diff = 0.0f64;
-    for (a, b) in full_elo.iter().zip(resume_elo.iter()) {
-        elo_max_diff = elo_max_diff.max((a - b).abs());
-    }
-    println!("resume test: ELO max-abs-diff = {elo_max_diff:e}");
-    assert_eq!(full_elo, resume_elo, "ELO ratings differ after resume");
-
-    let mut pop_max_diff = 0.0f32;
-    let mut mismatches = 0usize;
-    for (a, b) in full_pop.iter().zip(resume_pop.iter()) {
-        for (va, vb) in a.iter().zip(b.iter()) {
-            let d = (va - vb).abs();
-            if d > pop_max_diff {
-                pop_max_diff = d;
-            }
-            if d != 0.0 {
-                mismatches += 1;
-            }
-        }
-    }
-    println!("resume test: pop max-abs-diff = {pop_max_diff:e}, {mismatches} mismatches");
-    assert_eq!(full_pop, resume_pop, "population differs after resume");
-}
+// The GA resume round-trip test was removed with the GA optimiser (see
+// `docs/decision-ga-vs-es.md`). The ES checkpoint round-trip — which verifies
+// bit-identical resume of base params, Adam moments, perturbation seeds,
+// sigma, HOF, and generation counter — is covered by
+// `es_checkpoint_round_trips` in `src/es.rs`.
 
 // ─── Smoke test: anchored evaluation produces a report ────────────────────
 
@@ -1027,7 +774,6 @@ fn anchored_evaluation_produces_report() {
         &TRAINING_ARCH,
         &seeds,
         &device,
-        Rollout::Lockstep,
         usize::MAX,
         Some(1),
     );
@@ -1058,7 +804,6 @@ fn anchored_evaluation_produces_report() {
         &TRAINING_ARCH,
         &seeds,
         &device,
-        Rollout::Lockstep,
         usize::MAX,
         Some(1),
     );

@@ -1,8 +1,8 @@
 //! K-sweep benchmark: measure wall/gen, decisions/s, and rank correlation
 //! at different games-per-genome (K) values.
 //!
-//! K = opponents × seeds × 2 (2 for seat swap). The current default is
-//! K=64 (opponents=4, seeds=8). The sweep tests K ∈ {64, 128, 256, 512}.
+//! K = opponents × seeds × 2 (2 for seat swap). The default is K=64
+//! (opponents=4, seeds=8). The sweep tests K ∈ {64, 128, 256, 512}.
 //!
 //! Rank correlation: run the same population twice with different deal seeds,
 //! compute Spearman's ρ of the ELO rankings. High ρ means the fitness signal
@@ -12,9 +12,9 @@
 //!   target\release\canastra-ksweep.exe --population 96 --device cuda
 
 use canastra_train::elo::EloTracker;
-use canastra_train::ga::{self, GAConfig};
-use canastra_train::genome::TRAINING_ARCH;
-use canastra_train::league::{self, Rollout};
+use canastra_train::genome::{self, TRAINING_ARCH};
+use canastra_train::hof::HallOfFame;
+use canastra_train::league;
 use canastra_train::seedstream;
 use candle_core::Device;
 use clap::Parser;
@@ -34,10 +34,6 @@ struct Args {
     #[arg(long, default_value = "cuda")]
     device: String,
 
-    /// Rollout path: "auto", "lockstep", or "coalesced".
-    #[arg(long, default_value = "auto")]
-    rollout: String,
-
     /// Max legal actions per row (menu width cap). 0 = no cap.
     #[arg(long, default_value = "64")]
     max_width: usize,
@@ -50,12 +46,8 @@ struct Args {
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let arch = &TRAINING_ARCH;
-    let cfg = GAConfig {
-        population: args.population,
-        ..Default::default()
-    };
-    let pop = ga::initial_population(arch, &cfg, 7);
-    let hof = ga::HallOfFame::new();
+    let pop = genome::random_population(arch, args.population, 7);
+    let hof = HallOfFame::new();
 
     let device = match args.device.as_str() {
         "cuda" => Device::new_cuda(0).unwrap_or(Device::Cpu),
@@ -65,11 +57,6 @@ fn main() -> anyhow::Result<()> {
         "cuda"
     } else {
         "cpu"
-    };
-    let rollout = match args.rollout.as_str() {
-        "lockstep" => Rollout::Lockstep,
-        "coalesced" => Rollout::Coalesced,
-        _ => Rollout::default_for(args.population),
     };
 
     // Parse K values.
@@ -82,16 +69,15 @@ fn main() -> anyhow::Result<()> {
     // For each K, decompose into opponents × seeds. Use opponents=4 fixed,
     // vary seeds. K = opponents * seeds * 2.
     let opponents = 4usize;
+    let max_width = if args.max_width == 0 {
+        usize::MAX
+    } else {
+        args.max_width
+    };
 
     eprintln!(
-        "K-sweep: pop={} device={} rollout={} max_width={}",
-        args.population,
-        device_label,
-        match rollout {
-            Rollout::Lockstep => "lockstep",
-            Rollout::Coalesced => "coalesced",
-        },
-        args.max_width
+        "K-sweep: pop={} device={} max_width={}",
+        args.population, device_label, args.max_width
     );
     eprintln!(
         "{:>6} {:>8} {:>8} {:>10} {:>12} {:>10} {:>10}",
@@ -122,13 +108,7 @@ fn main() -> anyhow::Result<()> {
                 seeds: &gen_seeds1,
                 max_hands: Some(1),
                 device: &device,
-                n_workers: 8,
-                rollout,
-                max_width: if args.max_width == 0 {
-                    usize::MAX
-                } else {
-                    args.max_width
-                },
+                max_width,
             },
             &mut elo1,
         );
@@ -154,13 +134,7 @@ fn main() -> anyhow::Result<()> {
                 seeds: &gen_seeds2,
                 max_hands: Some(1),
                 device: &device,
-                n_workers: 8,
-                rollout,
-                max_width: if args.max_width == 0 {
-                    usize::MAX
-                } else {
-                    args.max_width
-                },
+                max_width,
             },
             &mut elo2,
         );
@@ -181,13 +155,7 @@ fn main() -> anyhow::Result<()> {
                 seeds: &gen_seeds3,
                 max_hands: Some(1),
                 device: &device,
-                n_workers: 8,
-                rollout,
-                max_width: if args.max_width == 0 {
-                    usize::MAX
-                } else {
-                    args.max_width
-                },
+                max_width,
             },
             &mut elo3,
         );

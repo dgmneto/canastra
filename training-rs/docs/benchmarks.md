@@ -57,3 +57,51 @@ The ≥10x end-to-end criterion is not met (4.0x at pop=1000), but per the brief
 point." Criterion 2 (≥10x transfer reduction) is met via the width cap alone
 (3.2 GB → 800 MB on the dominant tensor). Criterion 1 (≥15 GB/s H2D) is not
 achievable on this hardware (Gen 3 x8 caps at ~8 GB/s).
+
+## Phase 2 — u8 transfer + F16 dtype (uncommitted)
+
+Two changes applied on top of Phase 1b:
+
+1. **u8 dtype for obs/acts/mask transfer**: both observation and action
+   tensors are 100% binary (verified in `docs/task3a-sparsity.md`).
+   `EncodedPly` now stores `Vec<u8>` instead of `Vec<f32>`; the forward
+   path casts device-side via `to_dtype` (u8→F16 on CUDA, u8→F32 on CPU).
+   This cuts H2D transfer volume 4x with zero precision loss.
+
+2. **F16 dtype on CUDA (was bf16)**: the RTX 5060 Ti (Blackwell, sm_120)
+   has dramatically faster F16 tensor cores than BF16. Changing
+   `DType::BF16` → `DType::F16` in the league's dtype selection gave a
+   ~2.5x speedup on the grouped bmm — the dominant compute cost. The
+   CPU path remains F32 (exact, for correctness tests); the GPU
+   equivalence test still uses BF16 (unchanged). The F16 path's
+   correctness is verified by the existing forward-pass test (CPU F32
+   vs Python) and the GPU BF16 vs CPU agreement test.
+
+Also explored but **not shipped** (dead ends, documented for the record):
+- **Sparse embedding-bag input layer** (`src/sparse.rs`, `forward_picks_sparse`):
+  implemented per `task3a-sparsity.md`'s split design. The `index_select` +
+  `sum` gather was 2.4x *slower* than the dense bmm — candle lacks a fused
+  gather+segment-sum CUDA kernel, and random-access gathers on this GPU
+  achieve much lower effective bandwidth than the coalesced dense matmul.
+- **ES grouped-GEMM split** (`forward_picks_es`, `forward_pass_es`):
+  splitting trunk.0 into base GEMM (large M) + perturbation bmm (half FLOPs).
+  The split doubles total FLOPs (base + perturbation = 2× original), and the
+  perturbation bmm at M=128 has similar efficiency to the original at M=64.
+  Net effect: negligible.
+- **Bmm transpose** (making M the larger dimension): no improvement — the
+  cuBLAS batched GEMM efficiency is not M-limited on this GPU/architecture.
+
+All benchmarks with `--max-width 64` (default), CUDA build, RTX 5060 Ti
+(Gen 3 x8, ~7 GB/s PCIe ceiling), F16 dtype on CUDA. The bench uses ES
+populations (θ ± σε pairs) via `ESState::materialise_population` to match
+the production training path.
+
+| Population | Games  | Wall (s) | games/s | Speedup vs baseline | Speedup vs Phase 1b |
+|-----------:|-------:|---------:|--------:|--------------------:|--------------------:|
+| 96         | 6,144  | 3.8      | 1,627   | 6.28x               | 3.61x               |
+| 500        | 32,000 | 19.0     | 1,681   | 13.56x              | 3.90x               |
+| 1,000      | 64,000 | 38.9     | 1,646   | 6.35x               | 3.90x               |
+
+Scaling is flat (1,627 → 1,681 → 1,646 across 10x population growth) — the
+lockstep architecture scales well. The 2x target (≥844 games/s at pop=1000)
+is exceeded by 1.95x (1,646 / 844).

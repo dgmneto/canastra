@@ -1,7 +1,8 @@
 use canastra_train::elo::EloTracker;
-use canastra_train::ga::{self, GAConfig};
-use canastra_train::genome::TRAINING_ARCH;
-use canastra_train::league::{self, Rollout};
+use canastra_train::es::{ESConfig, ESState};
+use canastra_train::genome::{self, TRAINING_ARCH};
+use canastra_train::hof::HallOfFame;
+use canastra_train::league;
 use candle_core::Device;
 use clap::Parser;
 use rand::rngs::StdRng;
@@ -10,7 +11,7 @@ use std::time::Instant;
 
 #[derive(Parser)]
 #[command(name = "canastra-bench")]
-#[command(about = "Benchmark one GA generation")]
+#[command(about = "Benchmark one generation (lockstep)")]
 struct Args {
     /// Population size.
     #[arg(long, default_value = "96")]
@@ -24,17 +25,9 @@ struct Args {
     #[arg(long, default_value = "8")]
     seeds: usize,
 
-    /// Worker threads.
-    #[arg(long, default_value = "8")]
-    workers: usize,
-
     /// Device: "cuda" or "cpu".
     #[arg(long, default_value = "cuda")]
     device: String,
-
-    /// Rollout path: "auto", "lockstep", or "coalesced".
-    #[arg(long, default_value = "auto")]
-    rollout: String,
 
     /// Max legal actions per row (menu width cap). 0 = no cap.
     #[arg(long, default_value = "64")]
@@ -44,12 +37,17 @@ struct Args {
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let arch = &TRAINING_ARCH;
-    let cfg = GAConfig {
-        population: args.population,
+    // Use an ES population (θ ± σε pairs) so the ES grouped-GEMM split is
+    // available — the production training path always uses ES. The population
+    // is 2 × n_perturbations (mirrored pairs), matching the production config.
+    let es_cfg = ESConfig {
+        n_perturbations: args.population / 2,
         ..Default::default()
     };
-    let pop = ga::initial_population(arch, &cfg, 7);
-    let hof = ga::HallOfFame::new();
+    let base = genome::random_genome(arch, 7);
+    let es_state = ESState::new(base, &es_cfg, 7);
+    let pop = es_state.materialise_population(arch);
+    let hof = HallOfFame::new();
     let mut rng = StdRng::seed_from_u64(7);
     let pairings = league::schedule_pairings(args.population, args.opponents, &hof, &mut rng);
     let seeds: Vec<u64> = (11..11 + args.seeds).map(|i| i as u64).collect();
@@ -64,26 +62,11 @@ fn main() -> anyhow::Result<()> {
     } else {
         "cpu"
     };
-    let rollout = match args.rollout.as_str() {
-        "lockstep" => Rollout::Lockstep,
-        "coalesced" => Rollout::Coalesced,
-        _ => Rollout::default_for(args.population),
-    };
-    let rollout_label = match rollout {
-        Rollout::Lockstep => "lockstep",
-        Rollout::Coalesced => "coalesced",
-    };
     let mut elo = EloTracker::new(args.population);
 
     eprintln!(
-        "pop={} opponents={} seeds={} games={} workers={} device={} rollout={}",
-        args.population,
-        args.opponents,
-        args.seeds,
-        games,
-        args.workers,
-        device_label,
-        rollout_label
+        "pop={} opponents={} seeds={} games={} device={}",
+        args.population, args.opponents, args.seeds, games, device_label
     );
 
     let began = Instant::now();
@@ -96,8 +79,6 @@ fn main() -> anyhow::Result<()> {
             seeds: &seeds,
             max_hands: Some(1),
             device: &device,
-            n_workers: args.workers,
-            rollout,
             max_width: if args.max_width == 0 {
                 usize::MAX
             } else {
@@ -108,11 +89,10 @@ fn main() -> anyhow::Result<()> {
     );
     let elapsed = began.elapsed().as_secs_f64();
     println!(
-        "pop={} games={} device={} rollout={}: {:.1}s = {:.0} games/s",
+        "pop={} games={} device={}: {:.1}s = {:.0} games/s",
         args.population,
         games,
         device_label,
-        rollout_label,
         elapsed,
         games as f64 / elapsed
     );

@@ -17,9 +17,9 @@
 //! against each anchor. The anchor's rating is frozen; only the champion's
 //! rating updates. The result is logged to `generations.jsonl`.
 
-use crate::ga::HallOfFame;
 use crate::genome::{Arch, Genome};
-use crate::league::{batch_layout, Rollout};
+use crate::hof::HallOfFame;
+use crate::league::batch_layout;
 use candle_core::Device;
 
 /// A fixed-reference anchor with a frozen ELO rating.
@@ -66,14 +66,12 @@ impl AnchorSet {
     /// Evaluate the champion against all anchors. Updates `champion_rating`
     /// using frozen-anchor ELO. Returns the champion's rating and per-anchor
     /// results for logging.
-    #[allow(clippy::too_many_arguments)]
     pub fn evaluate(
         &mut self,
         champion: &Genome,
         arch: &Arch,
         seeds: &[u64],
         device: &Device,
-        rollout: Rollout,
         max_width: usize,
         max_hands: Option<u32>,
     ) -> AnchorReport {
@@ -90,15 +88,10 @@ impl AnchorSet {
             let (_roster, game_seeds, meta) =
                 batch_layout(&mini_pop, &mini_hof, &mini_pairings, seeds);
 
-            // Run the rollout directly.
-            let results = match rollout {
-                Rollout::Lockstep => crate::league::rollout_lockstep_public(
-                    &mini_pop, arch, game_seeds, &meta, max_hands, device, max_width,
-                ),
-                Rollout::Coalesced => crate::league::rollout_coalesced_public(
-                    &mini_pop, arch, game_seeds, meta, max_hands, device, 8, max_width,
-                ),
-            };
+            // Run the lockstep rollout directly.
+            let results = crate::league::rollout_lockstep_public(
+                &mini_pop, arch, game_seeds, &meta, max_hands, device, max_width,
+            );
 
             // Score: champion is index 0, anchor is index 1.
             // Seating 0: champion is team 0. Seating 1: champion is team 1.

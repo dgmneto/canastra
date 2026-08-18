@@ -53,6 +53,34 @@ pub fn genome_size(arch: &Arch) -> usize {
 /// A flat genome as owned f32 values.
 pub type Genome = Vec<f32>;
 
+/// A random population of `population` genomes drawn from one seeded RNG
+/// stream. Each genome is N(0, 0.1) via Box-Muller. Used by the diagnostic
+/// bins (bench, ksweep) and anywhere a random starting population is needed
+/// independent of any optimizer.
+pub fn random_population(arch: &Arch, population: usize, run_seed: u64) -> Vec<Genome> {
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+
+    let size = genome_size(arch);
+    let mut rng = StdRng::seed_from_u64(run_seed);
+    (0..population)
+        .map(|_| {
+            let mut g = Genome::with_capacity(size);
+            for i in (0..size).step_by(2) {
+                let u1 = (rng.gen::<u32>() as f64 / u32::MAX as f64).max(1e-10);
+                let u2 = rng.gen::<u32>() as f64 / u32::MAX as f64;
+                let r = (-2.0 * u1.ln()).sqrt();
+                let theta = 2.0 * std::f64::consts::PI * u2;
+                g.push((r * theta.cos() * 0.1) as f32);
+                if i + 1 < size {
+                    g.push((r * theta.sin() * 0.1) as f32);
+                }
+            }
+            g
+        })
+        .collect()
+}
+
 /// Random genome initialized with N(0, 0.1).
 pub fn random_genome(arch: &Arch, seed: u64) -> Genome {
     use rand::rngs::StdRng;

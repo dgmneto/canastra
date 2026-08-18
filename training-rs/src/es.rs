@@ -239,13 +239,31 @@ fn centred_ranks(fitness: &[f64]) -> Vec<f64> {
 }
 
 /// Save an ES checkpoint (base params + Adam moments + seeds + sigma + t).
+/// Atomic: writes to a `.tmp` file, then renames. Rotation: keeps the last
+/// `keep_recent` checkpoints plus every `keep_every`-th (matching GA's
+/// rotation). Without rotation, a 2000-gen run at `checkpoint_interval=5`
+/// would leave 400 checkpoints (each growing with the HOF) and fill the disk.
 pub fn save_es_checkpoint(
     dir: &std::path::Path,
     generation: u32,
     state: &ESState,
     elo: &crate::elo::EloTracker,
-    hof: &crate::ga::HallOfFame,
+    hof: &crate::hof::HallOfFame,
     seeds: &[u64],
+) -> anyhow::Result<()> {
+    save_es_checkpoint_with_rotation(dir, generation, state, elo, hof, seeds, 10, 50)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn save_es_checkpoint_with_rotation(
+    dir: &std::path::Path,
+    generation: u32,
+    state: &ESState,
+    elo: &crate::elo::EloTracker,
+    hof: &crate::hof::HallOfFame,
+    seeds: &[u64],
+    keep_recent: usize,
+    keep_every: u32,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join(format!("gen-{:05}.es.bin", generation));
@@ -305,11 +323,49 @@ pub fn save_es_checkpoint(
 
     std::fs::write(&tmp, &data)?;
     std::fs::rename(&tmp, &path)?;
+
+    // Prune: keep last `keep_recent` plus every `keep_every`-th.
+    // Only prune ES checkpoints (".es.bin"), never GA checkpoints (".bin").
+    let mut checkpoints: Vec<_> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("gen-") && name.ends_with(".es.bin") && !name.ends_with(".tmp")
+        })
+        .collect();
+    checkpoints.sort_by_key(|e| e.file_name());
+    let total = checkpoints.len();
+    if total > keep_recent {
+        let mut to_remove = Vec::new();
+        for (idx, entry) in checkpoints.iter().enumerate() {
+            if idx >= total - keep_recent {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(num_str) = name
+                .strip_prefix("gen-")
+                .and_then(|s| s.strip_suffix(".es.bin"))
+            {
+                if let Ok(gen) = num_str.parse::<u32>() {
+                    if gen % keep_every == 0 {
+                        continue;
+                    }
+                }
+            }
+            to_remove.push(entry.path());
+        }
+        for path in to_remove {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     Ok(())
 }
 
 /// Loaded ES checkpoint.
-pub type ESCheckpoint = (u32, ESState, Vec<f64>, Vec<u64>, crate::ga::HallOfFame);
+pub type ESCheckpoint = (u32, ESState, Vec<f64>, Vec<u64>, crate::hof::HallOfFame);
 
 /// Load an ES checkpoint.
 pub fn load_es_checkpoint(dir: &std::path::Path) -> anyhow::Result<ESCheckpoint> {
@@ -371,7 +427,7 @@ pub fn load_es_checkpoint(dir: &std::path::Path) -> anyhow::Result<ESCheckpoint>
     let elo: Vec<f64> = (0..elo_size).map(|_| read_f64(&data, &mut pos)).collect();
     let gen_seeds: Vec<u64> = (0..seeds_size).map(|_| read_u64(&data, &mut pos)).collect();
 
-    let mut hof = crate::ga::HallOfFame::new();
+    let mut hof = crate::hof::HallOfFame::new();
     for _ in 0..hof_size {
         let gsz = read_u64(&data, &mut pos) as usize;
         hof.genomes.push(read_f32_slice(&data, &mut pos, gsz));
@@ -498,7 +554,7 @@ mod tests {
         let base = vec![0.5f32; 50];
         let state = ESState::new(base, &cfg, 42);
         let elo = crate::elo::EloTracker::new(8);
-        let hof = crate::ga::HallOfFame::new();
+        let hof = crate::hof::HallOfFame::new();
         let seeds = vec![1u64, 2, 3];
 
         let tmp = std::env::temp_dir().join("canastra_es_checkpoint_test");
