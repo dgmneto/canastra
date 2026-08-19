@@ -1,0 +1,14 @@
+{
+  "$schema": "https://app.kilo.ai/config.json",
+  "permission": {
+    "edit": {
+      "training-rs/src/**": "allow",
+      "engine/crates/**": "allow",
+      "bench/**": "ask",
+      "training-rs/tests/reference/**": "ask",
+      "training-rs/src/bin/gate.rs": "ask",
+      "**": "ask"
+    },
+    "bash": "allow"
+  }
+}

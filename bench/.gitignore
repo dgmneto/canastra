@@ -1,0 +1,15 @@
+# runtime artifacts — never committed; regenerated each run
+.bold.json
+.profile.*
+.experiment.json
+.hypothesis.json
+.control.*
+.control.stderr
+.exp.stderr
+.baseline.stderr
+.holdout.stderr
+.holdout.final.json
+.holdout.run.*
+.prompt.*.txt
+baseline.orig.json
+generation.json.live
