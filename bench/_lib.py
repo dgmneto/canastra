@@ -177,15 +177,24 @@ _TRAIN_RE = re.compile(r"gen\s+\d+:.*?\(([\d.]+)s\)")
 def train_once(bin_path: str, games: int, flags: list[str]) -> dict:
     """Run one canastra-train generation (a different path: materialise +
     league + anchors + Adam, not the league-only bench) and return its
-    full-generation throughput. The holdout exercises code the bench omits."""
+    full-generation throughput. The holdout exercises code the bench omits.
+
+    Wall is timed externally (subprocess wall) for full precision — the train
+    binary prints only `{:.1}s`, which quantises a ~10s run to ~0.5% steps and
+    makes the CI degenerate. External wall includes ~1-2s CUDA init, a roughly
+    constant offset that dampens the % slightly but preserves the variance
+    component the overfit check needs."""
+    import time
+    t0 = time.perf_counter()
     r = run_native(bin_path, flags, timeout=600)
+    wall = time.perf_counter() - t0
     if r.returncode != 0:
         raise RuntimeError(f"train exit {r.returncode}: {r.stderr.strip()[:300]}")
-    m = _TRAIN_RE.search(r.stdout)
-    if not m:
+    # Sanity: the train binary must have printed a gen line (confirms it ran a
+    # generation, not just exited). Not used for the number (external wall is).
+    if not _TRAIN_RE.search(r.stdout):
         raise RuntimeError(f"could not parse train gen line: {r.stdout[-300:]!r}")
-    wall = float(m.group(1))
-    return {"wall_seconds": wall, "games": games,
+    return {"wall_seconds": round(wall, 4), "games": games,
             "games_per_s": round(games / wall, 4) if wall > 0 else 0.0}
 
 
