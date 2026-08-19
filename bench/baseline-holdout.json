@@ -1,0 +1,13 @@
+{
+  "commit": "cc0daee",
+  "dirty": false,
+  "correctness": "pass",
+  "correctness_detail": "",
+  "metric": "holdout_games_per_s",
+  "value": 267.0809,
+  "ci_low": 266.3659,
+  "ci_high": 267.9346,
+  "samples": 3,
+  "wall_seconds": 46.706,
+  "profile_top": []
+}
