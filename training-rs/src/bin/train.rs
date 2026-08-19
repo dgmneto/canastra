@@ -165,19 +165,37 @@ fn main() -> anyhow::Result<()> {
     };
 
     // Resume or fresh start.
-    let (start_gen, mut es_state, mut hof, mut best_ever) =
+    let (start_gen, mut es_state, mut hof, mut best_ever, mut anchors) =
         if let Some(ref resume_dir) = args.resume {
-            let (gen, state, _elo, _seeds, mut loaded_hof) = es::load_es_checkpoint(resume_dir)?;
+            let ckpt = es::load_es_checkpoint(resume_dir)?;
             // The checkpoint carries whatever archive it was written with; the
             // flag governs from here on, so resuming with a smaller cap thins
             // an oversized archive rather than carrying it forever.
+            let mut loaded_hof = ckpt.hof;
             loaded_hof.capacity = args.hof_capacity.max(1);
-            let next_gen = gen + 1;
+            let next_gen = ckpt.generation + 1;
+            // Restore the progress metric and the anchor set, so a resumed run
+            // continues from the same best_ever and the same fixed-reference
+            // opponents (random bot + frozen champions). Older checkpoints that
+            // predate anchor persistence have neither; fall back to the legacy
+            // fresh start for those.
+            let restored = ckpt.anchors.is_some();
+            let (best_ever, anchors) = match (ckpt.best_ever, ckpt.anchors) {
+                (Some(be), Some(snap)) => (be, AnchorSet::from_snapshot(snap)),
+                _ => (f64::NEG_INFINITY, AnchorSet::new(arch)),
+            };
             eprintln!(
-                "ES: resumed from gen {gen}, continuing at gen {next_gen} (HOF {} entries)",
-                loaded_hof.len()
+                "ES: resumed from gen {}, continuing at gen {} (HOF {} entries, {})",
+                ckpt.generation,
+                next_gen,
+                loaded_hof.len(),
+                if restored {
+                    "anchors restored"
+                } else {
+                    "fresh anchors"
+                }
             );
-            (next_gen, state, loaded_hof, f64::NEG_INFINITY)
+            (next_gen, ckpt.state, loaded_hof, best_ever, anchors)
         } else {
             let base = genome::random_genome(arch, args.run_seed);
             let state = ESState::new(base, &es_cfg, args.run_seed);
@@ -186,10 +204,10 @@ fn main() -> anyhow::Result<()> {
                 state,
                 HallOfFame::with_capacity(args.hof_capacity),
                 f64::NEG_INFINITY,
+                AnchorSet::new(arch),
             )
         };
 
-    let mut anchors = AnchorSet::new(arch);
     let anchor_seeds: Vec<u64> = (1000..1000 + args.anchor_seeds as u64).collect();
 
     for generation in start_gen..(start_gen + args.generations) {
@@ -371,6 +389,8 @@ fn main() -> anyhow::Result<()> {
                 &gen_seeds,
                 args.keep_recent,
                 args.keep_every,
+                best_ever,
+                Some(&anchors.snapshot()),
             );
         }
     }

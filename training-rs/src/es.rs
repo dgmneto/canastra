@@ -20,6 +20,7 @@
 //! term needs per-genome treatment. This is future work — the current
 //! implementation materialises genomes and reuses the existing league.
 
+use crate::anchors::{AnchorRecord, AnchorSnapshot};
 use crate::genome::{genome_size, Arch, Genome};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -266,7 +267,18 @@ pub fn save_es_checkpoint(
     hof: &crate::hof::HallOfFame,
     seeds: &[u64],
 ) -> anyhow::Result<()> {
-    save_es_checkpoint_with_rotation(dir, generation, state, elo, hof, seeds, 10, 50)
+    save_es_checkpoint_with_rotation(
+        dir,
+        generation,
+        state,
+        elo,
+        hof,
+        seeds,
+        10,
+        50,
+        f64::NEG_INFINITY,
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -279,6 +291,8 @@ pub fn save_es_checkpoint_with_rotation(
     seeds: &[u64],
     keep_recent: usize,
     keep_every: u32,
+    best_ever: f64,
+    anchors: Option<&AnchorSnapshot>,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join(format!("gen-{:05}.es.bin", generation));
@@ -336,6 +350,34 @@ pub fn save_es_checkpoint_with_rotation(
         data.extend_from_slice(&gen.to_le_bytes());
     }
 
+    // Anchor set + best_ever (added when this became resume-durable). The
+    // progress metric is the anchor rating, and the anchors themselves (random
+    // bot + frozen champions) accumulate state across generations. Without
+    // these the resumed run forgets its own history: best_ever resets to -inf
+    // and every --anchor-freeze-interval champion added before the resume is
+    // lost. Trailing section; older checkpoints that predate it simply end
+    // here, and load treats the missing bytes as "no claim".
+    data.extend_from_slice(&best_ever.to_le_bytes());
+    match anchors {
+        Some(snap) => {
+            data.push(1u8); // has_anchors marker
+            data.extend_from_slice(&snap.champion_rating.to_le_bytes());
+            data.extend_from_slice(&(snap.anchors.len() as u64).to_le_bytes());
+            for a in &snap.anchors {
+                let name_bytes = a.name.as_bytes();
+                data.extend_from_slice(&(name_bytes.len() as u64).to_le_bytes());
+                data.extend_from_slice(name_bytes);
+                data.extend_from_slice(&(a.genome.len() as u64).to_le_bytes());
+                for &v in &a.genome {
+                    data.extend_from_slice(&v.to_le_bytes());
+                }
+                data.extend_from_slice(&a.rating.to_le_bytes());
+                data.extend_from_slice(&a.generation.to_le_bytes());
+            }
+        }
+        None => data.push(0u8), // no anchors marker
+    }
+
     std::fs::write(&tmp, &data)?;
     std::fs::rename(&tmp, &path)?;
 
@@ -380,7 +422,22 @@ pub fn save_es_checkpoint_with_rotation(
 }
 
 /// Loaded ES checkpoint.
-pub type ESCheckpoint = (u32, ESState, Vec<f64>, Vec<u64>, crate::hof::HallOfFame);
+///
+/// `best_ever` and `anchors` are Option because checkpoints written before
+/// the anchor-persistence change end after the HOF section; a missing section
+/// is treated as "no claim" (best_ever = -inf, fresh AnchorSet::new).
+pub struct ESCheckpoint {
+    pub generation: u32,
+    pub state: ESState,
+    /// Legacy self-play ELO vector. Training no longer uses ELO for selection;
+    /// this is kept for the Python-equivalence test path and round-trips as
+    /// whatever was saved (the live loop saves an empty EloTracker::new(0)).
+    pub elo: Vec<f64>,
+    pub gen_seeds: Vec<u64>,
+    pub hof: crate::hof::HallOfFame,
+    pub best_ever: Option<f64>,
+    pub anchors: Option<AnchorSnapshot>,
+}
 
 /// Load an ES checkpoint.
 pub fn load_es_checkpoint(dir: &std::path::Path) -> anyhow::Result<ESCheckpoint> {
@@ -463,7 +520,54 @@ pub fn load_es_checkpoint(dir: &std::path::Path) -> anyhow::Result<ESCheckpoint>
         t,
     };
 
-    Ok((generation, state, elo, gen_seeds, hof))
+    // Optional trailing section: best_ever + anchors. Older checkpoints (written
+    // before anchor persistence) end here; a missing section is "no claim", and
+    // the caller falls back to best_ever = -inf and a fresh AnchorSet::new.
+    let (best_ever, anchors) = if pos < data.len() {
+        let best_ever = read_f64(&data, &mut pos);
+        let has_anchors = data[pos];
+        pos += 1;
+        let anchors = if has_anchors != 0 {
+            let champion_rating = read_f64(&data, &mut pos);
+            let n_anchors = read_u64(&data, &mut pos) as usize;
+            let mut records: Vec<AnchorRecord> = Vec::with_capacity(n_anchors);
+            for _ in 0..n_anchors {
+                let name_len = read_u64(&data, &mut pos) as usize;
+                let name = String::from_utf8(data[pos..pos + name_len].to_vec())
+                    .map_err(|e| anyhow::anyhow!("anchor name is not utf-8: {e}"))?;
+                pos += name_len;
+                let genome_len = read_u64(&data, &mut pos) as usize;
+                let genome = read_f32_slice(&data, &mut pos, genome_len);
+                let rating = read_f64(&data, &mut pos);
+                let generation = read_u32(&data, &mut pos);
+                records.push(AnchorRecord {
+                    name,
+                    genome,
+                    rating,
+                    generation,
+                });
+            }
+            Some(AnchorSnapshot {
+                champion_rating,
+                anchors: records,
+            })
+        } else {
+            None
+        };
+        (Some(best_ever), anchors)
+    } else {
+        (None, None)
+    };
+
+    Ok(ESCheckpoint {
+        generation,
+        state,
+        elo,
+        gen_seeds,
+        hof,
+        best_ever,
+        anchors,
+    })
 }
 
 #[cfg(test)]
@@ -604,18 +708,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         save_es_checkpoint(&tmp, 5, &state, &elo, &hof, &seeds).unwrap();
 
-        let (gen, loaded_state, loaded_elo, loaded_seeds, _loaded_hof) =
-            load_es_checkpoint(&tmp).unwrap();
+        let ckpt = load_es_checkpoint(&tmp).unwrap();
         let _ = std::fs::remove_dir_all(&tmp);
 
-        assert_eq!(gen, 5);
-        assert_eq!(loaded_state.base_params, state.base_params);
-        assert_eq!(loaded_state.m, state.m);
-        assert_eq!(loaded_state.v, state.v);
-        assert_eq!(loaded_state.sigma, state.sigma);
-        assert_eq!(loaded_state.t, state.t);
-        assert_eq!(loaded_state.perturbation_seeds, state.perturbation_seeds);
-        assert_eq!(loaded_elo, elo.ratings);
-        assert_eq!(loaded_seeds, seeds);
+        assert_eq!(ckpt.generation, 5);
+        assert_eq!(ckpt.state.base_params, state.base_params);
+        assert_eq!(ckpt.state.m, state.m);
+        assert_eq!(ckpt.state.v, state.v);
+        assert_eq!(ckpt.state.sigma, state.sigma);
+        assert_eq!(ckpt.state.t, state.t);
+        assert_eq!(ckpt.state.perturbation_seeds, state.perturbation_seeds);
+        assert_eq!(ckpt.elo, elo.ratings);
+        assert_eq!(ckpt.gen_seeds, seeds);
+        // The default wrapper writes best_ever but no anchors, so load reports
+        // the metric present and the snapshot absent (the legacy fallback path).
+        assert!(ckpt.best_ever.is_some(), "wrapper writes best_ever");
+        assert!(ckpt.anchors.is_none(), "wrapper writes no anchors");
+    }
+
+    /// An anchor snapshot round-trips through the checkpoint.
+    #[test]
+    fn anchor_snapshot_round_trips() {
+        let cfg = ESConfig {
+            n_perturbations: 4,
+            ..Default::default()
+        };
+        let base = vec![0.5f32; 50];
+        let state = ESState::new(base, &cfg, 42);
+        let elo = crate::elo::EloTracker::new(8);
+        let hof = crate::hof::HallOfFame::new();
+        let seeds = vec![1u64, 2, 3];
+
+        let arch = &crate::genome::TRAINING_ARCH;
+        let mut anchors = crate::anchors::AnchorSet::new(arch);
+        anchors.champion_rating = 1234.5;
+        anchors.add_champion(&vec![0.1f32; crate::genome::genome_size(arch)], 1100.0, 7);
+        let snap = anchors.snapshot();
+        let best_ever = 1234.5;
+
+        let tmp = std::env::temp_dir().join("canastra_es_anchor_checkpoint_test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        save_es_checkpoint_with_rotation(
+            &tmp,
+            5,
+            &state,
+            &elo,
+            &hof,
+            &seeds,
+            10,
+            50,
+            best_ever,
+            Some(&snap),
+        )
+        .unwrap();
+
+        let ckpt = load_es_checkpoint(&tmp).unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(
+            ckpt.best_ever,
+            Some(1234.5),
+            "best_ever must survive save/load"
+        );
+        let loaded = ckpt.anchors.expect("anchors must be present after save");
+        assert_eq!(loaded.champion_rating, 1234.5);
+        assert_eq!(loaded.anchors.len(), 2, "random bot + one frozen champion");
+        assert_eq!(loaded.anchors[0].name, "random");
+        assert_eq!(loaded.anchors[1].name, "gen-7");
+        assert_eq!(loaded.anchors[1].rating, 1100.0);
+        assert_eq!(loaded.anchors[1].generation, 7);
     }
 }

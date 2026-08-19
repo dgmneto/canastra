@@ -30,6 +30,26 @@ pub struct Anchor {
     pub generation: u32,
 }
 
+/// Serializable snapshot of one Anchor for checkpointing.
+pub struct AnchorRecord {
+    pub name: String,
+    pub genome: Genome,
+    pub rating: f64,
+    pub generation: u32,
+}
+
+/// Serializable snapshot of an AnchorSet for checkpointing.
+///
+/// The anchor set (the champion's accumulated rating against fixed references
+/// plus the frozen champions used as references) was not previously part of
+/// the ES checkpoint, so a resumed run rebuilt it from scratch: champion_rating
+/// reset to 1200 and every --anchor-freeze-interval champion added before the
+/// resume was lost. This snapshot makes both durable across resume.
+pub struct AnchorSnapshot {
+    pub champion_rating: f64,
+    pub anchors: Vec<AnchorRecord>,
+}
+
 /// The anchor set: random bot + frozen champions.
 pub struct AnchorSet {
     pub anchors: Vec<Anchor>,
@@ -61,6 +81,43 @@ impl AnchorSet {
             rating: internal_elo,
             generation,
         });
+    }
+
+    /// Snapshot the anchor set for checkpointing. Clones every anchor genome,
+    /// so this is O(anchors x genome_size); call it only at checkpoint time.
+    pub fn snapshot(&self) -> AnchorSnapshot {
+        AnchorSnapshot {
+            champion_rating: self.champion_rating,
+            anchors: self
+                .anchors
+                .iter()
+                .map(|a| AnchorRecord {
+                    name: a.name.clone(),
+                    genome: a.genome.clone(),
+                    rating: a.rating,
+                    generation: a.generation,
+                })
+                .collect(),
+        }
+    }
+
+    /// Rebuild an anchor set from a saved snapshot (resume path). The snapshot
+    /// carries the random-bot anchor too, so this does not call AnchorSet::new
+    /// -- the restored set is exactly what was saved.
+    pub fn from_snapshot(snap: AnchorSnapshot) -> Self {
+        AnchorSet {
+            anchors: snap
+                .anchors
+                .into_iter()
+                .map(|r| Anchor {
+                    name: r.name,
+                    genome: r.genome,
+                    rating: r.rating,
+                    generation: r.generation,
+                })
+                .collect(),
+            champion_rating: snap.champion_rating,
+        }
     }
 
     /// Evaluate the champion against all anchors. Updates `champion_rating`
