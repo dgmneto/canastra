@@ -22,7 +22,9 @@ MAX_ITERS=50               # hard cap on iterations
 MAX_WALL_SECONDS=3600      # hard wall cap
 MAX_COST_USD=5.0          # hard cost cap (placeholder; see docs)
 CONTROL_SAMPLES=10        # per-iteration control run sample count (multi-sample!)
-CONTROL_DRIFT_PCT=1.0     # abort iteration if control moved > this % from baseline
+CONTROL_WARMUP=3          # control warmup (cold-GPU guard; 3 because the first
+                          # control after loop start is colder than run.sh's default 2)
+CONTROL_DRIFT_PCT=1.0     # reported for info; the actual gate is CI overlap
 EXPERIMENT_SAMPLES=30     # sample count for the experiment run.sh
 DRIFT_GUARD_PCT=1.0       # machine-state drift guard for the control
 
@@ -230,6 +232,19 @@ fi
 # Snapshot the original baseline so the final report can compute total gain vs
 # the starting point (baseline.json is overwritten on each accept).
 [ -f "$BENCH/baseline.orig.json" ] || cp "$BASELINE" "$BENCH/baseline.orig.json"
+
+# Seed the ledger with an iteration-0 baseline entry so the optimizer's first
+# call to `recent 10` and `last-profile` has data. Without this, the first
+# iteration deadlocks: the optimizer sees an empty ledger, no profile_top, and
+# (correctly) stops without proposing anything.
+if [ ! -s "$LEDGER" ]; then
+  bl_prof="$("$PY" -c 'import json;print(json.dumps(json.load(open("'"$BASELINE"'")).get("profile_top",[])))' 2>/dev/null)"
+  bl_val="$(jnum "$BASELINE" value)"
+  bl_commit="$(jfield "$BASELINE" commit)"
+  "$PY" "$LED" append "{\"parent_commit\":\"\",\"commit\":\"$bl_commit\",\"hypothesis\":\"baseline\",\"target_symbol\":\"\",\"predicted_speedup\":1.0,\"actual_speedup\":1.0,\"verdict\":\"accept\",\"lines_changed\":0,\"notes\":\"seeded baseline: ${bl_val} games/s\",\"profile_top\":${bl_prof:-[]}}" >/dev/null 2>&1
+  echo "seeded ledger with baseline entry (iter 0)" >&2
+fi
+
 loop_start=$(date +%s)
 iter=0
 while true; do
@@ -240,17 +255,23 @@ while true; do
   hit_reason="$(evaluate_stop)"; hit="${hit_reason%%|*}"; reason="${hit_reason#*|}"
   if [ "$hit" = "true" ]; then echo "STOP at iter $iter: $reason" >&2; break; fi
 
-  # 1. control run on unchanged baseline
+  # 1. control run on unchanged baseline. The check is CI-overlap, NOT a
+  #    point-estimate % threshold: this machine's single-run CV is ~3% (GPU
+  #    thermals), so a 1% point-estimate bar false-aborts on noise. Two
+  #    multi-sample CIs that overlap = machine hasn't meaningfully moved.
   ctrl_json="$BENCH/.control.$$.json"
-  if ! "$BENCH/run.sh" --samples "$CONTROL_SAMPLES" --warmup 2 >"$ctrl_json" 2>"$BENCH/.control.stderr"; then
+  if ! "$BENCH/run.sh" --samples "$CONTROL_SAMPLES" --warmup "$CONTROL_WARMUP" >"$ctrl_json" 2>"$BENCH/.control.stderr"; then
     echo "control run failed — aborting iteration" >&2; rm -f "$ctrl_json"; continue
   fi
-  ctrl_val="$(jnum "$ctrl_json" value)"; base_val="$(jnum "$BASELINE" value)"
-  rm -f "$ctrl_json"
+  ctrl_val="$(jnum "$ctrl_json" value)"; ctrl_low="$(jnum "$ctrl_json" ci_low)"; ctrl_high="$(jnum "$ctrl_json" ci_high)"
+  base_val="$(jnum "$BASELINE" value)"; base_low="$(jnum "$BASELINE" ci_low)"; base_high="$(jnum "$BASELINE" ci_high)"
   drift="$(py "print(abs(${ctrl_val}-${base_val})/${base_val}*100 if ${base_val} else 0)")"
-  echo "control=$ctrl_val baseline=$base_val drift=${drift}%" >&2
-  if bq "${drift} > ${CONTROL_DRIFT_PCT}" | grep -q true; then
-    echo "ABORT iter $iter: control drifted ${drift}% > ${CONTROL_DRIFT_PCT}% — machine state untrustworthy" >&2
+  # CI overlap: control.ci_high >= baseline.ci_low AND control.ci_low <= baseline.ci_high
+  ci_overlap="$(bq "(${ctrl_high:-0} >= ${base_low:-0}) and (${ctrl_low:-0} <= ${base_high:-0})")"
+  echo "control=$ctrl_val [${ctrl_low},${ctrl_high}] baseline=$base_val [${base_low},${base_high}] drift=${drift}% ci_overlap=$ci_overlap" >&2
+  rm -f "$ctrl_json"
+  if [ "$ci_overlap" = "false" ]; then
+    echo "ABORT iter $iter: control CI [${ctrl_low},${ctrl_high}] does NOT overlap baseline CI [${base_low},${base_high}] — machine state moved (drift ${drift}%)" >&2
     continue
   fi
 

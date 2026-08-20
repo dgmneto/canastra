@@ -127,6 +127,17 @@ def last_profile_top() -> list[dict]:
     for e in reversed(_read_all()):
         if "profile_top" in e:
             return e["profile_top"]
+    # Fall back to baseline.json so the first iteration (empty ledger) still
+    # has a hotspot to target. Without this, the optimizer has no profile_top
+    # and must stop — a bootstrapping deadlock.
+    import os
+    bl = os.path.join(HERE, "baseline.json")
+    if os.path.exists(bl):
+        try:
+            with open(bl, "r", encoding="utf-8") as f:
+                return json.load(f).get("profile_top", [])
+        except (json.JSONDecodeError, OSError):
+            pass
     return []
 
 
