@@ -30,6 +30,12 @@ path = "src/bin/sparsity.rs"
 name = "canastra-ksweep"
 path = "src/bin/ksweep.rs"
 
+# Correctness gate for the optimisation harness. CPU-only, deterministic,
+# byte-identical golden comparison. Not a hot path — harness infrastructure.
+[[bin]]
+name = "gate"
+path = "src/bin/gate.rs"
+
 [workspace]
 
 [dependencies]
