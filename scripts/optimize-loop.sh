@@ -34,6 +34,17 @@ PATHOLOGICAL_CV_PCT=5.0   # abort iteration if the control's own CV exceeds this
                           # (a wildly unstable control means the machine itself
                           # is thrashing, not just shifted)
 
+
+# Model selection. Override on the CLI: --model <provider/model> [--variant <effort>].
+# Default: the Kilo config default (unset = kilo picks one). The model is VALIDATED
+# at startup: `kilo models` must list it, then `kilo run` must respond to a trivial
+# probe (Reply with the single word OK) before the loop starts -- catches auth,
+# billing, and connectivity failures before any GPU time is spent.
+KILO_MODEL="${KILO_MODEL:-}"
+KILO_VARIANT="${KILO_VARIANT:-}"
+MODEL_PROBE_TIMEOUT=60   # seconds; a model that can't answer in 60s is unusable for
+                          # a tight hypothesis-edit-test loop anyway
+
 # Optimiser invocation. Default: the Kilo CLI headless (`kilo run`), which runs
 # the /optimize-iteration slash command non-interactively with auto-approve on
 # the allowed edit paths (src/**). Override with OPTIMIZER_CMD if you want a
@@ -59,11 +70,40 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run)  DRY_RUN=1; shift;;
     --no-model) NO_MODEL=1; shift;;
+    --model)    KILO_MODEL="$2"; shift 2;;
+    --variant)  KILO_VARIANT="$2"; shift 2;;
     -h|--help)
       sed -n '2,30p' "$0"; exit 0;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
+
+# ─── model validation (before any work: catch auth/billing/connectivity) ────
+MODEL_FLAGS=()
+if [ -n "$KILO_MODEL" ]; then
+  MODEL_FLAGS+=(--model "$KILO_MODEL")
+  if [ -n "$KILO_VARIANT" ]; then MODEL_FLAGS+=(--variant "$KILO_VARIANT"); fi
+fi
+if [ "$DRY_RUN" -eq 0 ] && [ "$NO_MODEL" -eq 0 ]; then
+  echo "validating model..." >&2
+  if [ -n "$KILO_MODEL" ]; then
+    if ! kilo models 2>/dev/null | grep -qxF "$KILO_MODEL"; then
+      echo "model '$KILO_MODEL' not found in kilo models. First 20 available:" >&2
+      kilo models 2>/dev/null | head -20 >&2
+      exit 2
+    fi
+  fi
+  echo "probing model ${KILO_MODEL:-<default>}..." >&2
+  probe_out="$(kilo run "Reply with the single word OK and nothing else."     ${MODEL_FLAGS[*]} --dir "$REPO" 2>&1)" || true
+  if ! echo "$probe_out" | grep -qi "OK"; then
+    echo "model probe FAILED -- no OK in response. First 500 chars:" >&2
+    echo "$probe_out" | head -c 500 >&2
+    echo "" >&2
+    echo "the model may be down, misconfigured, or out of credits. Aborting." >&2
+    exit 2
+  fi
+  echo "model probe OK" >&2
+fi
 
 # ─── helpers (python as a calculator; control flow stays in bash) ──────────
 py() { "$PY" -c "$1"; }
@@ -304,7 +344,7 @@ while true; do
     cp "$ctrl_json" "$BENCH/.experiment.json" 2>/dev/null || true
   elif [ -n "$OPTIMIZER_CMD" ]; then
     echo "invoking optimiser: $OPTIMIZER_CMD --dir \"$REPO\"" >&2
-    $OPTIMIZER_CMD --dir "$REPO" >&2 2>&1 || echo "optimiser command failed (rc=$?)" >&2
+    $OPTIMIZER_CMD ${MODEL_FLAGS[*]} --dir "$REPO" >&2 2>&1 || echo "optimiser command failed (rc=$?)" >&2
   else
     echo "=== OPTIMISER (run /optimize-iteration in a FRESH Kilo session on branch $branch) ===" >&2
     echo "iter=$iter parent=$(git -C "$REPO" rev-parse --short HEAD) experiment_samples=$EXPERIMENT_SAMPLES" >&2
