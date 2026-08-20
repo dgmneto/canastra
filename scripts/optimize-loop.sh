@@ -26,13 +26,12 @@ CONTROL_DRIFT_PCT=1.0     # abort iteration if control moved > this % from basel
 EXPERIMENT_SAMPLES=30     # sample count for the experiment run.sh
 DRIFT_GUARD_PCT=1.0       # machine-state drift guard for the control
 
-# Optimiser invocation. The optimiser is a Kilo slash command
-# (.kilo/commands/optimize-iteration.md). To run it headless, set:
-#   export OPTIMIZER_CMD="kilo run --prompt-file"
-# (or whatever your Kilo headless CLI is). Default: prints the prompt and the
-# command to run, so the loop is drivable by hand. The fresh-context slash
-# command runs ONE iteration and appends to the ledger itself.
-OPTIMIZER_CMD="${OPTIMIZER_CMD:-}"
+# Optimiser invocation. Default: the Kilo CLI headless (`kilo run`), which runs
+# the /optimize-iteration slash command non-interactively with auto-approve on
+# the allowed edit paths (src/**). Override with OPTIMIZER_CMD if you want a
+# different runner; set to "" to fall back to manual (it prints the prompt and
+# waits for Enter).
+OPTIMIZER_CMD="${OPTIMIZER_CMD:-kilo run --command optimize-iteration --auto}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
@@ -266,15 +265,15 @@ while true; do
   #    bench/.hypothesis.json (hypothesis/target_symbol/predicted_speedup/
   #    lines_changed), then stops. The DRIVER owns the ledger append.
   rm -f "$BENCH/.experiment.json" "$BENCH/.hypothesis.json"
-  prompt="$(cat "$REPO/.kilo/commands/optimize-iteration.md" 2>/dev/null || echo '')"
   if [ "$NO_MODEL" -eq 1 ]; then
     echo "--no-model: skipping model step (no edit; ledger will record harness_fail)" >&2
     echo '{"hypothesis":"(no-model)","target_symbol":"","predicted_speedup":1.0,"lines_changed":0}' >"$BENCH/.hypothesis.json"
     cp "$BASELINE" "$BENCH/.experiment.json" 2>/dev/null || true
   elif [ -n "$OPTIMIZER_CMD" ]; then
-    pf="$BENCH/.prompt.$$.txt"; printf '%s\n' "$prompt" >"$pf"
-    $OPTIMIZER_CMD "$pf" >&2 || echo "optimiser command failed (rc=$?)" >&2
-    rm -f "$pf"
+    # Headless: run /optimize-iteration in the repo dir with auto-approve.
+    # kilo run --command <name> --auto --dir <path>
+    echo "invoking optimiser: $OPTIMIZER_CMD --dir \"$REPO\"" >&2
+    $OPTIMIZER_CMD --dir "$REPO" >&2 2>&1 || echo "optimiser command failed (rc=$?)" >&2
   else
     echo "=== OPTIMISER (run /optimize-iteration in a FRESH Kilo session on branch $branch) ===" >&2
     echo "iter=$iter parent=$(git -C "$REPO" rev-parse --short HEAD) experiment_samples=$EXPERIMENT_SAMPLES" >&2
