@@ -22,11 +22,17 @@ MAX_ITERS=50               # hard cap on iterations
 MAX_WALL_SECONDS=3600      # hard wall cap
 MAX_COST_USD=5.0          # hard cost cap (placeholder; see docs)
 CONTROL_SAMPLES=10        # per-iteration control run sample count (multi-sample!)
-CONTROL_WARMUP=3          # control warmup (cold-GPU guard; 3 because the first
-                          # control after loop start is colder than run.sh's default 2)
-CONTROL_DRIFT_PCT=1.0     # reported for info; the actual gate is CI overlap
+CONTROL_WARMUP=3          # control warmup (cold-GPU guard)
 EXPERIMENT_SAMPLES=30     # sample count for the experiment run.sh
-DRIFT_GUARD_PCT=1.0       # machine-state drift guard for the control
+# The control run is the WITHIN-SESSION reference, not baseline.json. Control
+# and experiment run back-to-back so they share the same GPU thermal/clock
+# state. Accept = experiment.ci_low > control.ci_high. baseline.json is only
+# the initial reference + the final total-gain anchor, never a per-iteration
+# gate — between-session GPU clock shifts (measured ~2%) would otherwise
+# false-abort every iteration.
+PATHOLOGICAL_CV_PCT=5.0   # abort iteration if the control's own CV exceeds this
+                          # (a wildly unstable control means the machine itself
+                          # is thrashing, not just shifted)
 
 # Optimiser invocation. Default: the Kilo CLI headless (`kilo run`), which runs
 # the /optimize-iteration slash command non-interactively with auto-approve on
@@ -185,12 +191,13 @@ if [ "$DRY_RUN" -eq 1 ]; then
   echo "constants: TARGET_VALUE=${TARGET_VALUE:-<unset>} PATIENCE=$PATIENCE MIN_IMPROVEMENT=$MIN_IMPROVEMENT AMDAHL_FLOOR=$AMDAHL_FLOOR COMPLEXITY_RATIO=$COMPLEXITY_RATIO PRED_CORR_MIN=$PRED_CORR_MIN MAX_ITERS=$MAX_ITERS MAX_WALL_SECONDS=$MAX_WALL_SECONDS MAX_COST_USD=$MAX_COST_USD" >&2
   echo "" >&2
   echo "iteration plan (per iteration):" >&2
-  echo "  1. control: ./bench/run.sh --samples $CONTROL_SAMPLES --warmup 2  (unchanged baseline)" >&2
-  echo "     abort iter if |control.value - baseline.value|/baseline.value > ${CONTROL_DRIFT_PCT}%" >&2
+  echo "  1. control: ./bench/run.sh --samples $CONTROL_SAMPLES --warmup $CONTROL_WARMUP" >&2
+  echo "     the control IS the within-session reference (not baseline.json)" >&2
+  echo "     abort iter if control CV > ${PATHOLOGICAL_CV_PCT}% (machine thrashing)" >&2
   echo "  2. branch from current best: git checkout -b ${BRANCH_PREFIX}-<N>" >&2
   echo "  3. invoke optimiser subagent (fresh context, one iteration): \$OPTIMIZER_CMD or /optimize-iteration" >&2
-  echo "  4. read last ledger entry; accept iff correctness=pass AND new.ci_low > baseline.ci_high" >&2
-  echo "     (non-overlapping CIs in the improvement direction; overlap => reject)" >&2
+  echo "  4. accept iff correctness=pass AND experiment.ci_low > control.ci_high" >&2
+  echo "     (non-overlapping CIs, same machine state; overlap => reject)" >&2
   echo "  5. accept => merge + update baseline.json; reject => record + delete branch" >&2
   echo "" >&2
   echo "ledger state:" >&2
@@ -255,30 +262,35 @@ while true; do
   hit_reason="$(evaluate_stop)"; hit="${hit_reason%%|*}"; reason="${hit_reason#*|}"
   if [ "$hit" = "true" ]; then echo "STOP at iter $iter: $reason" >&2; break; fi
 
-  # 1. control run on unchanged baseline. The check is CI-overlap, NOT a
-  #    point-estimate % threshold: this machine's single-run CV is ~3% (GPU
-  #    thermals), so a 1% point-estimate bar false-aborts on noise. Two
-  #    multi-sample CIs that overlap = machine hasn't meaningfully moved.
+  # 1. CONTROL RUN — the within-session reference. NOT compared to
+  #    baseline.json; the control IS this iteration's reference. Control and
+  #    experiment run back-to-back so they share the same GPU thermal/clock
+  #    state. baseline.json is only the initial reference + final gain anchor.
+  #    The only gate on the control is its own stability: if its CV is
+  #    pathological (> PATHOLOGICAL_CV_PCT) the machine is thrashing and the
+  #    iteration is untrustworthy.
   ctrl_json="$BENCH/.control.$$.json"
   if ! "$BENCH/run.sh" --samples "$CONTROL_SAMPLES" --warmup "$CONTROL_WARMUP" >"$ctrl_json" 2>"$BENCH/.control.stderr"; then
     echo "control run failed — aborting iteration" >&2; rm -f "$ctrl_json"; continue
   fi
   ctrl_val="$(jnum "$ctrl_json" value)"; ctrl_low="$(jnum "$ctrl_json" ci_low)"; ctrl_high="$(jnum "$ctrl_json" ci_high)"
-  base_val="$(jnum "$BASELINE" value)"; base_low="$(jnum "$BASELINE" ci_low)"; base_high="$(jnum "$BASELINE" ci_high)"
+  base_val="$(jnum "$BASELINE" value)"
+  # Pathological-stability gate: the control's own CV. run.sh doesn't emit CV,
+  # so compute it from CI width / mean as a rough proxy (CI width / (2× mean)).
+  ctrl_ci_width="$(py "print(${ctrl_high:-0} - ${ctrl_low:-0})")"
+  ctrl_cv_proxy="$(py "print(${ctrl_ci_width} / (2.0 * ${ctrl_val:-1}) * 100 if ${ctrl_val} else 0)")"
   drift="$(py "print(abs(${ctrl_val}-${base_val})/${base_val}*100 if ${base_val} else 0)")"
-  # CI overlap: control.ci_high >= baseline.ci_low AND control.ci_low <= baseline.ci_high
-  ci_overlap="$(bq "(${ctrl_high:-0} >= ${base_low:-0}) and (${ctrl_low:-0} <= ${base_high:-0})")"
-  echo "control=$ctrl_val [${ctrl_low},${ctrl_high}] baseline=$base_val [${base_low},${base_high}] drift=${drift}% ci_overlap=$ci_overlap" >&2
-  rm -f "$ctrl_json"
-  if [ "$ci_overlap" = "false" ]; then
-    echo "ABORT iter $iter: control CI [${ctrl_low},${ctrl_high}] does NOT overlap baseline CI [${base_low},${base_high}] — machine state moved (drift ${drift}%)" >&2
-    continue
+  echo "control=$ctrl_val [${ctrl_low},${ctrl_high}] (cv~${ctrl_cv_proxy}%) | baseline-ref=$base_val (session drift ${drift}%)" >&2
+  if bq "${ctrl_cv_proxy} > ${PATHOLOGICAL_CV_PCT}" | grep -q true; then
+    echo "ABORT iter $iter: control CV proxy ${ctrl_cv_proxy}% > ${PATHOLOGICAL_CV_PCT}% — machine is thrashing" >&2
+    rm -f "$ctrl_json"; continue
   fi
+  # control.json is kept for the accept comparison; cleaned up at iteration end.
 
   # 2. branch from current best
   branch="${BRANCH_PREFIX}-${iter}"
   cur_branch="$(git -C "$REPO" rev-parse --abbrev-ref HEAD)"
-  git_ok checkout -b "$branch" || { echo "branch create failed" >&2; continue; }
+  git_ok checkout -b "$branch" || { echo "branch create failed" >&2; rm -f "$ctrl_json"; continue; }
 
   # 3. invoke optimiser (fresh context, one iteration). Contract: the subagent
   #    edits training-rs/src/**, runs `./bench/run.sh --samples $EXPERIMENT_SAMPLES
@@ -289,10 +301,8 @@ while true; do
   if [ "$NO_MODEL" -eq 1 ]; then
     echo "--no-model: skipping model step (no edit; ledger will record harness_fail)" >&2
     echo '{"hypothesis":"(no-model)","target_symbol":"","predicted_speedup":1.0,"lines_changed":0}' >"$BENCH/.hypothesis.json"
-    cp "$BASELINE" "$BENCH/.experiment.json" 2>/dev/null || true
+    cp "$ctrl_json" "$BENCH/.experiment.json" 2>/dev/null || true
   elif [ -n "$OPTIMIZER_CMD" ]; then
-    # Headless: run /optimize-iteration in the repo dir with auto-approve.
-    # kilo run --command <name> --auto --dir <path>
     echo "invoking optimiser: $OPTIMIZER_CMD --dir \"$REPO\"" >&2
     $OPTIMIZER_CMD --dir "$REPO" >&2 2>&1 || echo "optimiser command failed (rc=$?)" >&2
   else
@@ -313,13 +323,14 @@ while true; do
   fi
   exp_correct="$(jfield "$exp_json" correctness)"
   exp_low="$(jnum "$exp_json" ci_low)"; exp_high="$(jnum "$exp_json" ci_high)"; exp_val="$(jnum "$exp_json" value)"
-  base_high="$(jnum "$BASELINE" ci_high)"; base_low="$(jnum "$BASELINE" ci_low)"
 
-  # accept iff correctness passes AND the new CI sits entirely ABOVE the
-  # baseline CI (new.ci_low > base.ci_high). Overlap or regression => reject.
+  # ACCEPT RULE: correctness passes AND experiment.ci_low > control.ci_high
+  #   (the experiment CI sits entirely above the control CI — a real win given
+  #   the same machine state). Overlapping CIs = reject, regardless of the
+  #   point estimate. This is the within-session paired comparison.
   accept=false
-  if [ "$exp_correct" = "pass" ] && [ -n "$exp_low" ] && [ -n "$base_high" ]; then
-    if bq "${exp_low} > ${base_high}" | grep -q true; then accept=true; fi
+  if [ "$exp_correct" = "pass" ] && [ -n "$exp_low" ] && [ -n "$ctrl_high" ]; then
+    if bq "${exp_low} > ${ctrl_high}" | grep -q true; then accept=true; fi
   fi
 
   # hypothesis metadata (from the subagent) for the ledger entry.
@@ -328,24 +339,24 @@ while true; do
   pred="$(jnum "$BENCH/.hypothesis.json" predicted_speedup 2>/dev/null)"; [ -z "$pred" ] && pred=1.0
   lch="$(jnum "$BENCH/.hypothesis.json" lines_changed 2>/dev/null)"; [ -z "$lch" ] && lch=0
   parent="$(git -C "$REPO" rev-parse --short HEAD)"
-  actual="$(py "print(round((${exp_val:-0})/${base_val:-1},4))")"
+  actual="$(py "print(round((${exp_val:-0})/${ctrl_val:-1},4))")"
 
   if [ "$accept" = "true" ]; then
     # 5a. accept: merge into best branch, promote experiment JSON to baseline.
-    git_ok checkout "$cur_branch" && git_ok merge --no-ff "$branch" -m "opt iter $iter: accept ${base_val} -> ${exp_val} games/s"
+    git_ok checkout "$cur_branch" && git_ok merge --no-ff "$branch" -m "opt iter $iter: accept ${ctrl_val} -> ${exp_val} games/s (vs control)"
     cp "$exp_json" "$BASELINE"   # experiment JSON becomes the new baseline reference
     [ -f "$BENCH/.experiment.json" ] && rm -f "$BENCH/.experiment.json"
-    "$PY" "$LED" append "{\"parent_commit\":\"$parent\",\"commit\":\"$(git -C "$REPO" rev-parse --short HEAD)\",\"hypothesis\":\"$hyp\",\"target_symbol\":\"$tsym\",\"predicted_speedup\":${pred},\"actual_speedup\":${actual},\"verdict\":\"accept\",\"lines_changed\":${lch},\"notes\":\"${base_val}->${exp_val} games/s; ci [${exp_low},${exp_high}] vs base [${base_low},${base_high}]\"}" >/dev/null
+    "$PY" "$LED" append "{\"parent_commit\":\"$parent\",\"commit\":\"$(git -C "$REPO" rev-parse --short HEAD)\",\"hypothesis\":\"$hyp\",\"target_symbol\":\"$tsym\",\"predicted_speedup\":${pred},\"actual_speedup\":${actual},\"verdict\":\"accept\",\"lines_changed\":${lch},\"notes\":\"control ${ctrl_val}->exp ${exp_val}; exp_ci [${exp_low},${exp_high}] vs ctrl_ci [${ctrl_low},${ctrl_high}]\"}" >/dev/null
     git_ok branch -D "$branch"
-    echo "ACCEPT iter $iter: ${base_val} -> ${exp_val} games/s (actual_speedup=${actual})" >&2
+    echo "ACCEPT iter $iter: control ${ctrl_val} -> experiment ${exp_val} games/s (actual_speedup=${actual})" >&2
   else
     # 5b. reject: record the failure mode, delete the branch.
     if [ "$exp_correct" != "pass" ]; then v="correctness_fail"; else v="reject"; fi
-    "$PY" "$LED" append "{\"parent_commit\":\"$parent\",\"commit\":\"$(git -C "$REPO" rev-parse --short HEAD)\",\"hypothesis\":\"$hyp\",\"target_symbol\":\"$tsym\",\"predicted_speedup\":${pred},\"actual_speedup\":${actual},\"verdict\":\"$v\",\"lines_changed\":${lch},\"notes\":\"correctness=${exp_correct}; ci_overlap=$(bq "(${exp_low:-0} <= ${base_high:-0}) and (${exp_high:-0} >= ${base_low:-0})")\"}" >/dev/null
+    "$PY" "$LED" append "{\"parent_commit\":\"$parent\",\"commit\":\"$(git -C "$REPO" rev-parse --short HEAD)\",\"hypothesis\":\"$hyp\",\"target_symbol\":\"$tsym\",\"predicted_speedup\":${pred},\"actual_speedup\":${actual},\"verdict\":\"$v\",\"lines_changed\":${lch},\"notes\":\"correctness=${exp_correct}; exp_ci [${exp_low:-0},${exp_high:-0}] vs ctrl_ci [${ctrl_low},${ctrl_high}]\"}" >/dev/null
     git_ok checkout "$cur_branch" && git_ok branch -D "$branch"
-    echo "REJECT iter $iter (verdict=$v, correctness=$exp_correct)" >&2
+    echo "REJECT iter $iter (verdict=$v, correctness=$exp_correct; exp=${exp_val:-0} vs ctrl=${ctrl_val})" >&2
   fi
-  rm -f "$exp_json" "$BENCH/.hypothesis.json" "$BENCH/.experiment.json"
+  rm -f "$exp_json" "$BENCH/.hypothesis.json" "$BENCH/.experiment.json" "$ctrl_json"
 done
 
 # ─── final report + holdout ─────────────────────────────────────────────────
