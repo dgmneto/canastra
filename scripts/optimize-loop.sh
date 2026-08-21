@@ -112,10 +112,14 @@ py() { "$PY" -c "$1"; }
 # match). Use bq for every boolean predicate.
 bq() { "$PY" -c "print('true' if ($1) else 'false')"; }
 
-# read a field from a JSON file: jfield <file> <key>
-jfield() { "$PY" -c "import json,sys;print(json.load(open(sys.argv[1])).get(sys.argv[2],''))" "$1" "$2"; }
-# read a nested numeric field
-jnum() { "$PY" -c "import json,sys;v=json.load(open(sys.argv[1])).get(sys.argv[2]);print('' if v is None else v)" "$1" "$2"; }
+# read a field from a JSON file: jfield <file> <key> / jnum <file> <key>.
+# Delegates to _lib.py getfield: fails soft ('' on missing/empty/unparseable —
+# never a traceback) and tolerates UTF-8/BOM/UTF-16 encodings. An agent whose
+# shell is PowerShell writes '>' redirections as UTF-16LE; plain
+# json.load(open(...)) chokes on that at char 0, which used to mislabel whole
+# iterations as correctness_fail.
+jfield() { "$PY" "$LIB" getfield "$1" "$2" 2>/dev/null; }
+jnum() { jfield "$1" "$2"; }
 
 git_ok() { git -C "$REPO" "$@" >/dev/null 2>&1; }
 
@@ -130,7 +134,9 @@ stop_target_reached() {
 # "non-significant" = verdict != accept, OR (accept but gain < MIN_IMPROVEMENT×ci_width)
 stop_patience_exhausted() {
   "$PY" "$LED" patience >/dev/null 2>&1
-  p="$("$PY" "$LED" patience 2>/dev/null | "$PY" -c 'import json,sys;print(json.load(sys.stdin)["patience"])')"
+  p="$("$PY" "$LED" patience 2>/dev/null | "$PY" -c 'import json,sys
+raw=sys.stdin.read().strip()
+print(json.loads(raw)["patience"] if raw else 0)' 2>/dev/null)"
   [ "${p:-0}" -ge "$PATIENCE" ] && echo true || echo false
 }
 
@@ -197,13 +203,15 @@ print("" if (r is None or math.isnan(r)) else r)' 2>/dev/null)"
   bq "${r} < ${PRED_CORR_MIN}"
 }
 
-# hard budgets
-iter_count() { "$PY" -c "import os;led=r'$LEDGER';n=0
-import os
-if os.path.exists(led):
-    for l in open(led,encoding='utf-8'):
+# hard budgets. NB: pass paths as standalone argv, never interpolated into the
+# -c script — MSYS path conversion only rewrites standalone arguments, so an
+# embedded /c/... path makes os.path.exists() silently false on Windows.
+iter_count() { "$PY" -c "import os,sys
+n=0
+if os.path.exists(sys.argv[1]):
+    for l in open(sys.argv[1],encoding='utf-8'):
         if l.strip(): n+=1
-print(n)" 2>/dev/null; }
+print(n)" "$LEDGER" 2>/dev/null; }
 
 stop_max_iters() { n="$(iter_count)"; [ "${n:-0}" -ge "$MAX_ITERS" ] && echo true || echo false; }
 loop_start=$(date +%s)
@@ -280,12 +288,24 @@ fi
 # the starting point (baseline.json is overwritten on each accept).
 [ -f "$BENCH/baseline.orig.json" ] || cp "$BASELINE" "$BENCH/baseline.orig.json"
 
+# A crashed earlier run can leave HEAD parked on a stale opt/* branch with its
+# edit still dirty in the working tree; iterations must start from the trunk or
+# the control run silently measures leftover experiments.
+case "$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null)" in
+  ${BRANCH_PREFIX}-*)
+    echo "HEAD is on a stale $(git -C "$REPO" rev-parse --abbrev-ref HEAD) — checking out main first" >&2
+    git_ok checkout main || { echo "cannot return to main — fix git state and re-run" >&2; exit 1; } ;;
+esac
+if [ -n "$(git -C "$REPO" status --porcelain=v1 -- training-rs/src 2>/dev/null)" ]; then
+  echo "WARNING: training-rs/src has uncommitted changes — control and experiment will measure this dirty tree" >&2
+fi
+
 # Seed the ledger with an iteration-0 baseline entry so the optimizer's first
 # call to `recent 10` and `last-profile` has data. Without this, the first
 # iteration deadlocks: the optimizer sees an empty ledger, no profile_top, and
 # (correctly) stops without proposing anything.
 if [ ! -s "$LEDGER" ]; then
-  bl_prof="$("$PY" -c 'import json;print(json.dumps(json.load(open("'"$BASELINE"'")).get("profile_top",[])))' 2>/dev/null)"
+  bl_prof="$("$PY" -c 'import json,sys;print(json.dumps(json.load(open(sys.argv[1])).get("profile_top",[])))' "$BASELINE" 2>/dev/null)"
   bl_val="$(jnum "$BASELINE" value)"
   bl_commit="$(jfield "$BASELINE" commit)"
   "$PY" "$LED" append "{\"parent_commit\":\"\",\"commit\":\"$bl_commit\",\"hypothesis\":\"baseline\",\"target_symbol\":\"\",\"predicted_speedup\":1.0,\"actual_speedup\":1.0,\"verdict\":\"accept\",\"lines_changed\":0,\"notes\":\"seeded baseline: ${bl_val} games/s\",\"profile_top\":${bl_prof:-[]}}" >/dev/null 2>&1
@@ -329,9 +349,11 @@ while true; do
   fi
   # control.json is kept for the accept comparison; cleaned up at iteration end.
 
-  # 2. branch from current best
+  # 2. branch from current best. A crashed earlier run can leave opt/iter-N
+  #    behind; delete the stale namesake first or checkout -b fails forever.
   branch="${BRANCH_PREFIX}-${iter}"
   cur_branch="$(git -C "$REPO" rev-parse --abbrev-ref HEAD)"
+  git_ok branch -D "$branch"
   git_ok checkout -b "$branch" || { echo "branch create failed" >&2; rm -f "$ctrl_json"; continue; }
 
   # 3. invoke optimiser (fresh context, one iteration). Contract: the subagent
@@ -354,14 +376,20 @@ while true; do
     read -r _ </dev/tty
   fi
 
-  # 4. evaluate the experiment. If the subagent didn't produce .experiment.json,
-  #    run the experiment ourselves (defensive — the accept decision is the
-  #    driver's, never the model's).
+  # 4. evaluate the experiment. The subagent's artifact is trusted only once it
+  #    actually parses: a missing, empty, or unparseable .experiment.json
+  #    triggers a driver-owned rerun (the accept decision is the driver's,
+  #    never the model's). Without this gate, an agent-side shell quirk (e.g.
+  #    PowerShell '>' writing UTF-16) used to surface as a bogus
+  #    correctness_fail and silently discard real work.
   exp_json="$BENCH/.experiment.$$.json"
+  rm -f "$exp_json"
   if [ -f "$BENCH/.experiment.json" ]; then cp "$BENCH/.experiment.json" "$exp_json"; fi
-  if [ ! -f "$exp_json" ]; then
+  if [ -z "$(jfield "$exp_json" correctness)" ]; then
+    echo "experiment artifact missing/unparseable — re-running the bench driver-side" >&2
+    rm -f "$exp_json"
     "$BENCH/run.sh" --samples "$EXPERIMENT_SAMPLES" --warmup 2 --profile >"$exp_json" 2>"$BENCH/.exp.stderr" \
-      || echo "experiment run.sh failed" >&2
+      || echo "experiment run.sh failed (see $BENCH/.exp.stderr)" >&2
   fi
   exp_correct="$(jfield "$exp_json" correctness)"
   exp_low="$(jnum "$exp_json" ci_low)"; exp_high="$(jnum "$exp_json" ci_high)"; exp_val="$(jnum "$exp_json" value)"
@@ -383,6 +411,18 @@ while true; do
   parent="$(git -C "$REPO" rev-parse --short HEAD)"
   actual="$(py "print(round((${exp_val:-0})/${ctrl_val:-1},4))")"
 
+  # Commit whatever the optimiser left in training-rs/src onto the iteration
+  # branch NOW, while HEAD is still on it. The agent edits the working tree
+  # without committing; left uncommitted, an accepted edit would never be in
+  # the merge (branch tip == parent commit => "Already up to date") and a
+  # rejected edit would silently ride the checkout into the next iteration,
+  # contaminating its control run.
+  if [ -n "$(git -C "$REPO" status --porcelain=v1 -- training-rs/src 2>/dev/null)" ]; then
+    git -C "$REPO" add -- training-rs/src >/dev/null 2>&1 \
+      && git -C "$REPO" commit -m "opt iter $iter: ${tsym:-edit} (harness-committed, predicted ${pred}x)" >/dev/null 2>&1 \
+      || echo "warning: could not commit the iteration edit to $branch" >&2
+  fi
+
   if [ "$accept" = "true" ]; then
     # 5a. accept: merge into best branch, promote experiment JSON to baseline.
     git_ok checkout "$cur_branch" && git_ok merge --no-ff "$branch" -m "opt iter $iter: accept ${ctrl_val} -> ${exp_val} games/s (vs control)"
@@ -392,11 +432,20 @@ while true; do
     git_ok branch -D "$branch"
     echo "ACCEPT iter $iter: control ${ctrl_val} -> experiment ${exp_val} games/s (actual_speedup=${actual})" >&2
   else
-    # 5b. reject: record the failure mode, delete the branch.
-    if [ "$exp_correct" != "pass" ]; then v="correctness_fail"; else v="reject"; fi
+    # 5b. reject: record the failure mode, preserve the diff as a patch, delete
+    #     the branch. The patch keeps a discarded experiment inspectable
+    #     without letting its code leak into the next iteration's baseline.
+    if [ -z "$exp_correct" ]; then v="harness_fail"
+    elif [ "$exp_correct" != "pass" ]; then v="correctness_fail"
+    else v="reject"; fi
+    git -C "$REPO" diff "$cur_branch" "$branch" -- training-rs/src >"$BENCH/.rejected.iter-$iter.patch" 2>/dev/null
     "$PY" "$LED" append "{\"parent_commit\":\"$parent\",\"commit\":\"$(git -C "$REPO" rev-parse --short HEAD)\",\"hypothesis\":\"$hyp\",\"target_symbol\":\"$tsym\",\"predicted_speedup\":${pred},\"actual_speedup\":${actual},\"verdict\":\"$v\",\"lines_changed\":${lch},\"notes\":\"correctness=${exp_correct}; exp_ci [${exp_low:-0},${exp_high:-0}] vs ctrl_ci [${ctrl_low},${ctrl_high}]\"}" >/dev/null
     git_ok checkout "$cur_branch" && git_ok branch -D "$branch"
-    echo "REJECT iter $iter (verdict=$v, correctness=$exp_correct; exp=${exp_val:-0} vs ctrl=${ctrl_val})" >&2
+    if [ "$v" = "harness_fail" ]; then
+      echo "REJECT iter $iter (verdict=harness_fail: no parsable experiment JSON after driver rerun; see $BENCH/.exp.stderr)" >&2
+    else
+      echo "REJECT iter $iter (verdict=$v, correctness=$exp_correct; exp=${exp_val:-0} vs ctrl=${ctrl_val}; edit saved to bench/.rejected.iter-$iter.patch)" >&2
+    fi
   fi
   rm -f "$exp_json" "$BENCH/.hypothesis.json" "$BENCH/.experiment.json" "$ctrl_json"
 done
