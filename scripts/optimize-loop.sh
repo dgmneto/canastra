@@ -13,24 +13,24 @@
 #
 # ─── Named constants (every threshold lives here) ──────────────────────────
 TARGET_VALUE=""            # absolute games/s goal; "" = unset; stop on reach
-PATIENCE=3                 # consecutive non-significant iterations
+PATIENCE="${PATIENCE:-3}"                 # consecutive non-significant iterations
 MIN_IMPROVEMENT=0.5        # significance = gain >= MIN_IMPROVEMENT × baseline CI width
-AMDAHL_FLOOR=1.15          # stop (with patience) if zeroing top hotspot can't reach this
-COMPLEXITY_RATIO=4         # stop if lines/% exceeds this × median of first 5 accepted
-PRED_CORR_MIN=0.3          # stop if predicted-vs-actual corr over last 5 decays below this
-MAX_ITERS=50               # hard cap on iterations
-MAX_WALL_SECONDS=3600      # hard wall cap
-MAX_COST_USD=5.0          # hard cost cap (placeholder; see docs)
-CONTROL_SAMPLES=10        # per-iteration control run sample count (multi-sample!)
-CONTROL_WARMUP=3          # control warmup (cold-GPU guard)
-EXPERIMENT_SAMPLES=30     # sample count for the experiment run.sh
+AMDAHL_FLOOR="${AMDAHL_FLOOR:-1.15}"          # stop (with patience) if zeroing top hotspot can't reach this
+COMPLEXITY_RATIO="${COMPLEXITY_RATIO:-4}"         # stop if lines/% exceeds this × median of first 5 accepted
+PRED_CORR_MIN="${PRED_CORR_MIN:-0.3}"          # stop if predicted-vs-actual corr over last 5 decays below this
+MAX_ITERS="${MAX_ITERS:-50}"               # hard cap on iterations
+MAX_WALL_SECONDS="${MAX_WALL_SECONDS:-3600}"      # hard wall cap
+MAX_COST_USD="${MAX_COST_USD:-5.0}"          # hard cost cap (placeholder; see docs)
+CONTROL_SAMPLES="${CONTROL_SAMPLES:-10}"        # per-iteration control run sample count (multi-sample!)
+CONTROL_WARMUP="${CONTROL_WARMUP:-3}"          # control warmup (cold-GPU guard)
+EXPERIMENT_SAMPLES="${EXPERIMENT_SAMPLES:-30}"     # sample count for the experiment run.sh
 # The control run is the WITHIN-SESSION reference, not baseline.json. Control
 # and experiment run back-to-back so they share the same GPU thermal/clock
 # state. Accept = experiment.ci_low > control.ci_high. baseline.json is only
 # the initial reference + the final total-gain anchor, never a per-iteration
 # gate — between-session GPU clock shifts (measured ~2%) would otherwise
 # false-abort every iteration.
-PATHOLOGICAL_CV_PCT=5.0   # abort iteration if the control's own CV exceeds this
+PATHOLOGICAL_CV_PCT="${PATHOLOGICAL_CV_PCT:-5.0}"   # abort iteration if the control's own CV exceeds this
                           # (a wildly unstable control means the machine itself
                           # is thrashing, not just shifted)
 
