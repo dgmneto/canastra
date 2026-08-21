@@ -63,12 +63,15 @@ impl Game {
             .collect()
     }
 
+    /// Commit the picked action. Returns `Ok(true)` when this call finished
+    /// the game (set its result), so the caller can maintain its finished
+    /// counter without re-scanning every game.
     fn commit_selected(
         &mut self,
         action: &Action,
         next_state: Result<GameState, RuleViolation>,
         max_actions_per_game: Option<u64>,
-    ) -> Result<(), RuleViolation> {
+    ) -> Result<bool, RuleViolation> {
         if matches!(
             self.state.phase,
             Phase::AwaitingDraw | Phase::AwaitingRefusalChoice
@@ -82,6 +85,7 @@ impl Game {
             self.safe = false;
         }
         self.state = next_state?;
+        let mut finished = false;
         if self.state.phase == Phase::HandOver {
             self.state = settle_hand(&self.state)?;
             if self.state.phase == Phase::MatchOver {
@@ -92,10 +96,11 @@ impl Game {
                     self.hands,
                     false,
                 ));
+                finished = true;
             } else if let Some(max) = self.max_hands {
                 if self.hands >= max {
                     self.result = Some((self.seed, self.state.scores, None, self.hands, false));
-                    return Ok(());
+                    return Ok(true);
                 }
                 self.hands += 1;
             } else {
@@ -103,14 +108,15 @@ impl Game {
             }
         }
         self.actions_played += 1;
-        if self.result.is_none() {
+        if !finished {
             if let Some(cap) = max_actions_per_game {
                 if self.actions_played >= cap {
                     self.result = Some((self.seed, self.state.scores, None, self.hands, true));
+                    finished = true;
                 }
             }
         }
-        Ok(())
+        Ok(finished)
     }
 }
 
@@ -144,6 +150,9 @@ pub struct Pool {
     menus: Vec<Vec<Action>>,
     max_actions_per_game: Option<u64>,
     max_width: usize,
+    /// Games that have finished so far (result set). Maintained incrementally
+    /// so the live dashboard can read progress in O(1) per ply.
+    n_finished: usize,
 }
 
 impl Pool {
@@ -167,6 +176,7 @@ impl Pool {
             menus: Vec::new(),
             max_actions_per_game,
             max_width,
+            n_finished: 0,
         }
     }
 
@@ -329,13 +339,29 @@ impl Pool {
 
         for (i, next_state) in applied {
             let action = selected[i].as_ref().expect("selected action");
-            self.games[i].commit_selected(action, next_state, max_actions)?;
+            let finished = self.games[i].commit_selected(action, next_state, max_actions)?;
+            if finished {
+                self.n_finished += 1;
+            }
         }
         Ok(())
     }
 
     pub fn results(&self) -> Vec<MatchResult> {
         self.games.iter().filter_map(|g| g.result).collect()
+    }
+
+    /// Number of games that have finished so far (O(1)).
+    pub fn finished_count(&self) -> usize {
+        self.n_finished
+    }
+
+    /// Every game's result **by game index** — `None` for games still in
+    /// play. Unlike [`Pool::results`], this preserves the index alignment the
+    /// league's `meta` uses, which is what the live dashboard needs to
+    /// attribute partial results to individuals mid-generation.
+    pub fn snapshot_results(&self) -> Vec<Option<MatchResult>> {
+        self.games.iter().map(|g| g.result).collect()
     }
 
     /// The legal actions per row from the last `encode()` call. Read-only
