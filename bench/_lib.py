@@ -112,11 +112,43 @@ def cv(samples: list[float]) -> float:
     return s / m * 100.0 if m != 0 else 0.0
 
 
+def getfield(path: str, key: str) -> str:
+    """Value of `key` in JSON file `path`, or '' on any failure.
+
+    Fails soft on purpose: the optimisation loop reads agent-written artifacts
+    (.experiment.json / .hypothesis.json) and must never crash on a missing,
+    empty, or unparseable file. Decoding tolerates UTF-8 (with/without BOM),
+    UTF-16, and cp1252 — an agent whose shell is PowerShell writes '>'
+    redirections as UTF-16LE, which a plain json.load(open(...)) cannot parse
+    and which used to surface as a bogus correctness_fail.
+    """
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return ""
+    text = None
+    for enc in ("utf-8-sig", "utf-16", "cp1252"):
+        try:
+            text = raw.decode(enc)
+            break
+        except (UnicodeDecodeError, ValueError):
+            continue
+    if text is None:
+        return ""
+    try:
+        v = json.loads(text).get(key, "")
+    except (json.JSONDecodeError, AttributeError):
+        return ""
+    return "" if v is None else str(v)
+
+
 # ─── CLI shim ───────────────────────────────────────────────────────────────
 # `python bench/_lib.py ci  'v1 v2 v3'`        -> {"mean":..,"sd":..,"ci_low":..,"ci_high":..}
 # `python bench/_lib.py parse-bench '<line>'`  -> bench dict (json)
 # `python bench/_lib.py parse-profile '<file>'`-> profile list (json)
 # `python bench/_lib.py cv 'v1 v2 ...'`         -> {"cv":..}
+# `python bench/_lib.py getfield <file> <key>`  -> field value or '' (fail-soft)
 # `python bench/_lib.py bench-once <bin> <flag>...`   -> run bench, parse, json
 # `python bench/_lib.py profile-once <bin> <flag>...`  -> run profile build, json
 # `python bench/_lib.py assemble ...`                  -> full run JSON
@@ -213,6 +245,8 @@ def _main() -> int:
     elif cmd == "cv":
         vals = [float(x) for x in sys.argv[2].split()]
         print(json.dumps({"cv": round(cv(vals), 4)}))
+    elif cmd == "getfield":
+        print(getfield(sys.argv[2], sys.argv[3]))
     elif cmd == "bench-once":
         try:
             print(json.dumps(bench_once(sys.argv[2], sys.argv[3:])))
