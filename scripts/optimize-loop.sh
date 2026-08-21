@@ -311,7 +311,9 @@ while true; do
   #    iteration is untrustworthy.
   ctrl_json="$BENCH/.control.$$.json"
   if ! "$BENCH/run.sh" --samples "$CONTROL_SAMPLES" --warmup "$CONTROL_WARMUP" >"$ctrl_json" 2>"$BENCH/.control.stderr"; then
-    echo "control run failed — aborting iteration" >&2; rm -f "$ctrl_json"; continue
+    echo "control run failed -- aborting iteration. stderr:" >&2
+    tail -20 "$BENCH/.control.stderr" >&2 2>/dev/null
+    rm -f "$ctrl_json"; continue
   fi
   ctrl_val="$(jnum "$ctrl_json" value)"; ctrl_low="$(jnum "$ctrl_json" ci_low)"; ctrl_high="$(jnum "$ctrl_json" ci_high)"
   base_val="$(jnum "$BASELINE" value)"
