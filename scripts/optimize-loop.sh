@@ -140,10 +140,14 @@ py() { "$PY" -c "$1"; }
 # match). Use bq for every boolean predicate.
 bq() { "$PY" -c "print('true' if ($1) else 'false')"; }
 
-# read a field from a JSON file: jfield <file> <key>
-jfield() { "$PY" -c "import json,sys;print(json.load(open(sys.argv[1])).get(sys.argv[2],''))" "$1" "$2"; }
-# read a nested numeric field
-jnum() { "$PY" -c "import json,sys;v=json.load(open(sys.argv[1])).get(sys.argv[2]);print('' if v is None else v)" "$1" "$2"; }
+# read a field from a JSON file: jfield <file> <key> / jnum <file> <key>.
+# Delegates to _lib.py getfield: fails soft ('' on missing/empty/unparseable —
+# never a traceback) and tolerates UTF-8/BOM/UTF-16 encodings. A parallel impl
+# session whose shell is PowerShell writes '>' redirections as UTF-16LE; plain
+# json.load(open(...)) chokes on that at char 0, which would mislabel a real
+# implementation as a bogus correctness_fail.
+jfield() { "$PY" "$LIB" getfield "$1" "$2" 2>/dev/null; }
+jnum() { jfield "$1" "$2"; }
 
 git_ok() { git -C "$REPO" "$@" >/dev/null 2>&1; }
 
@@ -219,7 +223,9 @@ stop_target_reached() {
 # "non-significant" = verdict != accept, OR (accept but gain < MIN_IMPROVEMENT×ci_width)
 stop_patience_exhausted() {
   "$PY" "$LED" patience >/dev/null 2>&1
-  p="$("$PY" "$LED" patience 2>/dev/null | "$PY" -c 'import json,sys;print(json.load(sys.stdin)["patience"])')"
+  p="$("$PY" "$LED" patience 2>/dev/null | "$PY" -c 'import json,sys
+raw=sys.stdin.read().strip()
+print(json.loads(raw)["patience"] if raw else 0)' 2>/dev/null)"
   [ "${p:-0}" -ge "$PATIENCE" ] && echo true || echo false
 }
 
@@ -286,13 +292,15 @@ print("" if (r is None or math.isnan(r)) else r)' 2>/dev/null)"
   bq "${r} < ${PRED_CORR_MIN}"
 }
 
-# hard budgets
-iter_count() { "$PY" -c "import os;led=r'$LEDGER';n=0
-import os
-if os.path.exists(led):
-    for l in open(led,encoding='utf-8'):
+# hard budgets. NB: pass paths as standalone argv, never interpolated into the
+# -c script — MSYS path conversion only rewrites standalone arguments, so an
+# embedded /c/... path makes os.path.exists() silently false on Windows.
+iter_count() { "$PY" -c "import os,sys
+n=0
+if os.path.exists(sys.argv[1]):
+    for l in open(sys.argv[1],encoding='utf-8'):
         if l.strip(): n+=1
-print(n)" 2>/dev/null; }
+print(n)" "$LEDGER" 2>/dev/null; }
 
 stop_max_iters() { n="$(iter_count)"; [ "${n:-0}" -ge "$MAX_ITERS" ] && echo true || echo false; }
 loop_start=$(date +%s)
@@ -372,12 +380,24 @@ fi
 # the starting point (baseline.json is overwritten on each accept).
 [ -f "$BENCH/baseline.orig.json" ] || cp "$BASELINE" "$BENCH/baseline.orig.json"
 
+# A crashed earlier run can leave HEAD parked on a stale opt/* branch with its
+# edit still dirty in the working tree; generations must start from the trunk or
+# the control run silently measures leftover experiments.
+case "$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null)" in
+  opt/impl-*|opt/cand-*|opt/iter-*)
+    echo "HEAD is on a stale $(git -C "$REPO" rev-parse --abbrev-ref HEAD) — checking out main first" >&2
+    git_ok checkout main || { echo "cannot return to main — fix git state and re-run" >&2; exit 1; } ;;
+esac
+if [ -n "$(git -C "$REPO" status --porcelain=v1 -- training-rs/src 2>/dev/null)" ]; then
+  echo "WARNING: training-rs/src has uncommitted changes — control and experiment will measure this dirty tree" >&2
+fi
+
 # Seed the ledger with an iteration-0 baseline entry so the optimizer's first
 # call to `recent 10` and `last-profile` has data. Without this, the first
 # iteration deadlocks: the optimizer sees an empty ledger, no profile_top, and
 # (correctly) stops without proposing anything.
 if [ ! -s "$LEDGER" ]; then
-  bl_prof="$("$PY" -c 'import json;print(json.dumps(json.load(open("'"$BASELINE"'")).get("profile_top",[])))' 2>/dev/null)"
+  bl_prof="$("$PY" -c 'import json,sys;print(json.dumps(json.load(open(sys.argv[1])).get("profile_top",[])))' "$BASELINE" 2>/dev/null)"
   bl_val="$(jnum "$BASELINE" value)"
   bl_commit="$(jfield "$BASELINE" commit)"
   "$PY" "$LED" append "{\"parent_commit\":\"\",\"commit\":\"$bl_commit\",\"hypothesis\":\"baseline\",\"target_symbol\":\"\",\"predicted_speedup\":1.0,\"actual_speedup\":1.0,\"verdict\":\"accept\",\"lines_changed\":0,\"notes\":\"seeded baseline: ${bl_val} games/s\",\"profile_top\":${bl_prof:-[]}}" >/dev/null 2>&1
@@ -484,6 +504,23 @@ PYEOF
   wait  # all implementation sessions
   echo "gen $iter B: all impl sessions finished" >&2
 
+  # Safety net: a session that implemented its idea in the working tree but
+  # forgot to `git commit` would be dropped by the n_commits check below and
+  # then lost when the worktree is removed. Commit any leftover training-rs/src
+  # edits on each impl branch harness-side (the harness owns the commit, never
+  # the model — same philosophy as the single-iteration path). Sessions that
+  # already committed are a no-op.
+  i=0
+  while [ "$i" -lt "$n_impl" ]; do
+    wt_i="$WT_ROOT/impl-$iter-$i"
+    if [ -d "$wt_i" ] && [ -n "$(git -C "$wt_i" status --porcelain=v1 -- training-rs/src 2>/dev/null)" ]; then
+      git -C "$wt_i" add -- training-rs/src >/dev/null 2>&1 \
+        && git -C "$wt_i" commit -m "opt impl $iter-$i: harness-committed (session left it uncommitted)" >/dev/null 2>&1 \
+        || echo "  warning: could not harness-commit leftover edits in $wt_i" >&2
+    fi
+    i=$((i+1))
+  done
+
   # ── collect implemented candidates (sorted by predicted_speedup desc) ─────
   cand_file="$BENCH/.candidates.$$.tsv"
   "$PY" - "$WT_ROOT" "$iter" "$n_impl" >"$cand_file" 2>"$BENCH/.candidates.stderr" <<'PYEOF'
@@ -585,12 +622,16 @@ PYEOF
       continue
     fi
 
-    # experiment benchmark (GPU, serial — the driver owns this)
+    # experiment benchmark (GPU, serial — the driver owns this). The artifact
+    # is trusted only once it actually parses: run.sh may fail (GPU/build issue)
+    # and leave no/unparseable JSON; an empty correctness => harness_fail, never
+    # a bogus correctness_fail that would mislabel real work.
     exp_json="$BENCH/.experiment.$$.json"
+    rm -f "$exp_json"
     exp_flags="--samples $EXPERIMENT_SAMPLES --warmup 2"
     [ "$EXPERIMENT_PROFILE" = "1" ] && exp_flags="$exp_flags --profile"
     "$BENCH/run.sh" $exp_flags >"$exp_json" 2>"$BENCH/.exp.stderr" \
-      || echo "  experiment run.sh failed (rc=$?)" >&2
+      || echo "  experiment run.sh failed (rc=$?; see $BENCH/.exp.stderr)" >&2
     exp_correct="$(jfield "$exp_json" correctness)"
     exp_low="$(jnum "$exp_json" ci_low)"; exp_high="$(jnum "$exp_json" ci_high)"; exp_val="$(jnum "$exp_json" value)"
     actual="$(py "print(round((${exp_val:-0})/${ctrl_val:-1},4))")"
@@ -611,11 +652,21 @@ PYEOF
       accept_count=$((accept_count+1))
       echo "  ACCEPT: control ${ctrl_val} -> experiment ${exp_val} games/s (speedup=${actual})" >&2
     else
-      if [ "$exp_correct" != "pass" ]; then v="correctness_fail"; else v="reject"; fi
-      "$PY" "$LED" append "{\"parent_commit\":\"$parent\",\"commit\":\"$(git -C "$REPO" rev-parse --short HEAD)\",\"hypothesis\":\"$c_hyp\",\"target_symbol\":\"$c_sym\",\"predicted_speedup\":${c_pred},\"actual_speedup\":${actual},\"verdict\":\"$v\",\"lines_changed\":${c_lch},\"notes\":\"correctness=${exp_correct}; exp_ci [${exp_low:-0},${exp_high:-0}] vs ctrl_ci [${ctrl_low},${ctrl_high}]\"}" >/dev/null
+      # reject: empty correctness => harness_fail; !=pass => correctness_fail;
+      # else (passed but CI overlap) => reject. Preserve the diff as a patch so a
+      # discarded candidate stays inspectable without leaking into the next run.
+      if [ -z "$exp_correct" ]; then v="harness_fail"
+      elif [ "$exp_correct" != "pass" ]; then v="correctness_fail"
+      else v="reject"; fi
+      git -C "$REPO" diff "$best_branch" "$cand_branch" -- training-rs/src >"$BENCH/.rejected.gen-$iter-$$-$(printf '%s' "$c_sym" | tr -c 'A-Za-z0-9' '_').patch" 2>/dev/null
+      "$PY" "$LED" append "{\"parent_commit\":\"$parent\",\"commit\":\"$(git -C "$REPO" rev-parse --short HEAD)\",\"hypothesis\":\"$c_hyp\",\"target_symbol\":\"$c_sym\",\"predicted_speedup\":${c_pred},\"actual_speedup\":${actual},\"verdict\":\"$v\",\"lines_changed\":${c_lch},\"notes\":\"correctness=${exp_correct:-<none>}; exp_ci [${exp_low:-0},${exp_high:-0}] vs ctrl_ci [${ctrl_low},${ctrl_high}]\"}" >/dev/null
       git -C "$REPO" checkout -q "$best_branch" 2>/dev/null || true
       git -C "$REPO" branch -q -D "$cand_branch" 2>/dev/null || true
-      echo "  REJECT (verdict=$v, correctness=$exp_correct; exp=${exp_val:-0} vs ctrl=${ctrl_val})" >&2
+      if [ "$v" = "harness_fail" ]; then
+        echo "  REJECT (verdict=harness_fail: no parsable experiment JSON after driver rerun; see $BENCH/.exp.stderr)" >&2
+      else
+        echo "  REJECT (verdict=$v, correctness=$exp_correct; exp=${exp_val:-0} vs ctrl=${ctrl_val})" >&2
+      fi
     fi
     rm -f "$exp_json"
   done < "$cand_file"

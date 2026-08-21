@@ -53,6 +53,16 @@ that is the result - do not "fix" the golden to make it pass.
 ```bash
 ./bench/run.sh --samples 30 --warmup 2 --profile > bench/.experiment.json
 ```
+ENCODING WARNING: if your shell tool is PowerShell, do NOT use `>` redirection
+for this command - Windows PowerShell writes redirections as UTF-16LE, which
+the driver's parser cannot read and which has mislabelled whole iterations as
+correctness_fail. Instead capture the output and write it as UTF-8, e.g.:
+```
+python -c "import subprocess; r = subprocess.run(['C:/Program Files/Git/bin/bash.exe', '-lc', './bench/run.sh --samples 30 --warmup 2 --profile'], capture_output=True, text=True); open('bench/.experiment.json', 'w', encoding='utf-8').write(r.stdout); print(r.stderr[-2000:])"
+```
+The driver re-verifies the artifact anyway and re-runs the bench itself if it
+does not parse, but a readable artifact saves a full benchmark run.
+
 `run.sh` runs the correctness gate FIRST (byte-identical golden on CPU). If the
 gate fails, `.experiment.json` will contain `correctness: "fail"` and a non-zero
 exit - leave it, the driver records `correctness_fail`. **Do not retry.** A
