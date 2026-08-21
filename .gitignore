@@ -9,3 +9,8 @@ web/src/engine/
 
 # server run-state — the table snapshot, safe to lose.
 server/data/
+
+# training run outputs — ephemeral; only promoted bots are saved.
+# Promote a champion by copying it under runs/promoted/.
+training-rs/runs/*
+!training-rs/runs/promoted/

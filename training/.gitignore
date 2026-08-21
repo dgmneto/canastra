@@ -6,5 +6,6 @@ __pycache__/
 .mypy_cache/
 target/
 *.so
-runs/
+runs/*
+!runs/promoted/
 *.pyd
