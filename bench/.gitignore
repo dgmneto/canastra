@@ -2,6 +2,7 @@
 .bold.json
 .profile.*
 .experiment.json
+.experiment.*.json
 .hypothesis.json
 .control.*
 .control.stderr
@@ -13,3 +14,19 @@
 .prompt.*.txt
 baseline.orig.json
 generation.json.live
+# parallel-agent loop artifacts (scripts/optimize-loop.sh)
+.ideas.json
+.idea.txt
+.idea-*.txt
+.impl-result.json
+.impl-*.json
+.session-*.jsonl
+.session-*.stderr
+.ideas.split.stderr
+.candidates.*.tsv
+.candidates.stderr
+.wt-*.stderr
+.cp.stderr
+.gatebuild.stderr
+.benchbuild.stderr
+.worktrees-*.txt

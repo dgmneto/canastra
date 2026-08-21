@@ -2,11 +2,18 @@
 # scripts/optimize-loop.sh — the optimisation driver.
 #
 # ALL control flow and EVERY stopping condition lives in this file, never in a
-# prompt. The model only generates a hypothesis + one edit; this script decides
-# whether to keep it, and when to stop. The harness works with zero agent
-# involvement: --dry-run evaluates every stop condition against the ledger
-# without invoking the model, and --no-model runs the loop body skipping the
-# model step (useful for testing the plumbing).
+# prompt. Each generation runs TWO agentic steps, then a serial validation:
+#   A. idea generation  — one session produces PARALLELISM ideas (bench/.ideas.json)
+#   B. implementation   — PARALLELISM parallel sessions (capped by MAX_CONCURRENT),
+#                          each in its own worktree, implement ONE idea (bench/.impl-result.json)
+#   C. validate + merge  — the harness cherry-picks each 'implemented' candidate onto
+#                          the current best, rebuilds the gate + CUDA bench binary, and
+#                          benchmarks it SERIALLY (one GPU), merging accepted changes 1-by-1.
+# Agents never build or benchmark — only the harness touches the GPU. The model only
+# generates ideas + implementations; this script validates, merges, and decides when to
+# stop. The harness works with zero agent involvement: --dry-run evaluates every stop
+# condition against the ledger without invoking the model, and --no-model runs the loop
+# body skipping the agentic steps (useful for testing the plumbing).
 #
 # Run (Git Bash):  ./scripts/optimize-loop.sh
 # Dry run:          ./scripts/optimize-loop.sh --dry-run
@@ -45,11 +52,32 @@ KILO_VARIANT="${KILO_VARIANT:-}"
 MODEL_PROBE_TIMEOUT=60   # seconds; a model that can't answer in 60s is unusable for
                           # a tight hypothesis-edit-test loop anyway
 
-# Optimiser invocation. Default: the Kilo CLI headless (`kilo run`), which runs
-# the /optimize-iteration slash command non-interactively with auto-approve on
-# the allowed edit paths (src/**). Override with OPTIMIZER_CMD if you want a
-# different runner; set to "" to fall back to manual (it prints the prompt and
-# waits for Enter).
+# ─── Parallel agentic loop config ───────────────────────────────────────────
+# Each generation runs TWO agentic steps, both via the Kilo CLI headless
+# (`kilo run --command <name> --auto --format json`):
+#   A. idea generation  — ONE session produces PARALLELISM distinct ideas,
+#      writing bench/.ideas.json (response_format contract).
+#   B. implementation   — PARALLELISM sessions run concurrently (capped by
+#      MAX_CONCURRENT), each in its own git worktree, implementing ONE idea and
+#      writing bench/.impl-result.json (response_format contract). Sessions are
+#      FORBIDDEN from running builds/benchmarks (one GPU; N parallel runs would
+#      thrash). The harness rebuilds the gate + CUDA bench binary and benchmarks
+#      each candidate SERIALLY during validation.
+# Override IDEA_CMD / IMPL_CMD to use a different headless runner.
+IDEA_CMD="${IDEA_CMD:-kilo run --command optimize-generate-ideas --auto --format json}"
+IMPL_CMD="${IMPL_CMD:-kilo run --command optimize-implement --auto --format json}"
+PARALLELISM="${PARALLELISM:-8}"        # ideas produced == impl sessions spawned
+MAX_CONCURRENT="${MAX_CONCURRENT:-$PARALLELISM}"  # cap concurrent impl sessions
+# Serial validation (harness-owned, one GPU): rebuild the (CPU) gate and the
+# (CUDA) bench binary per candidate so the experiment times the candidate's
+# code, not a stale binary. Set REBUILD_BENCH=0 only if you rebuild the bench
+# binary per candidate externally.
+REBUILD_BENCH="${REBUILD_BENCH:-1}"
+VCVARS="${VCVARS:-C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat}"
+CUDA_COMPUTE_CAP="${CUDA_COMPUTE_CAP:-120}"
+EXPERIMENT_PROFILE="${EXPERIMENT_PROFILE:-0}"  # 1 = add --profile to the per-candidate experiment run
+# Legacy single-iteration path (not used by the parallel loop; kept for the
+# manual /optimize-iteration flow). Ignored unless PARALLELISM=1.
 OPTIMIZER_CMD="${OPTIMIZER_CMD:-kilo run --command optimize-iteration --auto}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -62,7 +90,7 @@ BASELINE="$BENCH/baseline.json"
 HOLDOUT_BASELINE="$BENCH/baseline-holdout.json"
 LIB="$BENCH/_lib.py"
 LED="$BENCH/ledger.py"   # ledger queries live in ledger.py, not _lib.py
-BRANCH_PREFIX="opt/iter"
+# Branch naming: impl sessions -> opt/impl-<gen>-<i>; validation -> opt/cand-<gen>-<pid>-<i>.
 
 DRY_RUN=0
 NO_MODEL=0
@@ -118,6 +146,67 @@ jfield() { "$PY" -c "import json,sys;print(json.load(open(sys.argv[1])).get(sys.
 jnum() { "$PY" -c "import json,sys;v=json.load(open(sys.argv[1])).get(sys.argv[2]);print('' if v is None else v)" "$1" "$2"; }
 
 git_ok() { git -C "$REPO" "$@" >/dev/null 2>&1; }
+
+# ─── build/benchmark helpers (validation phase, SERIAL — one GPU) ───────────
+# Rebuild the CPU correctness gate for the current working tree's source.
+# Returns non-zero on compile failure (caller records correctness_fail, no GPU).
+rebuild_gate() {
+  ( cd "$TR" && cargo build --release --target-dir target/gate --bin gate ) \
+    >"$BENCH/.gatebuild.stderr" 2>&1
+}
+
+# Rebuild the CUDA bench binary for the current working tree's source so the
+# experiment times the candidate's code, not a stale binary. Serial by design:
+# only the harness calls this (sessions are forbidden from building). Override
+# VCVARS / CUDA_COMPUTE_CAP / REBUILD_BENCH for your toolchain.
+rebuild_bench() {
+  [ "$REBUILD_BENCH" = "1" ] || return 0
+  local inner="\"${VCVARS}\" >nul 2>&1"
+  inner="${inner} && set NVCC_PREPEND_FLAGS=-Xcompiler /Zc:preprocessor"
+  inner="${inner} && set CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}"
+  inner="${inner} && cargo build --release --features cuda --bin canastra-bench"
+  ( cd "$TR" && cmd /c "$inner" ) >"$BENCH/.benchbuild.stderr" 2>&1
+}
+
+# Run a control (within-session reference) benchmark against the current best
+# tree. $1 = output json path. Sets ctrl_val/ctrl_low/ctrl_high/ctrl_cv_proxy
+# globally. Returns non-zero if the run failed or the control's CV is
+# pathological (machine thrashing) — caller skips the candidate.
+run_control() {
+  local out="$1"
+  if ! "$BENCH/run.sh" --samples "$CONTROL_SAMPLES" --warmup "$CONTROL_WARMUP" >"$out" 2>"$BENCH/.control.stderr"; then
+    echo "  control run failed:" >&2; tail -20 "$BENCH/.control.stderr" >&2 2>/dev/null
+    return 1
+  fi
+  ctrl_val="$(jnum "$out" value)"; ctrl_low="$(jnum "$out" ci_low)"; ctrl_high="$(jnum "$out" ci_high)"
+  ctrl_ci_width="$(py "print(${ctrl_high:-0} - ${ctrl_low:-0})")"
+  ctrl_cv_proxy="$(py "print(${ctrl_ci_width} / (2.0 * ${ctrl_val:-1}) * 100 if ${ctrl_val} else 0)")"
+  if bq "${ctrl_cv_proxy} > ${PATHOLOGICAL_CV_PCT}" | grep -q true; then
+    echo "  ABORT candidate: control CV proxy ${ctrl_cv_proxy}% > ${PATHOLOGICAL_CV_PCT}% — machine thrashing" >&2
+    return 1
+  fi
+  echo "  control=$ctrl_val [${ctrl_low},${ctrl_high}] (cv~${ctrl_cv_proxy}%)" >&2
+  return 0
+}
+
+# Merge an experiment result into baseline.json, preserving the existing
+# profile_top (the per-candidate experiment run omits --profile by default, so
+# baseline.json would otherwise lose its hotspot map on every accept).
+# $1 = experiment json, $2 = baseline json.
+merge_baseline() {
+  "$PY" - "$1" "$2" <<'PYEOF'
+import json, sys
+exp, bl = sys.argv[1], sys.argv[2]
+e = json.load(open(exp, encoding="utf-8"))
+try:
+    b = json.load(open(bl, encoding="utf-8"))
+except Exception:
+    b = {}
+if "profile_top" not in e and "profile_top" in b:
+    e["profile_top"] = b["profile_top"]
+json.dump(e, open(bl, "w", encoding="utf-8"), indent=2)
+PYEOF
+}
 
 # ─── stop-condition evaluators (each prints "true"/"false") ────────────────
 stop_target_reached() {
@@ -228,17 +317,20 @@ evaluate_stop() {
 # ─── DRY RUN: print the plan + evaluate every condition, no model, no bench ──
 if [ "$DRY_RUN" -eq 1 ]; then
   echo "=== optimize-loop DRY RUN ===" >&2
-  echo "constants: TARGET_VALUE=${TARGET_VALUE:-<unset>} PATIENCE=$PATIENCE MIN_IMPROVEMENT=$MIN_IMPROVEMENT AMDAHL_FLOOR=$AMDAHL_FLOOR COMPLEXITY_RATIO=$COMPLEXITY_RATIO PRED_CORR_MIN=$PRED_CORR_MIN MAX_ITERS=$MAX_ITERS MAX_WALL_SECONDS=$MAX_WALL_SECONDS MAX_COST_USD=$MAX_COST_USD" >&2
+  echo "constants: TARGET_VALUE=${TARGET_VALUE:-<unset>} PATIENCE=$PATIENCE MIN_IMPROVEMENT=$MIN_IMPROVEMENT AMDAHL_FLOOR=$AMDAHL_FLOOR COMPLEXITY_RATIO=$COMPLEXITY_RATIO PRED_CORR_MIN=$PRED_CORR_MIN MAX_ITERS=$MAX_ITERS MAX_WALL_SECONDS=$MAX_WALL_SECONDS MAX_COST_USD=$MAX_COST_USD PARALLELISM=$PARALLELISM MAX_CONCURRENT=$MAX_CONCURRENT REBUILD_BENCH=$REBUILD_BENCH" >&2
   echo "" >&2
-  echo "iteration plan (per iteration):" >&2
-  echo "  1. control: ./bench/run.sh --samples $CONTROL_SAMPLES --warmup $CONTROL_WARMUP" >&2
-  echo "     the control IS the within-session reference (not baseline.json)" >&2
-  echo "     abort iter if control CV > ${PATHOLOGICAL_CV_PCT}% (machine thrashing)" >&2
-  echo "  2. branch from current best: git checkout -b ${BRANCH_PREFIX}-<N>" >&2
-  echo "  3. invoke optimiser subagent (fresh context, one iteration): \$OPTIMIZER_CMD or /optimize-iteration" >&2
-  echo "  4. accept iff correctness=pass AND experiment.ci_low > control.ci_high" >&2
-  echo "     (non-overlapping CIs, same machine state; overlap => reject)" >&2
-  echo "  5. accept => merge + update baseline.json; reject => record + delete branch" >&2
+  echo "generation plan (per generation):" >&2
+  echo "  A. idea generation: 1 session produces $PARALLELISM ideas -> bench/.ideas.json" >&2
+  echo "  B. implementation: $PARALLELISM parallel sessions (cap $MAX_CONCURRENT), each in its own" >&2
+  echo "     git worktree, implement ONE idea -> bench/.impl-result.json. Sessions run NO" >&2
+  echo "     builds/benchmarks (one GPU; N parallel runs would thrash)." >&2
+  echo "  C. validate+merge (SERIAL, harness-owned): for each 'implemented' candidate," >&2
+  echo "     cherry-pick onto current best, rebuild gate (CPU) + CUDA bench binary," >&2
+  echo "     run ./bench/run.sh --samples $EXPERIMENT_SAMPLES (control reuse: re-run only" >&2
+  echo "     when the best tree changed). accept iff correctness=pass AND" >&2
+  echo "     experiment.ci_low > control.ci_high (non-overlapping CIs)." >&2
+  echo "     accept => merge into best + update baseline.json; reject/correctness_fail" >&2
+  echo "     => record + delete branch. Candidates merged 1-by-1 (baseline shifts)." >&2
   echo "" >&2
   echo "ledger state:" >&2
   n="$(iter_count)"; echo "  iterations logged: ${n:-0}" >&2
@@ -296,109 +388,255 @@ loop_start=$(date +%s)
 iter=0
 while true; do
   iter=$((iter+1))
-  echo "=== iteration $iter ===" >&2
+  echo "=== generation $iter ===" >&2
 
   # 0. master stop check BEFORE doing any work
   hit_reason="$(evaluate_stop)"; hit="${hit_reason%%|*}"; reason="${hit_reason#*|}"
-  if [ "$hit" = "true" ]; then echo "STOP at iter $iter: $reason" >&2; break; fi
+  if [ "$hit" = "true" ]; then echo "STOP at gen $iter: $reason" >&2; break; fi
 
-  # 1. CONTROL RUN — the within-session reference. NOT compared to
-  #    baseline.json; the control IS this iteration's reference. Control and
-  #    experiment run back-to-back so they share the same GPU thermal/clock
-  #    state. baseline.json is only the initial reference + final gain anchor.
-  #    The only gate on the control is its own stability: if its CV is
-  #    pathological (> PATHOLOGICAL_CV_PCT) the machine is thrashing and the
-  #    iteration is untrustworthy.
-  ctrl_json="$BENCH/.control.$$.json"
-  if ! "$BENCH/run.sh" --samples "$CONTROL_SAMPLES" --warmup "$CONTROL_WARMUP" >"$ctrl_json" 2>"$BENCH/.control.stderr"; then
-    echo "control run failed -- aborting iteration. stderr:" >&2
-    tail -20 "$BENCH/.control.stderr" >&2 2>/dev/null
-    rm -f "$ctrl_json"; continue
-  fi
-  ctrl_val="$(jnum "$ctrl_json" value)"; ctrl_low="$(jnum "$ctrl_json" ci_low)"; ctrl_high="$(jnum "$ctrl_json" ci_high)"
-  base_val="$(jnum "$BASELINE" value)"
-  # Pathological-stability gate: the control's own CV. run.sh doesn't emit CV,
-  # so compute it from CI width / mean as a rough proxy (CI width / (2× mean)).
-  ctrl_ci_width="$(py "print(${ctrl_high:-0} - ${ctrl_low:-0})")"
-  ctrl_cv_proxy="$(py "print(${ctrl_ci_width} / (2.0 * ${ctrl_val:-1}) * 100 if ${ctrl_val} else 0)")"
-  drift="$(py "print(abs(${ctrl_val}-${base_val})/${base_val}*100 if ${base_val} else 0)")"
-  echo "control=$ctrl_val [${ctrl_low},${ctrl_high}] (cv~${ctrl_cv_proxy}%) | baseline-ref=$base_val (session drift ${drift}%)" >&2
-  if bq "${ctrl_cv_proxy} > ${PATHOLOGICAL_CV_PCT}" | grep -q true; then
-    echo "ABORT iter $iter: control CV proxy ${ctrl_cv_proxy}% > ${PATHOLOGICAL_CV_PCT}% — machine is thrashing" >&2
-    rm -f "$ctrl_json"; continue
-  fi
-  # control.json is kept for the accept comparison; cleaned up at iteration end.
+  # All implementation worktrees branch from the current best HEAD.
+  base_commit="$(git -C "$REPO" rev-parse HEAD)"
+  best_branch="$(git -C "$REPO" rev-parse --abbrev-ref HEAD)"
 
-  # 2. branch from current best
-  branch="${BRANCH_PREFIX}-${iter}"
-  cur_branch="$(git -C "$REPO" rev-parse --abbrev-ref HEAD)"
-  git_ok checkout -b "$branch" || { echo "branch create failed" >&2; rm -f "$ctrl_json"; continue; }
-
-  # 3. invoke optimiser (fresh context, one iteration). Contract: the subagent
-  #    edits training-rs/src/**, runs `./bench/run.sh --samples $EXPERIMENT_SAMPLES
-  #    --warmup 2 --profile` (writing bench/.experiment.json), writes
-  #    bench/.hypothesis.json (hypothesis/target_symbol/predicted_speedup/
-  #    lines_changed), then stops. The DRIVER owns the ledger append.
-  rm -f "$BENCH/.experiment.json" "$BENCH/.hypothesis.json"
+  # ── STEP A: idea generation (ONE session) ────────────────────────────────
+  # Produces PARALLELISM distinct ideas into bench/.ideas.json (response_format
+  # contract). --format json is also captured as an audit stream.
+  rm -f "$BENCH/.ideas.json" "$BENCH"/.idea-*.txt
   if [ "$NO_MODEL" -eq 1 ]; then
-    echo "--no-model: skipping model step (no edit; ledger will record harness_fail)" >&2
-    echo '{"hypothesis":"(no-model)","target_symbol":"","predicted_speedup":1.0,"lines_changed":0}' >"$BENCH/.hypothesis.json"
-    cp "$ctrl_json" "$BENCH/.experiment.json" 2>/dev/null || true
-  elif [ -n "$OPTIMIZER_CMD" ]; then
-    echo "invoking optimiser: $OPTIMIZER_CMD --dir \"$REPO\"" >&2
-    $OPTIMIZER_CMD ${MODEL_FLAGS[*]} --dir "$REPO" >&2 2>&1 || echo "optimiser command failed (rc=$?)" >&2
+    echo "gen $iter A: --no-model, skipping idea generation" >&2
+    echo '{"ideas":[]}' >"$BENCH/.ideas.json"
   else
-    echo "=== OPTIMISER (run /optimize-iteration in a FRESH Kilo session on branch $branch) ===" >&2
-    echo "iter=$iter parent=$(git -C "$REPO" rev-parse --short HEAD) experiment_samples=$EXPERIMENT_SAMPLES" >&2
-    echo "press Enter once .experiment.json + .hypothesis.json are written..." >&2
-    read -r _ </dev/tty
+    echo "gen $iter A: generating $PARALLELISM ideas..." >&2
+    $IDEA_CMD "$PARALLELISM" ${MODEL_FLAGS[*]} --dir "$REPO" \
+      >"$BENCH/.session-gen-$iter.jsonl" 2>"$BENCH/.session-gen-$iter.stderr" \
+      || echo "idea-gen command failed (rc=$?)" >&2
   fi
 
-  # 4. evaluate the experiment. If the subagent didn't produce .experiment.json,
-  #    run the experiment ourselves (defensive — the accept decision is the
-  #    driver's, never the model's).
-  exp_json="$BENCH/.experiment.$$.json"
-  if [ -f "$BENCH/.experiment.json" ]; then cp "$BENCH/.experiment.json" "$exp_json"; fi
-  if [ ! -f "$exp_json" ]; then
-    "$BENCH/run.sh" --samples "$EXPERIMENT_SAMPLES" --warmup 2 --profile >"$exp_json" 2>"$BENCH/.exp.stderr" \
-      || echo "experiment run.sh failed" >&2
+  # Split .ideas.json into per-idea text files for the implementation worktrees.
+  split_out="$("$PY" - "$BENCH" "$PARALLELISM" 2>"$BENCH/.ideas.split.stderr" <<'PYEOF'
+import json, os, sys
+bench, n = sys.argv[1], int(sys.argv[2])
+p = os.path.join(bench, ".ideas.json")
+try:
+    d = json.load(open(p, encoding="utf-8"))
+except Exception as e:
+    print("ERR " + str(e)); sys.exit(0)
+ideas = d.get("ideas", [])
+for it in ideas:
+    i = it.get("index", 0)
+    txt = (f"idea_index: {i}\n"
+           f"target_symbol: {it.get('target_symbol','')}\n"
+           f"predicted_speedup: {it.get('predicted_speedup',1.0)}\n"
+           f"hypothesis: {it.get('hypothesis','')}\n"
+           f"rationale: {it.get('rationale','')}\n")
+    open(os.path.join(bench, f".idea-{i}.txt"), "w", encoding="utf-8").write(txt)
+print("OK " + str(len(ideas)))
+PYEOF
+)"
+  idea_count="$(printf '%s' "$split_out" | sed -n 's/^OK //p')"
+  if [ -z "$idea_count" ] || [ "$idea_count" -lt 1 ]; then
+    echo "gen $iter A: no ideas produced ($(printf '%s' "$split_out" | head -1)); recording harness_fail" >&2
+    "$PY" "$LED" append "{\"parent_commit\":\"$(git -C "$REPO" rev-parse --short "$base_commit")\",\"commit\":\"$(git -C "$REPO" rev-parse --short HEAD)\",\"hypothesis\":\"(no ideas)\",\"target_symbol\":\"\",\"predicted_speedup\":1.0,\"actual_speedup\":1.0,\"verdict\":\"harness_fail\",\"lines_changed\":0,\"notes\":\"idea generation produced no ideas\"}" >/dev/null
+    continue
   fi
-  exp_correct="$(jfield "$exp_json" correctness)"
-  exp_low="$(jnum "$exp_json" ci_low)"; exp_high="$(jnum "$exp_json" ci_high)"; exp_val="$(jnum "$exp_json" value)"
+  n_impl="$idea_count"; [ "$n_impl" -gt "$PARALLELISM" ] && n_impl="$PARALLELISM"
+  echo "gen $iter A: $n_impl ideas to implement" >&2
 
-  # ACCEPT RULE: correctness passes AND experiment.ci_low > control.ci_high
-  #   (the experiment CI sits entirely above the control CI — a real win given
-  #   the same machine state). Overlapping CIs = reject, regardless of the
-  #   point estimate. This is the within-session paired comparison.
-  accept=false
-  if [ "$exp_correct" = "pass" ] && [ -n "$exp_low" ] && [ -n "$ctrl_high" ]; then
-    if bq "${exp_low} > ${ctrl_high}" | grep -q true; then accept=true; fi
-  fi
+  # ── STEP B: parallel implementation (N sessions, each its own worktree) ───
+  # Each session implements ONE idea (read from bench/.idea.txt in its worktree)
+  # and writes bench/.impl-result.json (response_format contract). Sessions run
+  # NO builds/benchmarks — the harness owns all of that, serially, in STEP C.
+  WT_ROOT="$(mktemp -d -t kilo-opt-XXXXXX)"
+  echo "$WT_ROOT" >"$BENCH/.worktrees-$iter.txt"
+  echo "gen $iter B: spawning $n_impl impl sessions (max $MAX_CONCURRENT concurrent) in $WT_ROOT" >&2
+  impl_wts=()
+  i=0
+  while [ "$i" -lt "$n_impl" ]; do
+    # throttle concurrency to MAX_CONCURRENT
+    while [ "$(jobs -rp 2>/dev/null | wc -l)" -ge "$MAX_CONCURRENT" ]; do sleep 2; done
+    wt="$WT_ROOT/impl-$iter-$i"
+    impl_branch="opt/impl-$iter-$i"
+    if ! git -C "$REPO" worktree add --force -b "$impl_branch" "$wt" "$base_commit" >/dev/null 2>"$BENCH/.wt-$iter-$i.stderr"; then
+      echo "  worktree add failed for idea $i: $(cat "$BENCH/.wt-$iter-$i.stderr" 2>/dev/null)" >&2
+      i=$((i+1)); continue
+    fi
+    impl_wts+=("$wt")
+    # seed the idea + the (uncommitted) implement command into the worktree so
+    # `kilo run --command optimize-implement --dir <wt>` resolves it there.
+    cp "$BENCH/.idea-$i.txt" "$wt/bench/.idea.txt" 2>/dev/null || true
+    mkdir -p "$wt/.kilo/commands"
+    cp "$REPO/.kilo/commands/optimize-implement.md" "$wt/.kilo/commands/" 2>/dev/null || true
+    # seed current ledger + baseline so the session sees the live rejection
+    # history and current hotspots (the worktree checkout has the committed —
+    # possibly stale — copies). These are read-only context; the session stages
+    # only training-rs/src, so they are never cherry-picked into the best branch.
+    cp "$LEDGER" "$wt/bench/LEDGER.jsonl" 2>/dev/null || true
+    cp "$BASELINE" "$wt/bench/baseline.json" 2>/dev/null || true
+    if [ "$NO_MODEL" -eq 1 ]; then
+      echo "  --no-model: skipping impl session $i" >&2
+      echo "{\"idea_index\":$i,\"status\":\"dropped\",\"hypothesis\":\"(no-model)\",\"target_symbol\":\"\",\"predicted_speedup\":1.0,\"lines_changed\":0,\"compiles\":null,\"notes\":\"no-model\"}" >"$wt/bench/.impl-result.json"
+    else
+      ( $IMPL_CMD ${MODEL_FLAGS[*]} --dir "$wt" \
+          >"$BENCH/.session-impl-$iter-$i.jsonl" 2>"$BENCH/.session-impl-$iter-$i.stderr" ) &
+    fi
+    i=$((i+1))
+  done
+  wait  # all implementation sessions
+  echo "gen $iter B: all impl sessions finished" >&2
 
-  # hypothesis metadata (from the subagent) for the ledger entry.
-  hyp="$(jfield "$BENCH/.hypothesis.json" hypothesis 2>/dev/null)"
-  tsym="$(jfield "$BENCH/.hypothesis.json" target_symbol 2>/dev/null)"
-  pred="$(jnum "$BENCH/.hypothesis.json" predicted_speedup 2>/dev/null)"; [ -z "$pred" ] && pred=1.0
-  lch="$(jnum "$BENCH/.hypothesis.json" lines_changed 2>/dev/null)"; [ -z "$lch" ] && lch=0
-  parent="$(git -C "$REPO" rev-parse --short HEAD)"
-  actual="$(py "print(round((${exp_val:-0})/${ctrl_val:-1},4))")"
+  # ── collect implemented candidates (sorted by predicted_speedup desc) ─────
+  cand_file="$BENCH/.candidates.$$.tsv"
+  "$PY" - "$WT_ROOT" "$iter" "$n_impl" >"$cand_file" 2>"$BENCH/.candidates.stderr" <<'PYEOF'
+import json, os, sys
+wtroot, iter, n = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+rows = []
+for i in range(n):
+    p = os.path.join(wtroot, f"impl-{iter}-{i}", "bench", ".impl-result.json")
+    if not os.path.exists(p):
+        continue
+    try:
+        r = json.load(open(p, encoding="utf-8"))
+    except Exception:
+        continue
+    if r.get("status") == "implemented":
+        r["_branch"] = f"opt/impl-{iter}-{r.get('idea_index', i)}"
+        rows.append(r)
+rows.sort(key=lambda r: float(r.get("predicted_speedup", 1.0)), reverse=True)
+def esc(s): return str(s).replace("\t", " ").replace("\n", " ")
+for r in rows:
+    print("\t".join([esc(r.get("_branch", "")), esc(r.get("hypothesis", "")),
+                     esc(r.get("target_symbol", "")), esc(r.get("predicted_speedup", 1.0)),
+                     esc(r.get("lines_changed", 0)), esc(r.get("notes", ""))]))
+PYEOF
+  n_cand="$(grep -c . "$cand_file" 2>/dev/null || echo 0)"
+  echo "gen $iter C: $n_cand candidates to validate+merge (serially)" >&2
 
-  if [ "$accept" = "true" ]; then
-    # 5a. accept: merge into best branch, promote experiment JSON to baseline.
-    git_ok checkout "$cur_branch" && git_ok merge --no-ff "$branch" -m "opt iter $iter: accept ${ctrl_val} -> ${exp_val} games/s (vs control)"
-    cp "$exp_json" "$BASELINE"   # experiment JSON becomes the new baseline reference
-    [ -f "$BENCH/.experiment.json" ] && rm -f "$BENCH/.experiment.json"
-    "$PY" "$LED" append "{\"parent_commit\":\"$parent\",\"commit\":\"$(git -C "$REPO" rev-parse --short HEAD)\",\"hypothesis\":\"$hyp\",\"target_symbol\":\"$tsym\",\"predicted_speedup\":${pred},\"actual_speedup\":${actual},\"verdict\":\"accept\",\"lines_changed\":${lch},\"notes\":\"control ${ctrl_val}->exp ${exp_val}; exp_ci [${exp_low},${exp_high}] vs ctrl_ci [${ctrl_low},${ctrl_high}]\"}" >/dev/null
-    git_ok branch -D "$branch"
-    echo "ACCEPT iter $iter: control ${ctrl_val} -> experiment ${exp_val} games/s (actual_speedup=${actual})" >&2
-  else
-    # 5b. reject: record the failure mode, delete the branch.
-    if [ "$exp_correct" != "pass" ]; then v="correctness_fail"; else v="reject"; fi
-    "$PY" "$LED" append "{\"parent_commit\":\"$parent\",\"commit\":\"$(git -C "$REPO" rev-parse --short HEAD)\",\"hypothesis\":\"$hyp\",\"target_symbol\":\"$tsym\",\"predicted_speedup\":${pred},\"actual_speedup\":${actual},\"verdict\":\"$v\",\"lines_changed\":${lch},\"notes\":\"correctness=${exp_correct}; exp_ci [${exp_low:-0},${exp_high:-0}] vs ctrl_ci [${ctrl_low},${ctrl_high}]\"}" >/dev/null
-    git_ok checkout "$cur_branch" && git_ok branch -D "$branch"
-    echo "REJECT iter $iter (verdict=$v, correctness=$exp_correct; exp=${exp_val:-0} vs ctrl=${ctrl_val})" >&2
-  fi
-  rm -f "$exp_json" "$BENCH/.hypothesis.json" "$BENCH/.experiment.json" "$ctrl_json"
+  # ── STEP C: serial validation + 1-by-1 merge ──────────────────────────────
+  # The harness owns the GPU: one candidate at a time. For each 'implemented'
+  # candidate: cherry-pick onto current best, rebuild gate (CPU) + CUDA bench
+  # binary, run the experiment benchmark, accept iff correctness=pass AND
+  # exp.ci_low > control.ci_high. Control is the within-session reference,
+  # reused while the best tree is unchanged and re-run only after an accept
+  # (the tree moved). Accepted changes merge 1-by-1 — the baseline shifts, so
+  # later candidates cherry-pick onto the advanced best.
+  ctrl_json=""; ctrl_commit=""
+  accept_count=0
+  git -C "$REPO" checkout -q "$best_branch" 2>/dev/null || true
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    c_branch="$(printf '%s' "$line" | cut -f1)"
+    c_hyp="$(printf '%s' "$line" | cut -f2)"
+    c_sym="$(printf '%s' "$line" | cut -f3)"
+    c_pred="$(printf '%s' "$line" | cut -f4)"; [ -z "$c_pred" ] && c_pred=1.0
+    c_lch="$(printf '%s' "$line" | cut -f5)"; [ -z "$c_lch" ] && c_lch=0
+    c_notes="$(printf '%s' "$line" | cut -f6)"
+    parent="$(git -C "$REPO" rev-parse --short HEAD)"
+    echo "gen $iter C: validating $c_branch ($c_sym, pred=$c_pred)" >&2
+
+    # control: reuse while best unchanged, re-run when it moved (after an accept)
+    cur_head="$(git -C "$REPO" rev-parse HEAD)"
+    if [ "$cur_head" != "$ctrl_commit" ]; then
+      ctrl_json="$BENCH/.control.$$.json"
+      if ! run_control "$ctrl_json"; then rm -f "$ctrl_json"; continue; fi
+      ctrl_commit="$cur_head"
+    fi
+
+    # the candidate must have committed its implementation
+    n_commits="$(git -C "$REPO" rev-list --count "$base_commit..$c_branch" 2>/dev/null || echo 0)"
+    if [ "${n_commits:-0}" -lt 1 ]; then
+      echo "  no commits on $c_branch — dropping (session did not commit)" >&2
+      "$PY" "$LED" append "{\"parent_commit\":\"$parent\",\"commit\":\"$parent\",\"hypothesis\":\"$c_hyp\",\"target_symbol\":\"$c_sym\",\"predicted_speedup\":${c_pred},\"actual_speedup\":1.0,\"verdict\":\"harness_fail\",\"lines_changed\":0,\"notes\":\"session reported implemented but committed nothing\"}" >/dev/null
+      continue
+    fi
+
+    # branch from current best, cherry-pick the candidate's implementation.
+    # $$ (PID) in the name makes the candidate branch unique per run, so a
+    # crashed prior run's stale branch never blocks checkout -b.
+    cand_branch="opt/cand-$iter-$$-$(printf '%s' "$c_branch" | sed 's#opt/impl-##')"
+    git -C "$REPO" checkout -q "$best_branch" 2>/dev/null || true
+    git -C "$REPO" branch -q -D "$cand_branch" 2>/dev/null || true
+    if ! git -C "$REPO" checkout -q -b "$cand_branch" 2>/dev/null; then
+      echo "  cand branch create failed" >&2; continue
+    fi
+    if ! git -C "$REPO" cherry-pick "$base_commit..$c_branch" >/dev/null 2>"$BENCH/.cp.stderr"; then
+      git -C "$REPO" cherry-pick --abort 2>/dev/null || true
+      echo "  MERGE CONFLICT cherry-picking $c_branch — dropping candidate" >&2
+      "$PY" "$LED" append "{\"parent_commit\":\"$parent\",\"commit\":\"$(git -C "$REPO" rev-parse --short HEAD)\",\"hypothesis\":\"$c_hyp\",\"target_symbol\":\"$c_sym\",\"predicted_speedup\":${c_pred},\"actual_speedup\":1.0,\"verdict\":\"harness_fail\",\"lines_changed\":${c_lch},\"notes\":\"merge conflict\"}" >/dev/null
+      git -C "$REPO" checkout -q "$best_branch" 2>/dev/null || true
+      git -C "$REPO" branch -q -D "$cand_branch" 2>/dev/null || true
+      continue
+    fi
+
+    # rebuild the (CPU) correctness gate for this candidate's source. A build
+    # failure => correctness_fail, no GPU time spent. Then rebuild the CUDA
+    # bench binary so the experiment times the candidate's code.
+    if ! rebuild_gate; then
+      echo "  gate BUILD FAILED — correctness_fail (no benchmark)" >&2
+      "$PY" "$LED" append "{\"parent_commit\":\"$parent\",\"commit\":\"$(git -C "$REPO" rev-parse --short HEAD)\",\"hypothesis\":\"$c_hyp\",\"target_symbol\":\"$c_sym\",\"predicted_speedup\":${c_pred},\"actual_speedup\":1.0,\"verdict\":\"correctness_fail\",\"lines_changed\":${c_lch},\"notes\":\"gate build failed\"}" >/dev/null
+      git -C "$REPO" checkout -q "$best_branch" 2>/dev/null || true
+      git -C "$REPO" branch -q -D "$cand_branch" 2>/dev/null || true
+      continue
+    fi
+    if ! rebuild_bench; then
+      echo "  CUDA bench BUILD FAILED — harness_fail (no benchmark)" >&2
+      "$PY" "$LED" append "{\"parent_commit\":\"$parent\",\"commit\":\"$(git -C "$REPO" rev-parse --short HEAD)\",\"hypothesis\":\"$c_hyp\",\"target_symbol\":\"$c_sym\",\"predicted_speedup\":${c_pred},\"actual_speedup\":1.0,\"verdict\":\"harness_fail\",\"lines_changed\":${c_lch},\"notes\":\"cuda bench build failed\"}" >/dev/null
+      git -C "$REPO" checkout -q "$best_branch" 2>/dev/null || true
+      git -C "$REPO" branch -q -D "$cand_branch" 2>/dev/null || true
+      continue
+    fi
+
+    # experiment benchmark (GPU, serial — the driver owns this)
+    exp_json="$BENCH/.experiment.$$.json"
+    exp_flags="--samples $EXPERIMENT_SAMPLES --warmup 2"
+    [ "$EXPERIMENT_PROFILE" = "1" ] && exp_flags="$exp_flags --profile"
+    "$BENCH/run.sh" $exp_flags >"$exp_json" 2>"$BENCH/.exp.stderr" \
+      || echo "  experiment run.sh failed (rc=$?)" >&2
+    exp_correct="$(jfield "$exp_json" correctness)"
+    exp_low="$(jnum "$exp_json" ci_low)"; exp_high="$(jnum "$exp_json" ci_high)"; exp_val="$(jnum "$exp_json" value)"
+    actual="$(py "print(round((${exp_val:-0})/${ctrl_val:-1},4))")"
+
+    # ACCEPT RULE: correctness passes AND experiment.ci_low > control.ci_high
+    accept=false
+    if [ "$exp_correct" = "pass" ] && [ -n "$exp_low" ] && [ -n "$ctrl_high" ]; then
+      if bq "${exp_low} > ${ctrl_high}" | grep -q true; then accept=true; fi
+    fi
+
+    if [ "$accept" = "true" ]; then
+      git -C "$REPO" checkout -q "$best_branch" 2>/dev/null || true
+      git -C "$REPO" merge --no-ff "$cand_branch" -m "opt gen $iter: accept ${ctrl_val} -> ${exp_val} games/s ($c_sym)" >/dev/null 2>&1
+      merge_baseline "$exp_json" "$BASELINE"
+      "$PY" "$LED" append "{\"parent_commit\":\"$parent\",\"commit\":\"$(git -C "$REPO" rev-parse --short HEAD)\",\"hypothesis\":\"$c_hyp\",\"target_symbol\":\"$c_sym\",\"predicted_speedup\":${c_pred},\"actual_speedup\":${actual},\"verdict\":\"accept\",\"lines_changed\":${c_lch},\"notes\":\"control ${ctrl_val}->exp ${exp_val}; exp_ci [${exp_low},${exp_high}] vs ctrl_ci [${ctrl_low},${ctrl_high}]\"}" >/dev/null
+      git -C "$REPO" branch -q -D "$cand_branch" 2>/dev/null || true
+      ctrl_commit=""   # best moved -> force a fresh control before the next candidate
+      accept_count=$((accept_count+1))
+      echo "  ACCEPT: control ${ctrl_val} -> experiment ${exp_val} games/s (speedup=${actual})" >&2
+    else
+      if [ "$exp_correct" != "pass" ]; then v="correctness_fail"; else v="reject"; fi
+      "$PY" "$LED" append "{\"parent_commit\":\"$parent\",\"commit\":\"$(git -C "$REPO" rev-parse --short HEAD)\",\"hypothesis\":\"$c_hyp\",\"target_symbol\":\"$c_sym\",\"predicted_speedup\":${c_pred},\"actual_speedup\":${actual},\"verdict\":\"$v\",\"lines_changed\":${c_lch},\"notes\":\"correctness=${exp_correct}; exp_ci [${exp_low:-0},${exp_high:-0}] vs ctrl_ci [${ctrl_low},${ctrl_high}]\"}" >/dev/null
+      git -C "$REPO" checkout -q "$best_branch" 2>/dev/null || true
+      git -C "$REPO" branch -q -D "$cand_branch" 2>/dev/null || true
+      echo "  REJECT (verdict=$v, correctness=$exp_correct; exp=${exp_val:-0} vs ctrl=${ctrl_val})" >&2
+    fi
+    rm -f "$exp_json"
+  done < "$cand_file"
+  echo "gen $iter: $accept_count accepted this generation" >&2
+
+  # ── cleanup: remove impl worktrees + branches + temp files ───────────────
+  for wt in "${impl_wts[@]}"; do
+    [ -z "$wt" ] && continue
+    git -C "$REPO" worktree remove --force "$wt" 2>/dev/null || rm -rf "$wt"
+  done
+  i=0
+  while [ "$i" -lt "$n_impl" ]; do
+    git -C "$REPO" branch -q -D "opt/impl-$iter-$i" 2>/dev/null || true
+    i=$((i+1))
+  done
+  rm -f "$cand_file" "$BENCH"/.idea-*.txt "$BENCH"/.session-impl-$iter-*.jsonl "$BENCH"/.session-impl-$iter-*.stderr \
+        "$BENCH"/.session-gen-$iter.* "$BENCH"/.control.* "$BENCH"/.experiment.*.json \
+        "$BENCH"/.candidates.stderr "$BENCH"/.ideas.split.stderr "$BENCH"/.wt-$iter-*.stderr \
+        "$BENCH"/.cp.stderr "$BENCH"/.gatebuild.stderr "$BENCH"/.benchbuild.stderr \
+        "$BENCH"/.control.stderr "$BENCH"/.exp.stderr "$BENCH"/.worktrees-$iter.txt 2>/dev/null
+  rmdir "$WT_ROOT" 2>/dev/null || true
 done
 
 # ─── final report + holdout ─────────────────────────────────────────────────

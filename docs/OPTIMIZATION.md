@@ -2,9 +2,30 @@
 
 An automated **benchmark → optimize → evaluate → repeat** loop for the
 `training-rs` lockstep self-play loop. Loop control is **deterministic** and
-lives entirely in `scripts/optimize-loop.sh`; only hypothesis generation is done
-by a model (the `/optimize-iteration` subagent). The harness works by hand with
-zero agent involvement (`--dry-run`, `--no-model`).
+lives entirely in `scripts/optimize-loop.sh`; only idea generation and parallel
+implementation are done by models (the `/optimize-generate-ideas` and
+`/optimize-implement` subagents). **Validation and merging are the harness's
+job, never a model's** — the harness owns the GPU: it rebuilds the correctness
+gate + CUDA bench binary and benchmarks each candidate **serially**, one at a
+time. The harness works by hand with zero agent involvement (`--dry-run`,
+`--no-model`).
+
+Each **generation** runs two agentic steps then a serial validation:
+
+1. **Idea generation** — one session produces `PARALLELISM` (default 8) distinct
+   ideas into `bench/.ideas.json` (response_format contract). No code edits, no
+   benchmarks.
+2. **Implementation** — `PARALLELISM` sessions run **in parallel** (capped by
+   `MAX_CONCURRENT`), each in its own git worktree, each implementing ONE idea
+   and writing `bench/.impl-result.json` (response_format contract). Sessions are
+   **forbidden from running builds or benchmarks** — one GPU shared across N
+   parallel sessions would thrash. They implement and reason only.
+3. **Validate + merge** — the harness collects the `implemented` candidates,
+   sorts by predicted speedup, and for each: cherry-picks onto the current best,
+   rebuilds the gate (CPU) + CUDA bench binary, runs the benchmark, and accepts
+   iff `correctness == pass` AND `experiment.ci_low > control.ci_high`.
+   Accepted changes merge **1-by-1** (the baseline shifts, so later candidates
+   cherry-pick onto the advanced best); rejected ones are recorded and dropped.
 
 This task built the **infrastructure only**. Nothing in the training hot path
 was optimized. Candidate hypotheses are listed at the bottom.
@@ -30,10 +51,12 @@ was optimized. Candidate hypotheses are listed at the bottom.
 # 3. Dry-run the loop (no model, no benchmark — evaluates stop conditions):
 ./scripts/optimize-loop.sh --dry-run
 
-# 4. Run the loop (model-driven). Set OPTIMIZER_CMD to your headless Kilo CLI,
-#    or run /optimize-iteration by hand in a fresh session per iteration:
-export OPTIMIZER_CMD="kilo run --prompt-file"
-./scripts/optimize-loop.sh
+# 4. Run the loop (model-driven, parallel). Tune the parallelism level and the
+#    serial GPU rebuild with env vars (defaults shown):
+PARALLELISM=8 MAX_CONCURRENT=8 REBUILD_BENCH=1 ./scripts/optimize-loop.sh
+#    Override the headless idea/implement runners with IDEA_CMD / IMPL_CMD if
+#    you need a different runner. The single-iteration /optimize-iteration
+#    command still exists as the legacy manual path.
 ```
 
 > Run the `.sh` files under **Git Bash** (`C:\Program Files\Git\bin\bash.exe`).
@@ -135,6 +158,36 @@ stop = target_reached
 Every stop is attributable — on exit the script prints which condition fired and
 why. `--dry-run` evaluates every condition against the current ledger without
 running the model or the benchmark.
+
+> Each generation writes up to `PARALLELISM` ledger entries (one per validated
+> candidate), so `MAX_ITERS` is an entry-level cap (≈ generations × `PARALLELISM`).
+> `patience` / `predcorr` / `complexity` / `amdahl` all read the ledger tail and
+> remain valid with batched entries.
+
+## Parallel loop configuration (`scripts/optimize-loop.sh`)
+
+| Constant | Default | Meaning |
+|---|---|---|
+| `PARALLELISM` | 8 | ideas produced per generation == implementation sessions spawned |
+| `MAX_CONCURRENT` | `=PARALLELISM` | cap on simultaneous implementation sessions (lower it if the model/CPU thrashes) |
+| `IDEA_CMD` | `kilo run --command optimize-generate-ideas --auto --format json` | headless idea-generation runner |
+| `IMPL_CMD` | `kilo run --command optimize-implement --auto --format json` | headless implementation runner |
+| `REBUILD_BENCH` | 1 | harness rebuilds the CUDA bench binary per candidate (serial) so the experiment times the candidate's code |
+| `VCVARS` / `CUDA_COMPUTE_CAP` | `…vcvars64.bat` / `120` | CUDA build env for the per-candidate bench rebuild |
+| `EXPERIMENT_PROFILE` | 0 | 1 = add `--profile` to the per-candidate experiment run (off by default — `profile_top` is preserved across accepts; run `./bench/run.sh --profile` to refresh it) |
+
+**Why sessions don't benchmark.** The machine has one GPU. Running N benchmarks
+in parallel would interleave CUDA work and corrupt every timing. So the
+implementation sessions only implement + reason (they are explicitly forbidden
+from `cargo build`, `cargo check`, `cargo build --features cuda`, and
+`./bench/run.sh`); the harness rebuilds the gate (CPU) and the CUDA bench binary
+and runs the benchmark **serially**, one candidate at a time, in step 3.
+
+**Control reuse.** The control is the within-session reference run against the
+current best tree. It is reused while the best tree is unchanged (a reject does
+not move the best) and re-run only after an accept (the tree moved) — so the
+per-generation GPU cost scales with the number of distinct best-trees seen, not
+with `PARALLELISM`.
 
 ## The correctness gate
 
