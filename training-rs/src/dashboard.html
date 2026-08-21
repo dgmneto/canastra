@@ -1,0 +1,474 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="__REFRESH_SECS__">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Canastra Train — Live Dashboard</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font: 14px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace;
+    background: #0d1117; color: #c9d1d9; padding: 16px;
+  }
+  h1 { font-size: 16px; margin: 0 0 4px; font-weight: 600; color: #f0f6fc; }
+  .sub { color: #768390; font-size: 12px; }
+  .top { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; }
+  .badge { font-size: 11px; padding: 3px 8px; border-radius: 10px; font-weight: 600; letter-spacing: .04em; }
+  .badge.live { background: #1f6f3f; color: #fff; animation: pulse 2s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.55; } }
+  .badge.done { background: #1f4f8f; color: #fff; }
+  .badge.idle { background: #4a4a4a; color: #ddd; }
+  .badge.stale { background: #8f5a1f; color: #fff; }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; margin: 14px 0; }
+  .kpi { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 10px 12px; }
+  .kpi .l { font-size: 10.5px; color: #768390; text-transform: uppercase; letter-spacing: .05em; }
+  .kpi .v { font-size: 20px; color: #f0f6fc; font-weight: 600; margin-top: 2px; }
+  .kpi .v small { font-size: 11px; color: #768390; font-weight: 400; }
+  .kpi.warn { border-color: #8f5a1f; }
+  .kpi.good { border-color: #1f6f3f; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 880px) { .grid { grid-template-columns: 1fr; } }
+  .chart-wrap { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 10px 12px 6px; }
+  .chart-title { font-size: 12px; color: #768390; margin-bottom: 4px; }
+  .chart { display: block; }
+  .axis { fill: #768390; font-size: 10px; font-family: ui-monospace, Consolas, monospace; }
+  .legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 4px; }
+  .legend span { font-size: 10.5px; color: #768390; display: inline-flex; align-items: center; gap: 4px; }
+  .legend i { width: 10px; height: 3px; border-radius: 2px; display: inline-block; }
+  .note { font-size: 11px; color: #8f5a1f; margin: 6px 0 0; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 6px; }
+  th, td { text-align: right; padding: 4px 8px; border-bottom: 1px solid #21262d; }
+  th { color: #768390; font-weight: 500; text-transform: uppercase; font-size: 10.5px; }
+  td:first-child, th:first-child { text-align: left; }
+  .section { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 10px 12px; margin-top: 12px; }
+  .section h2 { font-size: 12px; color: #768390; margin: 0 0 2px; text-transform: uppercase; letter-spacing: .05em; font-weight: 500; }
+  .empty { color: #768390; padding: 18px 0; text-align: center; }
+  .genbar { height: 4px; background: #21262d; border-radius: 2px; margin: 8px 0 0; overflow: hidden; }
+  .genbar > i { display: block; height: 100%; background: #1f6f3f; border-radius: 2px; transition: width .8s linear; }
+  .genbar.done > i { background: #1f4f8f; }
+
+  /* ---- live generation ---- */
+  .livebar { height: 20px; background: #21262d; border-radius: 10px; overflow: hidden; position: relative; margin: 10px 0 6px; }
+  .livebar > i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, #1f6f3f, #2ea043); transition: width .8s ease; }
+  .livebar > span { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 11px; color: #f0f6fc; text-shadow: 0 1px 3px rgba(0,0,0,.8); }
+  .lb { max-height: 430px; overflow-y: auto; margin-top: 8px; border: 1px solid #21262d; border-radius: 8px; }
+  .lb-row { display: grid; grid-template-columns: 40px 70px 54px 1fr 56px 84px; gap: 8px; align-items: center; padding: 4px 10px; border-bottom: 1px solid #21262d; font-size: 12px; }
+  .lb-row:last-child { border-bottom: none; }
+  .lb-row.head { position: sticky; top: 0; background: #161b22; color: #768390; font-size: 10.5px; text-transform: uppercase; z-index: 1; }
+  .lb-rank { font-weight: 700; text-align: right; color: #768390; }
+  .lb-rank.r1 { color: #e3b341; } .lb-rank.r2 { color: #adbac7; } .lb-rank.r3 { color: #d18b47; }
+  .lb-id { display: flex; align-items: center; gap: 6px; }
+  .tw { font-size: 10px; font-weight: 600; padding: 1px 5px; border-radius: 8px; }
+  .tw.plus { background: #123524; color: #3fb950; }
+  .tw.minus { background: #3d1d20; color: #f85149; }
+  .lb-games { color: #768390; text-align: right; }
+  .wbar { height: 8px; background: #21262d; border-radius: 4px; overflow: hidden; }
+  .wbar > i { display: block; height: 100%; width: 0; background: #58a6ff; border-radius: 4px; transition: width .6s ease; }
+  .lb-win { text-align: right; }
+  .lb-diff { text-align: right; font-weight: 600; }
+  .pos { color: #3fb950; } .neg { color: #f85149; }
+  .phase-chip { font-size: 10px; font-weight: 700; letter-spacing: .06em; padding: 2px 8px; border-radius: 9px; background: #21262d; color: #768390; margin-left: 8px; text-transform: uppercase; }
+  .phase-chip.league { background: #1f6f3f; color: #fff; animation: pulse 2s ease-in-out infinite; }
+  .phase-chip.anchors { background: #1f4f8f; color: #fff; }
+  .phase-chip.update { background: #8250df; color: #fff; }
+</style>
+</head>
+<body>
+<div class="top">
+  <div>
+    <h1>Canastra Train — <span id="run">…</span></h1>
+    <div class="sub" id="sub"></div>
+  </div>
+  <div style="text-align:right">
+    <span class="badge idle" id="status">…</span>
+    <div class="sub" id="refresh-note">refresh every 15s</div>
+  </div>
+</div>
+
+<div class="kpis" id="kpis"></div>
+<div class="genbar" id="genbar"><i style="width:0%"></i></div>
+
+<div class="section" id="live">
+  <h2>Live generation <span class="phase-chip" id="live-phase">idle</span><span class="sub" id="live-sub"></span></h2>
+  <div class="livebar" id="livebar"><i></i><span id="livebar-text">waiting for the first generation…</span></div>
+  <div class="sub" id="live-meta"></div>
+  <div class="lb" id="lb"></div>
+</div>
+
+<div class="grid" id="charts"></div>
+
+<div class="section">
+  <h2>Anchor opponents <span class="sub">(latest generation, point differential)</span></h2>
+  <div id="anchors"></div>
+</div>
+
+<div class="section">
+  <h2>Hyperparameters</h2>
+  <div id="cfg"></div>
+</div>
+
+<script>
+// The server swaps the token below for a live JSON snapshot of in-memory state
+// before serving this page. On every reload (every 15s) it is the freshest data
+// the trainer holds — no files, no fetch.
+const STATE = /*SNAP*/null;
+const REFRESH_S = __REFRESH_SECS__;
+
+// ---- number helpers ----
+const isNum = v => typeof v === "number" && isFinite(v);
+const orDash = (v, d) => (v == null || !isNum(v)) ? "—" : d(v);
+const f0 = v => Number(v).toFixed(0);
+const f1 = v => Number(v).toFixed(1);
+const f2 = v => Number(v).toFixed(2);
+const f4 = v => Number(v).toFixed(4);
+const pct = v => (v * 100).toFixed(0) + "%";
+function intk(n){ n=Math.round(n); return n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, " "); }
+function abbrev(v){ const a=Math.abs(v); if(a>=1e6) return (v/1e6).toFixed(1)+"M"; if(a>=1e3) return (v/1e3).toFixed(1)+"k"; if(a>=100) return f0(v); if(a>=10) return f1(v); return f2(v); }
+function dur(s){ if(!isNum(s)) return "—"; if(s<60) return f0(s)+"s"; const m=Math.floor(s/60), ss=Math.round(s%60); if(m<60) return m+"m "+ss+"s"; const h=Math.floor(m/60), mm=m%60; return h+"h "+mm+"m"; }
+function ago(t, now){ if(!isNum(t)) return "—"; const d=(now||Date.now()/1000)-t; return d<0?"just now":dur(Math.max(0,d))+" ago"; }
+
+// ---- chart ----
+function chart(cfg){
+  const W=860, H=260, mL=52, mR=16, mT=12, mB=26;
+  const pW=W-mL-mR, pH=H-mT-mB;
+  const N=cfg.labels.length;
+  const series=cfg.series||[], bands=cfg.bands||[];
+  let all=[];
+  for(const s of series) for(const v of s.points) if(isNum(v)) all.push(v);
+  for(const b of bands){ for(const v of b.hi) if(isNum(v)) all.push(v); for(const v of b.lo) if(isNum(v)) all.push(v); }
+  if(!all.length) return `<div class="chart-wrap"><div class="chart-title">${cfg.title}</div><div class="empty">no data yet</div></div>`;
+  let lo=Math.min(...all), hi=Math.max(...all);
+  if(lo===hi){ lo-=1; hi+=1; }
+  const pad=(hi-lo)*0.08||1; lo-=pad; hi+=pad;
+  const X=i=> N<=1?mL : mL+(i*pW)/(N-1);
+  const Y=v=> mT+pH-((v-lo)/(hi-lo))*pH;
+  let p=[];
+  p.push(`<div class="chart-wrap"><div class="chart-title">${cfg.title}</div>`);
+  p.push(`<svg viewBox="0 0 ${W} ${H}" class="chart" width="100%" height="${H}" preserveAspectRatio="xMidYMid meet">`);
+  const ticks=4;
+  for(let i=0;i<=ticks;i++){ const v=lo+(hi-lo)*i/ticks, y=Y(v);
+    p.push(`<line x1="${mL}" y1="${y}" x2="${W-mR}" y2="${y}" stroke="#1b2733"/>`);
+    p.push(`<text x="${mL-8}" y="${y+3}" text-anchor="end" class="axis">${abbrev(v)}</text>`);
+  }
+  for(const b of bands){
+    let d=""; let started=false;
+    for(let i=0;i<N;i++){ const a=b.hi[i],c=b.lo[i]; if(!isNum(a)||!isNum(c)){ started=false; continue; }
+      d+= started?` L ${X(i)} ${Y(a)}`:`M ${X(i)} ${Y(a)}`; started=true; }
+    for(let i=N-1;i>=0;i--){ const a=b.hi[i],c=b.lo[i]; if(!isNum(a)||!isNum(c)) continue; d+=` L ${X(i)} ${Y(c)}`; }
+    d+=" Z";
+    p.push(`<path d="${d}" fill="${b.color}" fill-opacity="${b.opacity==null?0.18:b.opacity}"/>`);
+  }
+  for(const s of series){
+    let d="", started=false;
+    for(let i=0;i<N;i++){ const v=s.points[i]; if(!isNum(v)){ started=false; continue; }
+      d+= started?` L ${X(i)} ${Y(v)}`:`M ${X(i)} ${Y(v)}`; started=true; }
+    p.push(`<path d="${d}" fill="none" stroke="${s.color}" stroke-width="${s.width||2}" ${s.dashed?'stroke-dasharray="4 3"':''}/>`);
+  }
+  const step=Math.max(1, Math.ceil(N/8));
+  for(let i=0;i<N;i+=step) p.push(`<text x="${X(i)}" y="${H-8}" text-anchor="middle" class="axis">${cfg.labels[i]}</text>`);
+  if(N>1 && (N-1)%step) p.push(`<text x="${X(N-1)}" y="${H-8}" text-anchor="middle" class="axis">${cfg.labels[N-1]}</text>`);
+  p.push(`</svg>`);
+  let leg='<div class="legend">';
+  for(const s of series) leg+=`<span><i style="background:${s.color}"></i>${s.name}</span>`;
+  for(const b of bands) leg+=`<span><i style="background:${b.color};opacity:${b.opacity==null?0.4:b.opacity}"></i>${b.name}</span>`;
+  leg+='</div>';
+  p.push(leg, `</div>`);
+  return p.join("");
+}
+
+// ---- render ----
+function render(s){
+  const now=(Date.now()/1000);
+  const gens=s.generations||[];
+  const last=gens.length?gens[gens.length-1]:null;
+  const cfg=s.config||{};
+
+  document.getElementById("run").textContent = (s.run_dir||"").split(/[\\/]/).pop() || "training";
+  const sub=[];
+  if(cfg.optimiser) sub.push(cfg.optimiser.toUpperCase());
+  if(isNum(cfg.population)) sub.push("pop "+cfg.population);
+  if(isNum(cfg.opponents)&&isNum(cfg.seeds)) sub.push("K="+(cfg.opponents*cfg.seeds*2));
+  if(cfg.device) sub.push(cfg.device);
+  document.getElementById("sub").textContent = sub.join("  ·  ");
+
+  // status badge
+  const age = isNum(s.updated_at)? (now - s.updated_at) : 999;
+  const stEl=document.getElementById("status");
+  if(s.status==="done"){ stEl.className="badge done"; stEl.textContent="DONE"; }
+  else if(s.status==="running" && age < 300){ stEl.className="badge live"; stEl.textContent="LIVE"; }
+  else { stEl.className="badge stale"; stEl.textContent="STALE"; }
+  document.getElementById("refresh-note").textContent =
+    isNum(s.updated_at)? `updated ${ago(s.updated_at, now)} · refresh ${REFRESH_S}s` : `refresh every ${REFRESH_S}s`;
+
+  // KPIs
+  const avgWall = gens.length ? s.total_wall_s / gens.length : null;
+  const completed = gens.length;
+  const remaining = Math.max(0, (s.target_generations||0) - completed);
+  const eta = isNum(avgWall) ? remaining*avgWall : null;
+  const genElapsed = isNum(s.gen_started_at) ? Math.max(0, now - s.gen_started_at) : null;
+  const spread = last ? last.signal_spread : null;
+  const spreadWarn = isNum(spread) && spread < 20;
+
+  const kpi = (l,v,cls,id) => `<div class="kpi ${cls||""}"${id?` id="kpi-${id}"`:""}><div class="l">${l}</div><div class="v">${v}</div></div>`;
+  document.getElementById("kpis").innerHTML = [
+    kpi("Generation", `${s.current_gen==null?"—":s.current_gen}<small> / ${s.target_generations==null?"?":s.target_generations}</small>`,
+        (s.target_generations && s.current_gen>=s.target_generations)?"good":""),
+    kpi("Anchor rating (latest)", orDash(last&&last.anchor&&last.anchor.champion_rating, f1)),
+    kpi("Best-ever", orDash(last&&last.best_ever, f1), "good"),
+    kpi("Sigma", orDash(last&&last.sigma, f4)),
+    kpi("Games / sec", orDash(last&&last.games_s, intk)),
+    kpi("Signal spread", orDash(spread, f1), spreadWarn?"warn":""),
+    kpi("Gen elapsed", `${orDash(genElapsed, dur)}<small> / last ${orDash(s.last_gen_wall_s, dur)}</small>`, "", "gen-elapsed"),
+    kpi("Total games", intk(s.total_games||0)),
+    kpi("Total time", dur(s.total_wall_s), "", "total-time"),
+    kpi("ETA", orDash(eta, dur), "", "eta"),
+    kpi("Win rate (best)", orDash(last&&last.win_rate_best, pct)),
+  ].join("");
+
+  if(spreadWarn){
+    document.querySelector("#kpis .kpi.warn").insertAdjacentHTML("beforeend",
+      `<div class="note">spread collapsing — population not differentiating</div>`);
+  }
+
+  // chart data arrays
+  const labels = gens.map(g=>g.gen);
+  const fitness = gens.map(g=>g.fitness||{});
+  const charts = [];
+  // 1. progress — the metric that matters
+  charts.push(chart({
+    title:"Anchor rating & best-ever  (progress)",
+    labels,
+    series:[
+      {name:"best-ever", color:"#3fb950", points:gens.map(g=>g.best_ever)},
+      {name:"anchor rating", color:"#58a6ff", points:gens.map(g=>g.anchor&&g.anchor.champion_rating), dashed:true},
+    ],
+  }));
+  // 2. signal spread — collapse watch
+  charts.push(chart({
+    title:"Signal spread  (mean |paired diff|)",
+    labels,
+    series:[{name:"spread", color:"#d29922", points:gens.map(g=>g.signal_spread)}],
+  }));
+  // 3. sigma
+  charts.push(chart({
+    title:"Sigma  (perturbation scale)",
+    labels,
+    series:[{name:"sigma", color:"#a371f7", points:gens.map(g=>g.sigma)}],
+  }));
+  // 4. fitness distribution
+  charts.push(chart({
+    title:"Fitness distribution  (points)",
+    labels,
+    bands:[
+      {name:"p25–p75", color:"#1f6feb", opacity:0.30, lo:fitness.map(f=>f.p25), hi:fitness.map(f=>f.p75)},
+      {name:"min–max", color:"#1f6feb", opacity:0.10, lo:fitness.map(f=>f.min), hi:fitness.map(f=>f.max)},
+    ],
+    series:[{name:"median", color:"#f0f6fc", points:fitness.map(f=>f.median), width:2}],
+  }));
+  // 5. throughput
+  charts.push(chart({
+    title:"Throughput  (games/sec)",
+    labels,
+    series:[{name:"games/s", color:"#3fb950", points:gens.map(g=>g.games_s)}],
+  }));
+  // 6. wall time
+  charts.push(chart({
+    title:"Wall time / generation  (s)",
+    labels,
+    series:[
+      {name:"total", color:"#58a6ff", points:gens.map(g=>g.wall_s)},
+      {name:"league", color:"#768390", points:gens.map(g=>g.league_wall_s), dashed:true},
+    ],
+  }));
+  document.getElementById("charts").innerHTML = charts.join("");
+
+  // anchor opponents table
+  const opps = last && last.anchor && last.anchor.opponents;
+  if(opps && opps.length){
+    let rows = opps.map(o=>
+      `<tr><td>${o.name}${o.gen!=null?` <span class="sub">g${o.gen}</span>`:""}</td>
+        <td>${o.w}</td><td>${o.l}</td><td>${o.d}</td>
+        <td>${orDash(o.champ_score, f1)}</td><td>${orDash(o.anchor_score, f1)}</td></tr>`).join("");
+    document.getElementById("anchors").innerHTML =
+      `<table><thead><tr><th>opponent</th><th>W</th><th>L</th><th>D</th><th>champ</th><th>anchor</th></tr></thead><tbody>${rows}</tbody></table>`;
+  } else {
+    document.getElementById("anchors").innerHTML = `<div class="empty">no anchor evaluation yet</div>`;
+  }
+
+  // hyperparameters
+  const hp = [];
+  for(const k of ["population","n_perturbations","opponents","seeds","max_hands","sigma","sigma_decay","sigma_floor","lr","weight_decay","run_seed","device","hof_interval","hof_capacity","checkpoint_interval","anchor_interval","anchor_seeds","anchor_freeze_interval"]){
+    if(cfg[k]!=null) hp.push(`<b>${k}</b> ${cfg[k]}`);
+  }
+  document.getElementById("cfg").innerHTML = `<div class="sub">${hp.join("  ·  ")}</div>`;
+}
+
+try { render(STATE||{}); } catch(e){
+  var msg = (e && e.stack) ? String(e.stack) : String(e);
+  document.getElementById("charts").innerHTML =
+    '<div class="section"><h2>render error</h2><pre style="white-space:pre-wrap;color:#ff7b72">'
+    + msg.replace(/</g,"&lt;") + '</pre></div>';
+}
+
+// ---- 1s live ticker: updates time-sensitive displays without a full reload ----
+// The meta-refresh still pulls fresh server data every 15s; this just makes the
+// page feel alive in between by ticking elapsed/ETA/progress from the snapshot.
+var SNAP = (STATE||{});
+function tick(){
+  var now = Date.now()/1000;
+  var genStart = SNAP.gen_started_at;
+  var lastWall = SNAP.last_gen_wall_s;
+  var done = SNAP.status === "done";
+
+  // gen elapsed KPI
+  var el = document.getElementById("kpi-gen-elapsed");
+  if(el){
+    var elapsed = (isNum(genStart) && !done) ? Math.max(0, now - genStart) : null;
+    var lastStr = isNum(lastWall) ? dur(lastWall) : "—";
+    el.querySelector(".v").innerHTML = `${orDash(elapsed, dur)}<small> / last ${lastStr}</small>`;
+  }
+
+  // total time KPI (snapshot total + elapsed since last gen if still running)
+  var tt = document.getElementById("kpi-total-time");
+  if(tt){
+    var base = (SNAP.total_wall_s||0);
+    if(!done && isNum(genStart) && SNAP.generations && SNAP.generations.length){
+      base += Math.max(0, now - genStart);
+    }
+    tt.querySelector(".v").textContent = dur(base);
+  }
+
+  // ETA KPI
+  var etaEl = document.getElementById("kpi-eta");
+  if(etaEl){
+    var gens = SNAP.generations||[];
+    var avg = gens.length ? (SNAP.total_wall_s||0)/gens.length : null;
+    var rem = Math.max(0, (SNAP.target_generations||0) - gens.length);
+    // if currently mid-gen, subtract the portion already elapsed from the ETA
+    var etaVal = isNum(avg) ? rem*avg : null;
+    if(isNum(etaVal) && !done && isNum(genStart) && isNum(lastWall)){
+      etaVal = Math.max(0, etaVal - Math.max(0, now - genStart));
+    }
+    etaEl.querySelector(".v").textContent = orDash(etaVal, dur);
+  }
+
+  // "updated X ago" note
+  var rn = document.getElementById("refresh-note");
+  if(rn && isNum(SNAP.updated_at)){
+    rn.textContent = `updated ${ago(SNAP.updated_at, now)} · refresh ${REFRESH_S}s`;
+  }
+
+  // gen progress bar
+  var bar = document.getElementById("genbar");
+  if(bar){
+    var pct = 0;
+    if(done){ pct = 100; bar.className = "genbar done"; }
+    else if(isNum(genStart) && isNum(lastWall)){
+      pct = Math.min(100, (Math.max(0, now - genStart) / lastWall) * 100);
+      bar.className = "genbar";
+    }
+    bar.querySelector("i").style.width = pct.toFixed(1) + "%";
+  }
+}
+tick();
+setInterval(tick, 1000);
+
+// ---- live generation: per-individual leaderboard, polled from /live every 1s ----
+// The full page still reloads every 15s (charts, KPIs); this poll keeps the
+// intra-generation view alive in between: games finished, plies, and the
+// running leaderboard of individuals (mirrored ES twins: even = θ+σε, odd = θ−σε).
+var POP = (STATE && STATE.config && isNum(STATE.config.population)) ? STATE.config.population : null;
+
+function individualId(i){
+  if(POP != null && i >= POP) return "HOF " + (i - POP);
+  return "P" + String(Math.floor(i/2)+1).padStart(2,"0");
+}
+function twinSign(i){
+  if(POP != null && i >= POP) return "";
+  return (i % 2 === 0)
+    ? '<span class="tw plus">+</span>'
+    : '<span class="tw minus">&minus;</span>';
+}
+
+function renderLive(L){
+  if(!L || !L.roster){
+    document.getElementById("live-sub").textContent = "";
+    return;
+  }
+  var phaseEl = document.getElementById("live-phase");
+  var ph = L.phase || "idle";
+  phaseEl.textContent = ph;
+  phaseEl.className = "phase-chip " + ph;
+
+  var sig = isNum(L.sigma) ? L.sigma.toFixed(4) : "—";
+  document.getElementById("live-sub").textContent =
+    "gen " + (L.gen != null ? L.gen : "—") + "  ·  \u03c3 " + sig;
+
+  var total = L.games_total || 0, done = L.games_done || 0;
+  var pct = total ? (done / total) * 100 : 0;
+  document.querySelector("#livebar i").style.width = pct.toFixed(1) + "%";
+  document.getElementById("livebar-text").textContent = total
+    ? intk(done) + " / " + intk(total) + " games  (" + pct.toFixed(0) + "%)"
+    : "waiting for the league to start…";
+
+  // live games/s from the generation clock (approximate: includes pop setup)
+  var meta = ["plies " + intk(L.plies || 0)];
+  var genStart = SNAP.gen_started_at;
+  if(!done && total) genStart = null; // fresh gen, clock not meaningful yet
+  if(isNum(genStart) && done > 0){
+    var el = Math.max(1, (Date.now()/1000) - genStart);
+    meta.push("~" + intk(done / el) + " games/s");
+  }
+  document.getElementById("live-meta").textContent = meta.join("  ·  ");
+
+  // leaderboard: individuals with at least one completed paired comparison,
+  // ranked by running mean differential
+  var rows = (L.leaderboard || [])
+    .map(function(g, i){
+      return g && g.g > 0
+        ? { i: i, g: g.g, d: g.ds / g.g, w: g.w / g.g }
+        : null;
+    })
+    .filter(Boolean)
+    .sort(function(a, b){ return b.d - a.d; });
+
+  if(!rows.length){
+    document.getElementById("lb").innerHTML =
+      '<div class="empty">no completed games yet this generation</div>';
+    return;
+  }
+
+  var html = '<div class="lb-row head"><span class="lb-rank">#</span><span>individual</span>' +
+    '<span class="lb-games">games</span><span>win rate</span><span class="lb-win">win%</span>' +
+    '<span class="lb-diff">diff</span></div>';
+  rows.forEach(function(r, idx){
+    var rank = idx + 1;
+    var cls = rank <= 3 ? " r" + rank : "";
+    var dcls = r.d > 0 ? "pos" : (r.d < 0 ? "neg" : "");
+    html += '<div class="lb-row">' +
+      '<span class="lb-rank' + cls + '">' + rank + '</span>' +
+      '<span class="lb-id">' + individualId(r.i) + twinSign(r.i) + '</span>' +
+      '<span class="lb-games">' + r.g + '</span>' +
+      '<span class="wbar"><i style="width:' + (r.w * 100).toFixed(1) + '%"></i></span>' +
+      '<span class="lb-win">' + pct(r.w) + '</span>' +
+      '<span class="lb-diff ' + dcls + '">' + (r.d > 0 ? "+" : "") + f1(r.d) + '</span>' +
+      '</div>';
+  });
+  document.getElementById("lb").innerHTML = html;
+}
+
+async function fetchLive(){
+  try {
+    var r = await fetch("/live", { cache: "no-store" });
+    if(!r.ok) return;
+    renderLive(await r.json());
+  } catch(e) { /* server unreachable (e.g. process exited) — keep last view */ }
+}
+renderLive(STATE && STATE.live);
+fetchLive();
+setInterval(fetchLive, 1000);
+</script>
+</body>
+</html>

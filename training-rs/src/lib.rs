@@ -23,6 +23,7 @@
 //! - `bin/bench` — benchmark one generation
 
 pub mod anchors;
+pub mod dashboard;
 pub mod elo;
 pub mod es;
 pub mod evaluate;

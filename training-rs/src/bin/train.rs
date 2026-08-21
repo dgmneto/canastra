@@ -113,6 +113,21 @@ struct Args {
     /// ES: weight decay (L2).
     #[arg(long, default_value = "0.0")]
     weight_decay: f64,
+
+    /// Enable the live in-process dashboard (HTTP page, auto-refresh ~15s).
+    /// Serves a snapshot of in-memory training state — no files involved —
+    /// plus a `/live` endpoint with intra-generation progress (games finished,
+    /// per-individual differentials) polled by the page every second.
+    #[arg(long)]
+    dashboard: bool,
+
+    /// Dashboard bind host.
+    #[arg(long, default_value = "127.0.0.1")]
+    dashboard_host: String,
+
+    /// Dashboard bind port.
+    #[arg(long, default_value_t = 4242)]
+    dashboard_port: u16,
 }
 
 /// Write one JSON record per generation to `<run_dir>/generations.jsonl`.
@@ -192,8 +207,50 @@ fn main() -> anyhow::Result<()> {
     let mut anchors = AnchorSet::new(arch);
     let anchor_seeds: Vec<u64> = (1000..1000 + args.anchor_seeds as u64).collect();
 
+    // Live in-process dashboard, fed straight from memory. The handle is
+    // `None` when `--dashboard` is off, so the calls below become no-ops.
+    let dashboard = if args.dashboard {
+        let config = serde_json::json!({
+            "optimiser": "es",
+            "n_perturbations": args.n_perturbations,
+            "population": pop_size,
+            "opponents": args.opponents,
+            "seeds": args.seeds,
+            "max_hands": args.max_hands,
+            "run_seed": args.run_seed,
+            "sigma": args.sigma,
+            "sigma_decay": args.sigma_decay,
+            "sigma_floor": args.sigma_floor,
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
+            "device": args.device,
+            "hof_interval": args.hof_interval,
+            "hof_capacity": args.hof_capacity,
+            "checkpoint_interval": args.checkpoint_interval,
+            "keep_recent": args.keep_recent,
+            "keep_every": args.keep_every,
+            "anchor_interval": args.anchor_interval,
+            "anchor_seeds": args.anchor_seeds,
+            "anchor_freeze_interval": args.anchor_freeze_interval,
+        });
+        let st = canastra_train::dashboard::DashboardState::new(
+            config,
+            args.generations,
+            start_gen,
+            args.run_dir.to_string_lossy().to_string(),
+        );
+        let arc = std::sync::Arc::new(std::sync::Mutex::new(st));
+        canastra_train::dashboard::spawn(arc.clone(), &args.dashboard_host, args.dashboard_port);
+        Some(canastra_train::dashboard::DashboardHandle::new(arc))
+    } else {
+        None
+    };
+
     for generation in start_gen..(start_gen + args.generations) {
         let began = Instant::now();
+        if let Some(ref d) = dashboard {
+            d.set_gen_start(generation);
+        }
         es_state.sigma_for_generation(&es_cfg, generation);
 
         // Materialise population: 2 × n_perturbations genomes (mirrored pairs).
@@ -210,7 +267,7 @@ fn main() -> anyhow::Result<()> {
             league::schedule_pairings_mirrored(pop_size, args.opponents, &hof, &mut gen_rng);
 
         let league_began = Instant::now();
-        let results = league::play_generation(&league::EvalInputs {
+        let league_inputs = league::EvalInputs {
             pop: &pop,
             hof: &hof,
             pairings: &pairings,
@@ -220,7 +277,18 @@ fn main() -> anyhow::Result<()> {
             device: &device,
             max_width,
             dtype: None,
-        });
+        };
+        // With the dashboard on, the lockstep loop reports per-ply progress
+        // (games finished, per-individual differentials) through cheap
+        // atomics + a throttled try_lock — never a sync point.
+        let results = if let Some(ref d) = dashboard {
+            d.begin_league(generation, es_state.sigma, pop_size + hof.len());
+            league::play_generation_with_progress(&league_inputs, Some(&|pool, meta, plies| {
+                d.observe(pool, meta, plies)
+            }))
+        } else {
+            league::play_generation(&league_inputs)
+        };
 
         // Fitness = mean duplicate-deal score differential. Antisymmetric, so
         // the population mean sits near zero by construction.
@@ -262,6 +330,9 @@ fn main() -> anyhow::Result<()> {
         // Run *before* `es_state.update`, so "generation N's anchor rating" is
         // the θ that produced generation N's population.
         let anchor_report = if args.anchor_interval > 0 && generation % args.anchor_interval == 0 {
+            if let Some(ref d) = dashboard {
+                d.set_phase(canastra_train::dashboard::Phase::Anchors);
+            }
             let report = anchors.evaluate(
                 &es_state.base_params,
                 arch,
@@ -285,6 +356,9 @@ fn main() -> anyhow::Result<()> {
         }
 
         // ES update: rank-normalised fitness → gradient estimate → Adam.
+        if let Some(ref d) = dashboard {
+            d.set_phase(canastra_train::dashboard::Phase::Update);
+        }
         es_state.update(&fitness, &es_cfg);
 
         let wall = began.elapsed().as_secs_f64();
@@ -343,6 +417,9 @@ fn main() -> anyhow::Result<()> {
             "anchor": anchor_report,
         });
         log_generation(&args.run_dir, &record);
+        if let Some(ref d) = dashboard {
+            d.record_generation(&record);
+        }
 
         // Export champion (the base policy, not a perturbation).
         if improved || generation % es_cfg.hof_interval == 0 {
@@ -378,6 +455,11 @@ fn main() -> anyhow::Result<()> {
     // Final champion = base params.
     let path = args.run_dir.join("champion-final.json");
     let _ = genome::save_json(path.to_str().unwrap(), arch, &es_state.base_params);
+    if let Some(ref d) = dashboard {
+        d.finish();
+        // give the server a beat to serve the final "done" snapshot before exit.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    }
     println!("done: {}", args.run_dir.display());
     Ok(())
 }

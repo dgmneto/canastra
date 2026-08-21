@@ -26,8 +26,15 @@ use rand::Rng;
 #[cfg(feature = "profile")]
 use crate::profile;
 
-type Pairing = (usize, usize);
-type GameMeta = (usize, usize, usize);
+pub type Pairing = (usize, usize);
+/// Per game: `(genome_a, genome_b, seating)` — the game→roster attribution.
+pub type GameMeta = (usize, usize, usize);
+
+/// Per-ply progress callback for the lockstep rollout: receives the pool
+/// (finished-game counts and partial results), the game→roster `meta`, and
+/// the ply count so far. Used by the live dashboard; implementations must
+/// stay cheap — they run once per ply inside the training loop.
+pub type ProgressCb<'a> = &'a dyn Fn(&Pool, &[GameMeta], u64);
 
 pub fn schedule_pairings(
     pop_size: usize,
@@ -165,14 +172,16 @@ pub fn rollout_lockstep_public(
     max_width: usize,
 ) -> Vec<MatchResult> {
     rollout_lockstep(
-        roster, arch, game_seeds, meta, max_hands, device, max_width, None,
+        roster, arch, game_seeds, meta, max_hands, device, max_width, None, None,
     )
 }
 
 /// Drive all games in lockstep with a single `Pool`. One forward per ply.
 ///
 /// `dtype` overrides the weight-stack precision; `None` takes
-/// [`default_dtype`].
+/// [`default_dtype`]. `progress` is an optional per-ply callback for the live
+/// dashboard — it is invoked after every `apply`, off the hot path's critical
+/// work, and must not block.
 #[allow(clippy::too_many_arguments)]
 fn rollout_lockstep(
     roster: &[Genome],
@@ -183,6 +192,7 @@ fn rollout_lockstep(
     device: &Device,
     max_width: usize,
     dtype: Option<DType>,
+    progress: Option<ProgressCb<'_>>,
 ) -> Vec<MatchResult> {
     let dtype = dtype.unwrap_or_else(|| default_dtype(device));
     let roster_refs: Vec<&Genome> = roster.iter().collect();
@@ -191,6 +201,7 @@ fn rollout_lockstep(
     let act_dim = arch.act;
 
     let mut pool = Pool::with_max_width(game_seeds, None, max_hands, max_width);
+    let mut plies: u64 = 0;
 
     while pool.has_live() {
         #[cfg(feature = "profile")]
@@ -260,6 +271,11 @@ fn rollout_lockstep(
         let _ = pool.apply(&picks);
         #[cfg(feature = "profile")]
         drop(_app);
+
+        if let Some(cb) = progress {
+            plies += 1;
+            cb(&pool, meta, plies);
+        }
     }
 
     pool.results()
@@ -290,6 +306,16 @@ pub struct EvalInputs<'a> {
 /// (pairing-major, then seed, then seating), which is the alignment both
 /// [`crate::fitness::score_generation`] and [`elo_updates`] rely on.
 pub fn play_generation(inputs: &EvalInputs<'_>) -> Vec<MatchResult> {
+    play_generation_with_progress(inputs, None)
+}
+
+/// [`play_generation`] with a per-ply progress callback (live dashboard).
+/// The callback sees the same results `meta` this function sees, so it can
+/// attribute partially-finished games to individuals mid-generation.
+pub fn play_generation_with_progress(
+    inputs: &EvalInputs<'_>,
+    progress: Option<ProgressCb<'_>>,
+) -> Vec<MatchResult> {
     #[cfg(feature = "profile")]
     {
         profile::reset();
@@ -312,7 +338,7 @@ pub fn play_generation(inputs: &EvalInputs<'_>) -> Vec<MatchResult> {
     let _gen_wall = profile::Span::new(&profile::GEN_WALL_NS);
 
     let results = rollout_lockstep(
-        &roster, arch, game_seeds, &meta, *max_hands, device, *max_width, *dtype,
+        &roster, arch, game_seeds, &meta, *max_hands, device, *max_width, *dtype, progress,
     );
 
     #[cfg(feature = "profile")]
